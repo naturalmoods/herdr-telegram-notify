@@ -175,6 +175,12 @@ rejected token or chat id is never queued, since nothing about it will change.
   while you were on another tab, another workspace, or away from the machine
   raises `done`. Put `idle` in `NOTIFY_STATUSES` to be told either way — at the
   cost of a ping for every short turn in the pane you are looking at.
+- `BLOCKED_REMINDER_MINUTES` nudges once about an agent still waiting that long
+  after it first said so — the first message is the one that arrives while you
+  are reading something else. The nudge carries how long it has been standing
+  there and the screen it is standing on; it is sent once per blocked stretch,
+  and only after the live session confirms the agent is still blocked, so an
+  answered pane is never nagged about. Off by default.
 - `MIN_DURATION_SECONDS` drops turns shorter than it — a turn you sat through
   does not need a notification, and a phone that buzzes for those is a phone you
   stop reading. Off by default; 60 is a sensible start. Never applies to

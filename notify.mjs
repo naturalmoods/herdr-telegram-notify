@@ -39,6 +39,7 @@ const DEFAULTS = {
   LAST_MESSAGE_CHARS: "600",
   SCREEN_LINES: "12",
   MIN_DURATION_SECONDS: "0",
+  BLOCKED_REMINDER_MINUTES: "0",
   QUIET_HOURS: "",
   TELEGRAM_TOPIC_ID: "",
   TELEGRAM_TOPICS: "",
@@ -55,6 +56,10 @@ const MAX_PANE_ELAPSED = 6 * 60 * 60 * 1000;
 // How long one session's status change stays recognisable on a second pane when
 // there is no transcript timestamp to match it against; see main().
 const SESSION_GUARD_WINDOW = 30 * 1000;
+
+// Most reminders one run may send, so a machine coming back from sleep with
+// several blocked agents nudges rather than floods.
+const MAX_REMINDERS = 3;
 
 // How long a pane's or session's state file outlives its last status change.
 const STATE_TTL = 7 * 24 * 60 * 60 * 1000;
@@ -279,6 +284,19 @@ function herdr(args, timeout = 4000) {
   return res.stdout;
 }
 
+let snapshotCache;
+let snapshotLoaded = false;
+
+// Two callers now want it — the event being handled and the reminder sweep —
+// and it costs a subprocess, so it is fetched at most once per run.
+function sessionSnapshot() {
+  if (!snapshotLoaded) {
+    snapshotCache = loadSnapshot();
+    snapshotLoaded = true;
+  }
+  return snapshotCache;
+}
+
 function loadSnapshot() {
   const out = herdr(["api", "snapshot"]);
   if (!out) return undefined;
@@ -309,14 +327,14 @@ function paneInfo(snapshot, paneId) {
 
 // What the rest of the herd is doing, by workspace label — the part you cannot
 // see from the phone, and the reason to walk back to the desk or not.
-function herdSummary(snapshot, paneId) {
-  const others = (snapshot?.agents ?? []).filter(
+function herdSummary(snap, paneId) {
+  const others = (snap?.agents ?? []).filter(
     (a) => a.pane_id !== paneId && a.agent_status && a.agent_status !== "unknown"
   );
   if (!others.length) return undefined;
 
   const labelOf = (a) =>
-    (snapshot.workspaces ?? []).find((w) => w.workspace_id === a.workspace_id)?.label ?? a.workspace_id;
+    (snap.workspaces ?? []).find((w) => w.workspace_id === a.workspace_id)?.label ?? a.workspace_id;
   const named = (status) => {
     const labels = [...new Set(others.filter((a) => a.agent_status === status).map(labelOf))];
     if (!labels.length) return undefined;
@@ -573,6 +591,94 @@ function writeState(stateDir, key, state) {
     mkdirSync(stateDir, { recursive: true });
     writeFileSync(join(stateDir, `state-${key}.json`), JSON.stringify(state));
   } catch {}
+}
+
+// ----------------------------------------------------------------- reminder
+
+// Panes recorded as blocked longer ago than this, that have not been nudged
+// about yet. Only the state files are read here: the snapshot costs a
+// subprocess, and most runs have nothing overdue to spend it on.
+function overdueBlocked(stateDir, afterMs) {
+  if (!stateDir || !afterMs) return [];
+  const now = Date.now();
+  const due = [];
+  try {
+    for (const name of readdirSync(stateDir)) {
+      if (!name.startsWith("state-") || name.startsWith("state-send-") || !name.endsWith(".json")) continue;
+      let state;
+      try {
+        state = JSON.parse(readFileSync(join(stateDir, name), "utf8"));
+      } catch {
+        continue;
+      }
+      if (state?.status !== "blocked" || state.remindedAt || !state.paneId) continue;
+      if (now - state.updatedAt < afterMs) continue;
+      due.push({ file: name, state });
+    }
+  } catch {}
+  return due.slice(0, MAX_REMINDERS);
+}
+
+// One nudge per blocked stretch, once the first message has gone long enough
+// unanswered to have been missed. Not a second copy of the original: what it
+// carries is how long the agent has been standing there.
+async function remindBlocked(stateDir, cfg, { token, chatId, silent }) {
+  const afterMs = toInt(cfg("BLOCKED_REMINDER_MINUTES"), 0) * 60 * 1000;
+  const due = overdueBlocked(stateDir, afterMs);
+  if (!due.length) return;
+
+  const snap = sessionSnapshot();
+  for (const { file, state } of due) {
+    const paneId = state.paneId;
+    const agent = (snap?.agents ?? []).find((a) => a.pane_id === paneId);
+    // The state file can have been overtaken: the agent answered, or the pane is
+    // gone. Either way there is nothing to be reminded about.
+    if (!agent || agent.agent_status !== "blocked") continue;
+
+    const info = paneInfo(snap, paneId);
+    const workspaceId = firstDefined(info.workspaceId, agent.workspace_id);
+    if (
+      listMatches(cfg("NOTIFY_WORKSPACES"), info.workspaceLabel, workspaceId) === false ||
+      listMatches(cfg("IGNORE_WORKSPACES"), info.workspaceLabel, workspaceId) === true
+    ) {
+      continue;
+    }
+
+    const projectBits = [];
+    if (isOn(cfg("SHOW_PROJECT"))) {
+      if (info.workspaceLabel) projectBits.push(String(info.workspaceLabel));
+      if (info.cwd) projectBits.push(tilde(info.cwd));
+    }
+    const paneBits = [];
+    if (isOn(cfg("SHOW_PANE"))) {
+      if (isOn(cfg("SHOW_HOST"))) paneBits.push(hostname());
+      paneBits.push(`herdr agent focus ${paneId}`);
+    }
+
+    const message = buildMessage({
+      emoji: "⏰",
+      agent: String(firstDefined(agent.agent, "agent")),
+      statusLabel: "still blocked",
+      title: isOn(cfg("SHOW_TITLE")) ? info.title : undefined,
+      project: projectBits.length ? `📁 ${projectBits.join(" · ")}` : undefined,
+      meta: `⏱ waiting ${humanDuration(Date.now() - state.updatedAt)}`,
+      pane: paneBits.length ? `🖥 ${paneBits.join(" · ")}` : undefined,
+      body: isOn(cfg("SHOW_SCREEN_ON_BLOCKED")) ? screenTail(paneId, toInt(cfg("SCREEN_LINES"), 12)) : undefined,
+      bodyIsScreen: true,
+    });
+
+    // Marked first: a reminder that fails is not worth queueing — by the time it
+    // could be delivered the wait it reports is no longer the wait there is.
+    writeState(stateDir, file.replace(/^state-|\.json$/g, ""), { ...state, remindedAt: Date.now() });
+    try {
+      await sendTelegram(token, chatId, message, {
+        silent,
+        topicId: topicFor(cfg, info.workspaceLabel, workspaceId),
+      });
+    } catch (err) {
+      console.error(`herdr-telegram-notify: reminder for ${paneId} failed: ${redact(err.message, token)}`);
+    }
+  }
 }
 
 // ------------------------------------------------------------------ message
@@ -837,6 +943,10 @@ async function main() {
     !dryRun && !muted && token && chatId ? await flushPending(stateDir, token, chatId, silent) : true;
 
 
+  if (!dryRun && !muted && online && token && chatId) {
+    await remindBlocked(stateDir, cfg, { token, chatId, silent });
+  }
+
   const key = stateKey(event, context);
   const previous = readState(stateDir, key);
   if (previous.status === status) return; // repeat of a state we already handled
@@ -852,7 +962,7 @@ async function main() {
   // status change on wake, not when the agent stopped. Past this the transcript's
   // own turn is the more honest number.
   const paneElapsed = sinceWorking !== undefined && sinceWorking <= MAX_PANE_ELAPSED ? sinceWorking : undefined;
-  writeState(stateDir, key, { status, workingSince, updatedAt: now });
+  writeState(stateDir, key, { status, workingSince, updatedAt: now, paneId: data.pane_id });
 
   const notifyStatuses = new Set(
     String(cfg("NOTIFY_STATUSES"))
@@ -885,8 +995,8 @@ async function main() {
     isOn(cfg("SHOW_TOKENS")) ||
     isOn(cfg("SHOW_DURATION")) ||
     isOn(cfg("SHOW_TITLE"));
-  const snapshot = wantsSnapshot ? loadSnapshot() : undefined;
-  const info = paneInfo(snapshot, paneId);
+  const snap = wantsSnapshot ? sessionSnapshot() : undefined;
+  const info = paneInfo(snap, paneId);
 
   // The context describes the focused pane, so it only stands in for the event
   // pane when they are the same one.
@@ -989,7 +1099,7 @@ async function main() {
   }
   const pane = paneBits.length ? `🖥 ${paneBits.join(" · ")}` : undefined;
 
-  const herd = isOn(cfg("SHOW_HERD")) ? herdSummary(snapshot, paneId) : undefined;
+  const herd = isOn(cfg("SHOW_HERD")) ? herdSummary(snap, paneId) : undefined;
 
   // What the agent said, or — when it is waiting on an answer that never
   // reaches the transcript — what its screen is showing.
