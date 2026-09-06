@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.1
 
 - The blocked-screen block is cropped to one column when the pane is split. An
   agent with a diff panel beside it put a piece of both in every terminal row,
