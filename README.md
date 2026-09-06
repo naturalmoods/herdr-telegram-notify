@@ -70,6 +70,21 @@ For a group instead of a private chat, add the bot to the group and send
 bots, so a command addressed to it is what makes the chat show up in
 `getUpdates`.
 
+### A topic per workspace
+
+In a group with Topics turned on, `TELEGRAM_TOPICS` gives each workspace its own
+thread rather than one stream carrying every project:
+
+```
+TELEGRAM_TOPICS=marys.hu:12,jegykezelo:15,wB:15
+TELEGRAM_TOPIC_ID=7
+```
+
+The pairs are `label-or-id:topic`; `TELEGRAM_TOPIC_ID` catches everything they do
+not name, and with neither set the messages go to the group's General topic. To
+read a topic's id, open it in Telegram Web — the number at the end of the URL is
+it.
+
 ## The message
 
 ```

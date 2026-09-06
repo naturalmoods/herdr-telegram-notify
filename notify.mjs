@@ -40,6 +40,8 @@ const DEFAULTS = {
   SCREEN_LINES: "12",
   MIN_DURATION_SECONDS: "0",
   QUIET_HOURS: "",
+  TELEGRAM_TOPIC_ID: "",
+  TELEGRAM_TOPICS: "",
   NOTIFY_WORKSPACES: "",
   IGNORE_WORKSPACES: "",
   DRY_RUN: "0",
@@ -152,6 +154,18 @@ function listMatches(list, ...values) {
     .filter(Boolean);
   if (!wanted.length) return undefined;
   return values.some((v) => v !== undefined && wanted.includes(String(v).toLowerCase()));
+}
+
+// `marys.hu:12,wB:15` — which topic of a forum group a workspace's messages
+// belong in. Falls back to TELEGRAM_TOPIC_ID, and to the group's General topic
+// when neither names one.
+function topicFor(cfg, label, id) {
+  for (const pair of String(cfg("TELEGRAM_TOPICS") ?? "").split(",")) {
+    const at = pair.lastIndexOf(":");
+    if (at === -1) continue;
+    if (listMatches(pair.slice(0, at), label, id)) return toInt(pair.slice(at + 1), undefined);
+  }
+  return toInt(cfg("TELEGRAM_TOPIC_ID"), undefined);
 }
 
 function isOn(value) {
@@ -631,7 +645,7 @@ function retryAfterMs(body) {
   return undefined;
 }
 
-async function sendTelegram(token, chatId, message, { silent } = {}) {
+async function sendTelegram(token, chatId, message, { silent, topicId } = {}) {
   const url = `https://api.telegram.org/bot${token}/sendMessage`;
   const post = async (payload) => {
     try {
@@ -643,6 +657,7 @@ async function sendTelegram(token, chatId, message, { silent } = {}) {
           disable_web_page_preview: true,
           // Delivered, listed, unread — just without the sound.
           ...(silent ? { disable_notification: true } : {}),
+          ...(topicId ? { message_thread_id: topicId } : {}),
           ...payload,
         }),
         signal: AbortSignal.timeout(SEND_TIMEOUT),
@@ -728,7 +743,7 @@ function writePending(stateDir, entries) {
   } catch {}
 }
 
-function queuePending(stateDir, parts) {
+function queuePending(stateDir, parts, topicId) {
   if (!pendingPath(stateDir)) {
     console.error("herdr-telegram-notify: no state directory, so the message could not be kept for later");
     return;
@@ -736,7 +751,7 @@ function queuePending(stateDir, parts) {
   const entries = readPending(stateDir);
   // The parts, not the rendered message: a late delivery carries an extra line,
   // and rendering it then is what keeps the result inside Telegram's limit.
-  entries.push({ at: Date.now(), parts });
+  entries.push({ at: Date.now(), parts, topicId });
   writePending(stateDir, entries);
   console.error(`herdr-telegram-notify: kept for the next event (${entries.length} waiting)`);
 }
@@ -760,7 +775,10 @@ async function flushPending(stateDir, token, chatId, silent) {
     // Telegram stamps the message with its arrival time, which by now is a lie.
     const late = `🕘 delayed ${humanDuration(Date.now() - entry.at)}`;
     try {
-      await sendTelegram(token, chatId, buildMessage({ ...entry.parts, late }), { silent });
+      await sendTelegram(token, chatId, buildMessage({ ...entry.parts, late }), {
+        silent,
+        topicId: entry.topicId,
+      });
     } catch (err) {
       console.error(
         `herdr-telegram-notify: ${waiting.length} message(s) still waiting: ${redact(err.message, token)}`
@@ -802,6 +820,7 @@ async function main() {
   // does not make a sound doing it.
   const silent = inQuietHours(cfg("QUIET_HOURS"));
   const online = !dryRun && token && chatId ? await flushPending(stateDir, token, chatId, silent) : true;
+
 
   const key = stateKey(event, context);
   const previous = readState(stateDir, key);
@@ -867,6 +886,7 @@ async function main() {
   // its label and to its id, so `marys.hu` and `wA` both work — the label is
   // what you think in, the id is what survives renaming it.
   const workspaceId = firstDefined(info.workspaceId, data.workspace_id);
+  const topicId = topicFor(cfg, workspaceLabel, workspaceId);
   const allowed = listMatches(cfg("NOTIFY_WORKSPACES"), workspaceLabel, workspaceId);
   const ignored = listMatches(cfg("IGNORE_WORKSPACES"), workspaceLabel, workspaceId);
   if (allowed === false || ignored === true) {
@@ -988,6 +1008,7 @@ async function main() {
 
   if (dryRun) {
     if (silent) console.log("--- (quiet hours: would be delivered without a sound) ---");
+    if (topicId) console.log(`--- (topic ${topicId}) ---`);
     console.log(`--- sent as HTML ---\n${message.html}\n\n--- plain-text fallback ---\n${message.plain}`);
     return;
   }
@@ -996,19 +1017,19 @@ async function main() {
     // The queue flush just proved the network is down; no point spending another
     // round of attempts on the same connection.
     console.error("herdr-telegram-notify: still offline, not retrying this one now");
-    queuePending(stateDir, parts);
+    queuePending(stateDir, parts, topicId);
     process.exitCode = 1;
     return;
   }
 
   try {
-    await sendTelegram(token, chatId, message, { silent });
+    await sendTelegram(token, chatId, message, { silent, topicId });
   } catch (err) {
     console.error(`herdr-telegram-notify: ${redact(err.message, token)}`);
     // A refused connection or a Telegram that is down will look different in a
     // minute; a rejected token or chat id will not, and queueing it would only
     // pile up messages that can never be sent.
-    if (isRetryable(err.status)) queuePending(stateDir, parts);
+    if (isRetryable(err.status)) queuePending(stateDir, parts, topicId);
     process.exitCode = 1;
   }
 }
