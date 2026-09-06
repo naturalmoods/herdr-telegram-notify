@@ -130,6 +130,8 @@ plain text rather than dropped.
   stays believable as one turn (under six hours). A machine that suspends
   mid-turn notices the status change on waking, not when the agent stopped, so
   past that the transcript's own turn is used instead.
+- Housekeeping: state files for panes untouched for a week are removed on the
+  next event, along with anything an earlier version of the plugin left behind.
 - Degrades instead of failing. Without the `herdr` CLI on the machine there is
   no snapshot, so the message falls back to what the event and the focused-pane
   context carry; an unreadable transcript just drops the body.

@@ -16,6 +16,7 @@ import {
   readSync,
   fstatSync,
   closeSync,
+  unlinkSync,
 } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir, hostname } from "node:os";
@@ -48,6 +49,9 @@ const MAX_PANE_ELAPSED = 6 * 60 * 60 * 1000;
 // How long one session's status change stays recognisable on a second pane when
 // there is no transcript timestamp to match it against; see main().
 const SESSION_GUARD_WINDOW = 30 * 1000;
+
+// How long a pane's or session's state file outlives its last status change.
+const STATE_TTL = 7 * 24 * 60 * 60 * 1000;
 
 // ---------------------------------------------------------------- utilities
 
@@ -457,6 +461,26 @@ function readState(stateDir, key) {
   }
 }
 
+// A closed pane never comes back to clean up after itself, and an upgrade leaves
+// the previous scheme's files lying around — so the state directory only ever
+// grows unless someone sweeps it. Untouched for a week means the pane is gone;
+// its status is no longer worth de-duplicating against.
+function sweepState(stateDir) {
+  if (!stateDir) return;
+  const now = Date.now();
+  try {
+    for (const name of readdirSync(stateDir)) {
+      // `last-status-<pane>.txt` is the 0.1 scheme; nothing reads it now.
+      const obsolete = name.startsWith("last-status-") && name.endsWith(".txt");
+      if (!obsolete && !(name.startsWith("state-") && name.endsWith(".json"))) continue;
+      const path = join(stateDir, name);
+      try {
+        if (obsolete || now - statSync(path).mtimeMs > STATE_TTL) unlinkSync(path);
+      } catch {}
+    }
+  } catch {}
+}
+
 function writeState(stateDir, key, state) {
   if (!stateDir) return;
   try {
@@ -536,6 +560,7 @@ async function main() {
   // Record every transition — the working→done gap is where the duration comes
   // from — then decide whether this one is worth a message.
   const stateDir = process.env.HERDR_PLUGIN_STATE_DIR;
+  sweepState(stateDir);
   const key = stateKey(event, context);
   const previous = readState(stateDir, key);
   if (previous.status === status) return; // repeat of a state we already handled
