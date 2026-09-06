@@ -4,6 +4,10 @@ A Herdr plugin that sends a Telegram message when an agent finishes (`done`)
 or needs input (`blocked`) — with enough detail to tell, from the phone, which
 agent it was and what it did.
 
+Requires Herdr 0.8 or newer, Node 18+, and Linux or macOS. Herdr's server does
+not inherit your shell's PATH, so `run.sh` locates Node itself — an nvm, fnm or
+volta install would otherwise be invisible to it.
+
 ## Install
 
 ```
@@ -99,6 +103,13 @@ plain text rather than dropped.
 - Fires on Herdr's `pane.agent_status_changed` event.
 - Sends only for the statuses in `NOTIFY_STATUSES` (default `done,blocked`), but
   records every transition — that is where the duration comes from.
+- `done` is not "the turn ended". Herdr's own definition: `idle` is an agent
+  ready for input whose tab **has been seen** in the focused UI, and `done` is
+  that same idle state reached while the work was **unseen**. So a turn you sat
+  and watched ends as `idle` and stays silent by design; only work that finished
+  while you were on another tab, another workspace, or away from the machine
+  raises `done`. Put `idle` in `NOTIFY_STATUSES` to be told either way — at the
+  cost of a ping for every short turn in the pane you are looking at.
 - De-dupes: won't send twice in a row for the same pane if the status hasn't
   actually changed since the last notification.
 - Degrades instead of failing. Without the `herdr` CLI on the machine there is

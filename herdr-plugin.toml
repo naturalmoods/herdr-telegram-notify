@@ -1,12 +1,12 @@
 id = "naturalmoods.herdr-telegram-notify"
 name = "Herdr Telegram Notify"
-version = "0.2.0"
+version = "0.2.1"
 min_herdr_version = "0.8.0"
 description = "Sends a Telegram message when a Herdr-managed agent finishes or gets blocked, with the session title, project, duration and the agent's last message."
 platforms = ["linux", "macos"]
 
 [[events]]
 on = "pane.agent_status_changed"
-# Herdr's own process may not have the interactive shell's PATH (e.g. nvm-installed
-# node isn't on it), so this points at a node binary directly instead of relying on PATH.
-command = ["/bin/sh", "-c", "command -v node >/dev/null 2>&1 && exec node notify.mjs; for n in \"$HOME\"/.config/nvm/versions/node/*/bin/node /usr/local/bin/node /usr/bin/node; do [ -x \"$n\" ] && exec \"$n\" notify.mjs; done; echo 'node not found' >&2; exit 1"]
+# Herdr's server may not have the interactive shell's PATH (an nvm-installed node
+# is invisible to it), so the launcher finds a node itself. See run.sh.
+command = ["/bin/sh", "run.sh"]
