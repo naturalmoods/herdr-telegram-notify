@@ -30,6 +30,7 @@ const DEFAULTS = {
   PROMPT_CHARS: "120",
   SHOW_PROJECT: "1",
   SHOW_BRANCH: "1",
+  SHOW_CHANGES: "1",
   SHOW_DURATION: "1",
   SHOW_TIMESTAMP: "0",
   SHOW_TOKENS: "1",
@@ -355,6 +356,51 @@ function herdSummary(snap, paneId) {
 }
 
 // ------------------------------------------------------------------- extras
+
+// Herdr's server may not have the shell's PATH, the same way it does not have
+// node's — so `git` gets the same treatment.
+function gitBin() {
+  const candidates = [process.env.GIT_BIN_PATH, "/usr/bin/git", "/usr/local/bin/git", "/opt/homebrew/bin/git"];
+  for (const candidate of candidates) {
+    if (candidate && existsSync(candidate)) return candidate;
+  }
+  return "git";
+}
+
+function git(cwd, args) {
+  const res = spawnSync(gitBin(), ["-C", cwd, ...args], {
+    encoding: "utf8",
+    timeout: 3000,
+    maxBuffer: 1024 * 1024,
+    env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
+  });
+  if (res.error || res.status !== 0) return undefined;
+  return res.stdout;
+}
+
+// What is sitting in the working tree right now. Not all of it need be this
+// turn's doing, but it is the difference between an agent that thought about the
+// problem and one that changed things — which is most of what you want to know
+// before deciding whether to walk back to the desk.
+function workingTreeChanges(cwd) {
+  const stat = git(cwd, ["diff", "--shortstat", "HEAD"]);
+  if (stat === undefined) return undefined; // not a repo, no commits yet, no git
+
+  const bits = [];
+  const files = /(\d+) files? changed/.exec(stat);
+  const added = /(\d+) insertions?\(\+\)/.exec(stat);
+  const removed = /(\d+) deletions?\(-\)/.exec(stat);
+  if (files) bits.push(`${files[1]} ${files[1] === "1" ? "file" : "files"}`);
+  if (added || removed) bits.push(`+${added?.[1] ?? 0} −${removed?.[1] ?? 0}`);
+
+  // A file the agent has only just written is untracked, so the diff above
+  // cannot see it at all — and a new file is rarely the boring half of the work.
+  const untracked = git(cwd, ["ls-files", "--others", "--exclude-standard"]);
+  const newFiles = untracked ? untracked.split("\n").filter((l) => l.trim()).length : 0;
+  if (newFiles) bits.push(`${newFiles} new`);
+
+  return bits.length ? bits.join(" · ") : undefined;
+}
 
 function gitBranch(cwd) {
   let dir = cwd;
@@ -712,7 +758,7 @@ function clip(text, max) {
 }
 
 function buildMessage(parts) {
-  const { emoji, agent, statusLabel, title, prompt, project, meta, pane, herd, bodyIsScreen, late } = parts;
+  const { emoji, agent, statusLabel, title, prompt, project, changes, meta, pane, herd, bodyIsScreen, late } = parts;
 
   const render = (body) => {
     const plain = [];
@@ -729,7 +775,7 @@ function buildMessage(parts) {
       plain.push(shown);
       html.push(`<i>${escapeHtml(shown)}</i>`);
     }
-    for (const line of [prompt, project, meta, pane, herd ? `🐑 ${herd}` : undefined].filter(Boolean)) {
+    for (const line of [prompt, project, changes, meta, pane, herd ? `🐑 ${herd}` : undefined].filter(Boolean)) {
       const shown = clip(line, HEAD_LINE_CHARS);
       plain.push(shown);
       html.push(escapeHtml(shown));
@@ -1068,6 +1114,9 @@ async function main() {
   }
   const project = projectBits.length ? `📁 ${projectBits.join(" · ")}` : undefined;
 
+  const changed = isOn(cfg("SHOW_CHANGES")) && cwd ? workingTreeChanges(cwd) : undefined;
+  const changes = changed ? `✎ ${changed}` : undefined;
+
   // One read of the transcript feeds the duration, the token counts and the
   // body below.
   const minSeconds = toInt(cfg("MIN_DURATION_SECONDS"), 0);
@@ -1161,7 +1210,7 @@ async function main() {
     writeState(stateDir, guardKey, { status, endedAt: turn.endedAt, at: Date.now(), paneId });
   }
 
-  const parts = { emoji, agent, statusLabel, title, prompt, project, meta, pane, herd, body, bodyIsScreen };
+  const parts = { emoji, agent, statusLabel, title, prompt, project, changes, meta, pane, herd, body, bodyIsScreen };
   const message = buildMessage(parts);
 
   if (dryRun) {
