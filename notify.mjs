@@ -84,10 +84,11 @@ async function sendTelegram(token, chatId, text) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ chat_id: chatId, text }),
   });
+  const body = await res.text().catch(() => "");
   if (!res.ok) {
-    const body = await res.text().catch(() => "");
     throw new Error(`Telegram API ${res.status}: ${body}`);
   }
+  console.log(`herdr-telegram-notify: sent, response: ${body}`);
 }
 
 async function main() {
