@@ -1,10 +1,22 @@
 #!/bin/sh
 # Herdr's server does not inherit an interactive shell's PATH, so a node
 # installed by nvm, fnm or volta is usually invisible to it. Find one, then hand
-# over to the notifier. Node 18+ is required (fetch, ?? and ?.).
+# over to the script named as the first argument (the notifier by default).
+# Node 18+ is required (fetch, ?? and ?.).
 
-if command -v node >/dev/null 2>&1; then
-  exec node notify.mjs
+dir=$(dirname "$0")
+script="$dir/${1:-notify.mjs}"
+
+# /usr/bin/node on an old distribution can be far behind what this needs, and the
+# failure it produces is a syntax error rather than anything that names a
+# version — so a candidate has to prove itself before it is used.
+usable() {
+  [ -x "$1" ] || return 1
+  "$1" -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 18 ? 0 : 1)' 2>/dev/null
+}
+
+if command -v node >/dev/null 2>&1 && usable "$(command -v node)"; then
+  exec node "$script"
 fi
 
 for candidate in \
@@ -16,10 +28,10 @@ for candidate in \
   /usr/local/bin/node \
   /usr/bin/node
 do
-  if [ -x "$candidate" ]; then
-    exec "$candidate" notify.mjs
+  if usable "$candidate"; then
+    exec "$candidate" "$script"
   fi
 done
 
-echo "herdr-telegram-notify: no node found on PATH or in the usual install locations (Node 18+ required)" >&2
+echo "herdr-telegram-notify: no Node 18+ found on PATH or in the usual install locations" >&2
 exit 1

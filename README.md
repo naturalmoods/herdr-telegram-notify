@@ -85,6 +85,27 @@ not name, and with neither set the messages go to the group's General topic. To
 read a topic's id, open it in Telegram Web — the number at the end of the URL is
 it.
 
+## Muting it
+
+One action mutes the notifier and lifts the mute when it is already on, so a
+single key covers both:
+
+```toml
+# ~/.config/herdr/config.toml
+[[keys.command]]
+key = "prefix+m"
+type = "plugin_action"
+command = "naturalmoods.herdr-telegram-notify.mute"
+description = "mute/unmute Telegram notifications"
+```
+
+Without a binding, `herdr plugin action invoke mute` does the same. It confirms
+in a Herdr notification either way, and `MUTE_MINUTES` (an hour by default) says
+how long the silence lasts. What it covers is dropped rather than queued — the
+point is not to be told, not to be told all at once when it lifts. Status changes
+are still recorded while muted, so the first message afterwards still knows how
+long its turn took.
+
 ## The message
 
 ```

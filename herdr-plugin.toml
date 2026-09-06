@@ -9,4 +9,12 @@ platforms = ["linux", "macos"]
 on = "pane.agent_status_changed"
 # Herdr's server may not have the interactive shell's PATH (an nvm-installed node
 # is invisible to it), so the launcher finds a node itself. See run.sh.
-command = ["/bin/sh", "run.sh"]
+command = ["/bin/sh", "run.sh", "notify.mjs"]
+
+# Silence the notifier without editing the config: one action that mutes, and
+# lifts the mute when it is already on. Bind it to a key in herdr's config.toml.
+[[actions]]
+id = "mute"
+title = "Mute/unmute Telegram notifications"
+description = "Stop sending for MUTE_MINUTES (default an hour), or start again if already muted."
+command = ["/bin/sh", "run.sh", "mute.mjs"]

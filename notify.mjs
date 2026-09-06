@@ -554,6 +554,19 @@ function sweepState(stateDir) {
   } catch {}
 }
 
+// Written by mute.mjs, the plugin's `mute` action. Muting drops the messages it
+// covers rather than queueing them: you asked not to be told, not to be told all
+// at once in an hour.
+function mutedUntil(stateDir) {
+  if (!stateDir) return 0;
+  try {
+    const until = JSON.parse(readFileSync(join(stateDir, "mute.json"), "utf8"))?.until;
+    return Number.isFinite(until) && until > Date.now() ? until : 0;
+  } catch {
+    return 0;
+  }
+}
+
 function writeState(stateDir, key, state) {
   if (!stateDir) return;
   try {
@@ -819,7 +832,9 @@ async function main() {
   // Overnight the message still arrives and still waits in the chat; it just
   // does not make a sound doing it.
   const silent = inQuietHours(cfg("QUIET_HOURS"));
-  const online = !dryRun && token && chatId ? await flushPending(stateDir, token, chatId, silent) : true;
+  const muted = mutedUntil(stateDir);
+  const online =
+    !dryRun && !muted && token && chatId ? await flushPending(stateDir, token, chatId, silent) : true;
 
 
   const key = stateKey(event, context);
@@ -846,6 +861,13 @@ async function main() {
       .filter(Boolean)
   );
   if (!notifyStatuses.has(status)) return;
+
+  // Recorded above whatever happens — a mute should not cost the next message
+  // its duration — but nothing goes out while it holds.
+  if (muted) {
+    console.log(`herdr-telegram-notify: muted until ${clockTime(new Date(muted))}; ${status} not sent`);
+    return;
+  }
 
   if (!dryRun && (!token || !chatId)) {
     console.error("herdr-telegram-notify: missing TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID");
