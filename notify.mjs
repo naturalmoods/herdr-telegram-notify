@@ -45,6 +45,10 @@ const TELEGRAM_LIMIT = 4096;
 // Longest working→stop gap still believable as one turn; see main().
 const MAX_PANE_ELAPSED = 6 * 60 * 60 * 1000;
 
+// How long one session's status change stays recognisable on a second pane when
+// there is no transcript timestamp to match it against; see main().
+const SESSION_GUARD_WINDOW = 30 * 1000;
+
 // ---------------------------------------------------------------- utilities
 
 function readJson(envVar) {
@@ -389,6 +393,8 @@ function readTurn(path, maxRecords = 200) {
   const to = Date.parse(endedAt ?? "");
   return {
     text,
+    // Identifies the turn: two panes on one session read the same last record.
+    endedAt,
     duration: Number.isFinite(from) && Number.isFinite(to) && to > from ? to - from : undefined,
     out,
     context,
@@ -418,9 +424,12 @@ function screenTail(paneId, maxLines) {
 
 // -------------------------------------------------------------------- state
 
-function stateKey(event, context) {
-  const raw = firstDefined(event.data?.pane_id, context.focused_pane_id, "default");
+function sanitizeKey(raw) {
   return String(raw).replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
+function stateKey(event, context) {
+  return sanitizeKey(firstDefined(event.data?.pane_id, context.focused_pane_id, "default"));
 }
 
 function readState(stateDir, key) {
@@ -640,6 +649,28 @@ async function main() {
   }
   if (!body && isOn(cfg("SHOW_LAST_MESSAGE")) && turn.text) {
     body = truncate(turn.text, toInt(cfg("LAST_MESSAGE_CHARS"), 600));
+  }
+
+  // Herdr can report one agent session on two panes — a resumed session, or the
+  // same agent adopted by a second pane — and each pane raises its own status
+  // change, so one turn arrives twice. The transcript's last record pins the
+  // turn, so the second pane's copy of it is recognisable; with no transcript to
+  // read, a short window stands in. Keyed on the session, and never against the
+  // pane that sent it, so a pane's own later turns are unaffected.
+  const guardKey = info.session?.value ? `send-${sanitizeKey(info.session.value)}` : undefined;
+  if (guardKey) {
+    const last = readState(stateDir, guardKey);
+    const sameTurn =
+      turn.endedAt && last.endedAt
+        ? last.endedAt === turn.endedAt
+        : Date.now() - (last.at ?? 0) < SESSION_GUARD_WINDOW;
+    if (last.status === status && last.paneId && last.paneId !== paneId && sameTurn) {
+      console.log(
+        `herdr-telegram-notify: ${status} already sent for this session from pane ${last.paneId}, skipping ${paneId}`
+      );
+      return;
+    }
+    writeState(stateDir, guardKey, { status, endedAt: turn.endedAt, at: Date.now(), paneId });
   }
 
   const message = buildMessage({ emoji, agent, statusLabel, title, project, meta, pane, herd, body, bodyIsScreen });

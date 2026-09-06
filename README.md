@@ -110,8 +110,11 @@ plain text rather than dropped.
   while you were on another tab, another workspace, or away from the machine
   raises `done`. Put `idle` in `NOTIFY_STATUSES` to be told either way — at the
   cost of a ping for every short turn in the pane you are looking at.
-- De-dupes: won't send twice in a row for the same pane if the status hasn't
-  actually changed since the last notification.
+- De-dupes twice over: a pane never sends for a status it is already in, and one
+  agent session never sends the same turn from two panes. Herdr can report a
+  single session on two panes — a resumed session, or an agent adopted by a
+  second pane — and each raises its own status change; the transcript's last
+  record identifies the turn, so the second copy is dropped.
 - The duration is the pane's own `working` → stop gap, but only while that gap
   stays believable as one turn (under six hours). A machine that suspends
   mid-turn notices the status change on waking, not when the agent stopped, so
