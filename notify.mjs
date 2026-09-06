@@ -331,8 +331,10 @@ function transcriptPath(session) {
   return undefined;
 }
 
-// Transcripts run to megabytes, so only the tail is read.
-function readTail(path, bytes = 512 * 1024) {
+// Transcripts run to megabytes, so only the tail is read — but the tail has to
+// be long enough to reach back past the turn being reported, and an afternoon of
+// tool calls is measured in hundreds of kilobytes.
+function readTail(path, bytes = 4 * 1024 * 1024) {
   let fd;
   try {
     fd = openSync(path, "r");
@@ -403,7 +405,11 @@ function isHumanPrompt(record, message) {
 // us: what the agent said last, how long the turn took and what it spent.
 // Claude writes `{type:"assistant", message:{…}}`, pi writes
 // `{type:"message", message:{role:"assistant", …}}`.
-function readTurn(path, maxRecords = 200) {
+// maxRecords bounds the walk back to the turn's opening prompt. Set too low it
+// fails silently and expensively: no prompt, no duration, and a token count that
+// only covers the part of the turn it managed to see. A turn of forty tool calls
+// was already past two hundred records.
+function readTurn(path, maxRecords = 1500) {
   const tail = readTail(path);
   if (!tail) return {};
   const lines = tail.split("\n").filter((l) => l.trim());
@@ -454,11 +460,15 @@ function readTurn(path, maxRecords = 200) {
     }
   }
 
+  // Ran out of records before finding where the turn began — everything measured
+  // from its start is therefore partial.
+  const truncated = seen >= maxRecords && !startedAt;
   const from = Date.parse(startedAt ?? "");
   const to = Date.parse(endedAt ?? "");
   return {
     text,
     prompt,
+    truncated,
     tools,
     // Identifies the turn: two panes on one session read the same last record.
     endedAt,
@@ -1052,6 +1062,9 @@ async function main() {
     minSeconds > 0;
   const transcript = wantsTurn ? transcriptPath(info.session) : undefined;
   const turn = transcript ? readTurn(transcript) : {};
+  if (turn.truncated) {
+    note("the turn is longer than the transcript scan reaches back; its prompt, duration and token counts are partial");
+  }
   if (wantsTurn && !transcript) {
     note(`no transcript found for ${JSON.stringify(info.session ?? null)}; the message loses its body, duration and tokens`);
   }
