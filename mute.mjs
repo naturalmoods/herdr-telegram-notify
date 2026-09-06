@@ -4,39 +4,13 @@
 // arguments, so one action toggles and MUTE_MINUTES in the config .env decides
 // how long — see .env.example.
 
-import { readFileSync, writeFileSync, mkdirSync, unlinkSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
 import { spawnSync } from "node:child_process";
 
+import { herdrBin, loadConfig, toInt } from "./lib.mjs";
+
 const DEFAULT_MINUTES = 60;
-
-function config(key) {
-  const dir = process.env.HERDR_PLUGIN_CONFIG_DIR;
-  if (process.env[key]) return process.env[key];
-  if (!dir) return undefined;
-  try {
-    for (const line of readFileSync(join(dir, ".env"), "utf8").split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith("#")) continue;
-      const eq = trimmed.indexOf("=");
-      if (eq !== -1 && trimmed.slice(0, eq).trim() === key) return trimmed.slice(eq + 1).trim();
-    }
-  } catch {}
-  return undefined;
-}
-
-// Same search as run.sh: herdr's server may not have the shell's PATH.
-function herdrBin() {
-  const candidates = [
-    process.env.HERDR_BIN_PATH,
-    join(homedir(), ".local", "bin", "herdr"),
-    "/usr/local/bin/herdr",
-    "/usr/bin/herdr",
-    "/opt/homebrew/bin/herdr",
-  ];
-  return candidates.find((c) => c && existsSync(c)) ?? "herdr";
-}
 
 // An action fired from the UI needs its answer in the UI, not in a log file.
 function announce(title, body) {
@@ -47,6 +21,7 @@ function announce(title, body) {
   });
 }
 
+const config = loadConfig();
 const stateDir = process.env.HERDR_PLUGIN_STATE_DIR;
 if (!stateDir) {
   announce("Telegram notify", "no state directory, so muting has nowhere to be recorded");
@@ -64,7 +39,7 @@ if (!stateDir) {
     } catch {}
     announce("🔔 Telegram notify on", "messages are going out again");
   } else {
-    const minutes = Math.max(1, Number.parseInt(config("MUTE_MINUTES") ?? "", 10) || DEFAULT_MINUTES);
+    const minutes = toInt(config("MUTE_MINUTES"), DEFAULT_MINUTES);
     const ends = Date.now() + minutes * 60 * 1000;
     try {
       mkdirSync(stateDir, { recursive: true });
