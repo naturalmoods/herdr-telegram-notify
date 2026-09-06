@@ -38,6 +38,7 @@ const DEFAULTS = {
   SHOW_SCREEN_ON_BLOCKED: "1",
   LAST_MESSAGE_CHARS: "600",
   SCREEN_LINES: "12",
+  MIN_DURATION_SECONDS: "0",
   DRY_RUN: "0",
 };
 
@@ -847,16 +848,32 @@ async function main() {
 
   // One read of the transcript feeds the duration, the token counts and the
   // body below.
+  const minSeconds = toInt(cfg("MIN_DURATION_SECONDS"), 0);
   const wantsTurn =
-    isOn(cfg("SHOW_LAST_MESSAGE")) || isOn(cfg("SHOW_TOKENS")) || isOn(cfg("SHOW_DURATION"));
+    isOn(cfg("SHOW_LAST_MESSAGE")) ||
+    isOn(cfg("SHOW_TOKENS")) ||
+    isOn(cfg("SHOW_DURATION")) ||
+    minSeconds > 0;
   const transcript = wantsTurn ? transcriptPath(info.session) : undefined;
   const turn = transcript ? readTurn(transcript) : {};
 
+  // The pane's own working→stop gap, or the turn the transcript recorded when
+  // this plugin was not running for the whole of it.
+  const elapsed = paneElapsed ?? turn.duration;
+
+  // A turn that took seconds is one you were probably sitting through, and a
+  // phone that buzzes for those is a phone you stop reading. A blocked agent is
+  // exempt however briefly it ran: that message is a question waiting for an
+  // answer, not a report on work done.
+  if (minSeconds > 0 && status !== "blocked" && elapsed !== undefined && elapsed < minSeconds * 1000) {
+    console.log(
+      `herdr-telegram-notify: ${status} after ${humanDuration(elapsed)}, under MIN_DURATION_SECONDS=${minSeconds}; not sending`
+    );
+    return;
+  }
+
   const metaBits = [];
   if (isOn(cfg("SHOW_DURATION"))) {
-    // The pane's own working→stop gap, or the turn the transcript recorded when
-    // this plugin was not running for the whole of it.
-    const elapsed = paneElapsed ?? turn.duration;
     if (elapsed >= 1000) metaBits.push(`ran ${humanDuration(elapsed)}`);
   }
   if (isOn(cfg("SHOW_TOKENS"))) {
