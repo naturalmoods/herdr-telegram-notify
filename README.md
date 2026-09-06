@@ -109,6 +109,13 @@ Messages are sent as Telegram HTML, with the agent's `**bold**` and `` `code` ``
 carried over. If Telegram rejects the markup, the same message is re-sent as
 plain text rather than dropped.
 
+A send that fails is tried up to three times — a request is given eight seconds,
+and a dropped connection, a 5xx or a rate limit earns another go (Telegram's own
+`retry_after` when it sends one, otherwise one second, then two). A rejected
+token or chat id is not retried: nothing about it will be different next time.
+Everything is bounded, so the hook never outlives the failure by more than half
+a minute.
+
 ## Behavior
 
 - Fires on Herdr's `pane.agent_status_changed` event.

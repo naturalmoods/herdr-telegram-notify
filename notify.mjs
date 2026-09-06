@@ -53,6 +53,14 @@ const SESSION_GUARD_WINDOW = 30 * 1000;
 // How long a pane's or session's state file outlives its last status change.
 const STATE_TTL = 7 * 24 * 60 * 60 * 1000;
 
+// One send: how long a request may take, how many goes it gets, and how long it
+// waits between them. The whole hook stays under half a minute even with the
+// network down, so a dead wifi never leaves a process hanging around.
+const SEND_TIMEOUT = 8 * 1000;
+const SEND_ATTEMPTS = 3;
+const SEND_BACKOFF = 1000;
+const MAX_RETRY_AFTER = 30 * 1000;
+
 // ---------------------------------------------------------------- utilities
 
 function readJson(envVar) {
@@ -129,6 +137,17 @@ function isOn(value) {
 function toInt(value, fallback) {
   const n = Number.parseInt(String(value ?? ""), 10);
   return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// The bot token is in the request URL, so anything that quotes the URL back —
+// a fetch error, a stack trace — would put it in a log file.
+function redact(text, token) {
+  const s = String(text);
+  return token ? s.split(token).join("<token>") : s;
 }
 
 function escapeHtml(text) {
@@ -523,26 +542,67 @@ function buildMessage(parts) {
   };
 }
 
+// Worth another go: a connection that never landed (status 0), a rate limit, or
+// a server-side error. A 400 is the markup, handled on its own below; 401, 403
+// and 404 are the token or the chat id, and no amount of retrying fixes those.
+function isRetryable(status) {
+  return status === 0 || status === 429 || status >= 500;
+}
+
+// Telegram says how long to wait when it rate-limits; honour it, within reason.
+function retryAfterMs(body) {
+  try {
+    const seconds = JSON.parse(body)?.parameters?.retry_after;
+    if (Number.isFinite(seconds) && seconds > 0) return Math.min(seconds * 1000, MAX_RETRY_AFTER);
+  } catch {}
+  return undefined;
+}
+
 async function sendTelegram(token, chatId, message) {
   const url = `https://api.telegram.org/bot${token}/sendMessage`;
   const post = async (payload) => {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, disable_web_page_preview: true, ...payload }),
-    });
-    return { ok: res.ok, status: res.status, body: await res.text().catch(() => "") };
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId, disable_web_page_preview: true, ...payload }),
+        signal: AbortSignal.timeout(SEND_TIMEOUT),
+      });
+      return { ok: res.ok, status: res.status, body: await res.text().catch(() => "") };
+    } catch (err) {
+      // Refused, unresolvable, or past SEND_TIMEOUT: no response, so no status.
+      return { ok: false, status: 0, body: redact(err?.message ?? err, token) };
+    }
   };
 
-  let result = await post({ text: message.html, parse_mode: "HTML" });
-  if (!result.ok && result.status === 400) {
-    // Markup Telegram rejected (an entity we failed to escape, or a server too
-    // old for <blockquote>) — resend as plain text rather than lose the alert.
-    console.error(`herdr-telegram-notify: HTML rejected (${result.body}); retrying as plain text`);
-    result = await post({ text: message.plain });
+  let payload = { text: message.html, parse_mode: "HTML" };
+  let attempts = 0;
+  let result;
+  for (;;) {
+    result = await post(payload);
+    if (result.ok) {
+      console.log(`herdr-telegram-notify: sent, response: ${result.body}`);
+      return;
+    }
+    if (result.status === 400 && payload.parse_mode) {
+      // Markup Telegram rejected (an entity we failed to escape, or a server too
+      // old for <blockquote>) — resend as plain text rather than lose the alert.
+      // A different message, not a retry of this one, so it costs no attempt.
+      console.error(`herdr-telegram-notify: HTML rejected (${result.body}); retrying as plain text`);
+      payload = { text: message.plain };
+      continue;
+    }
+    attempts += 1;
+    if (attempts >= SEND_ATTEMPTS || !isRetryable(result.status)) break;
+    // A notification is worth a second try: the usual failure is a laptop whose
+    // wifi has not come back yet, which is over in a couple of seconds.
+    const wait = retryAfterMs(result.body) ?? SEND_BACKOFF * 2 ** (attempts - 1);
+    console.error(
+      `herdr-telegram-notify: attempt ${attempts} failed (${result.status || "no response"}: ${result.body}); retrying in ${Math.round(wait / 1000)}s`
+    );
+    await sleep(wait);
   }
-  if (!result.ok) throw new Error(`Telegram API ${result.status}: ${result.body}`);
-  console.log(`herdr-telegram-notify: sent, response: ${result.body}`);
+  throw new Error(`Telegram API ${result.status || "unreachable"}: ${result.body}`);
 }
 
 // --------------------------------------------------------------------- main
@@ -724,7 +784,7 @@ async function main() {
   try {
     await sendTelegram(token, chatId, message);
   } catch (err) {
-    console.error(`herdr-telegram-notify: ${err.message}`);
+    console.error(`herdr-telegram-notify: ${redact(err.message, token)}`);
     process.exitCode = 1;
   }
 }
