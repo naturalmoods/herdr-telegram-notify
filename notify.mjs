@@ -95,16 +95,6 @@ async function main() {
   const event = readJson("HERDR_PLUGIN_EVENT_JSON");
   const context = readJson("HERDR_PLUGIN_CONTEXT_JSON");
 
-  if (process.env.HERDR_PLUGIN_STATE_DIR) {
-    try {
-      mkdirSync(process.env.HERDR_PLUGIN_STATE_DIR, { recursive: true });
-      writeFileSync(
-        join(process.env.HERDR_PLUGIN_STATE_DIR, "debug-last-event.json"),
-        JSON.stringify({ event, context }, null, 2)
-      );
-    } catch {}
-  }
-
   const status = extractStatus(event, context);
   if (!status || !NOTIFY_STATUSES.has(status)) return;
 

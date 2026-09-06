@@ -28,8 +28,9 @@ TELEGRAM_CHAT_ID=<your chat id>
 - Ignores every status except `done` and `blocked`.
 - De-dupes: won't send twice in a row for the same pane if the status hasn't
   actually changed since the last notification.
-- Message format: `✅ <agent> done — <workspace:tab>` or
-  `⚠️ <agent> blocked — <workspace:tab>`.
+- Message format: `✅ <agent kind> done — <workspace label> (<pane id>)` or
+  `⚠️ <agent kind> blocked — <workspace label> (<pane id>)`, e.g.
+  `✅ claude done — jegykezelo (wB:p9)`.
 
 ## Uninstall
 
