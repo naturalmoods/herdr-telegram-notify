@@ -40,6 +40,8 @@ const DEFAULTS = {
   SCREEN_LINES: "12",
   MIN_DURATION_SECONDS: "0",
   QUIET_HOURS: "",
+  NOTIFY_WORKSPACES: "",
+  IGNORE_WORKSPACES: "",
   DRY_RUN: "0",
 };
 
@@ -139,6 +141,17 @@ function loadEnvFile(dir) {
 function loadConfig() {
   const fileEnv = loadEnvFile(process.env.HERDR_PLUGIN_CONFIG_DIR);
   return (key) => firstDefined(process.env[key], fileEnv[key], DEFAULTS[key]);
+}
+
+// Undefined when the list is empty — "nothing said", which is not the same
+// answer as "said no".
+function listMatches(list, ...values) {
+  const wanted = String(list ?? "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  if (!wanted.length) return undefined;
+  return values.some((v) => v !== undefined && wanted.includes(String(v).toLowerCase()));
 }
 
 function isOn(value) {
@@ -274,6 +287,7 @@ function paneInfo(snapshot, paneId) {
     cwd: firstDefined(pane.cwd, pane.foreground_cwd),
     title: pane.terminal_title_stripped,
     session: pane.agent_session,
+    workspaceId: pane.workspace_id,
     workspaceLabel: (snapshot.workspaces ?? []).find((w) => w.workspace_id === pane.workspace_id)?.label,
     tabLabel: (snapshot.tabs ?? []).find((t) => t.tab_id === pane.tab_id)?.label,
   };
@@ -847,6 +861,20 @@ async function main() {
     data.workspace_id
   );
   const tabLabel = firstDefined(info.tabLabel, sameAsFocused ? context.tab_label : undefined);
+
+  // Five agents running and two of them worth interrupting for: name the ones
+  // that may reach the phone, or the ones that may not. A workspace answers to
+  // its label and to its id, so `marys.hu` and `wA` both work — the label is
+  // what you think in, the id is what survives renaming it.
+  const workspaceId = firstDefined(info.workspaceId, data.workspace_id);
+  const allowed = listMatches(cfg("NOTIFY_WORKSPACES"), workspaceLabel, workspaceId);
+  const ignored = listMatches(cfg("IGNORE_WORKSPACES"), workspaceLabel, workspaceId);
+  if (allowed === false || ignored === true) {
+    console.log(
+      `herdr-telegram-notify: ${firstDefined(workspaceLabel, workspaceId, "this workspace")} is filtered out by ${allowed === false ? "NOTIFY_WORKSPACES" : "IGNORE_WORKSPACES"}; not sending`
+    );
+    return;
+  }
 
   const agent = String(firstDefined(data.display_agent, data.agent, context.focused_pane_agent, "agent"));
   const statusLabel = String(firstDefined(data.state_labels?.[status], status));

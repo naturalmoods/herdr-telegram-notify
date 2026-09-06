@@ -143,6 +143,10 @@ rejected token or chat id is never queued, since nothing about it will change.
   does not need a notification, and a phone that buzzes for those is a phone you
   stop reading. Off by default; 60 is a sensible start. Never applies to
   `blocked`, which is a question waiting on you however briefly it ran.
+- `NOTIFY_WORKSPACES` and `IGNORE_WORKSPACES` decide which workspaces may reach
+  the phone at all. Comma separated, matched against the workspace's label and
+  its id, so `marys.hu` and `wA` name the same one. An empty allowlist means all
+  of them; the denylist wins either way.
 - `QUIET_HOURS=23:00-07:00` delivers without a sound inside that window (local
   time, may run past midnight). The message still arrives and still waits in the
   chat — Telegram simply does not ring for it, so an overnight run is there in
