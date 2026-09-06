@@ -7,4 +7,6 @@ platforms = ["linux", "macos"]
 
 [[events]]
 on = "pane.agent_status_changed"
-command = ["node", "notify.mjs"]
+# Herdr's own process may not have the interactive shell's PATH (e.g. nvm-installed
+# node isn't on it), so this points at a node binary directly instead of relying on PATH.
+command = ["/bin/sh", "-c", "command -v node >/dev/null 2>&1 && exec node notify.mjs; for n in \"$HOME\"/.config/nvm/versions/node/*/bin/node /usr/local/bin/node /usr/bin/node; do [ -x \"$n\" ] && exec \"$n\" notify.mjs; done; echo 'node not found' >&2; exit 1"]
