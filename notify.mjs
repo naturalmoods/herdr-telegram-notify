@@ -51,55 +51,30 @@ function loadEnvFile(dir) {
   }
 }
 
+// Actual shapes (captured via HERDR_PLUGIN_STATE_DIR/debug-last-event.json):
+// event   = { event: "pane_agent_status_changed",
+//             data: { type, pane_id, workspace_id, agent_status, agent } }
+// context = { workspace_id, workspace_label, tab_id, focused_pane_id,
+//             focused_pane_agent, focused_pane_status, ... }
+
 function extractStatus(event, context) {
-  const raw = firstDefined(
-    event.status,
-    event.new_status,
-    event.newStatus,
-    event.data?.status,
-    context.agent?.status,
-    context.pane?.agent?.status
-  );
+  const raw = firstDefined(event.data?.agent_status, context.focused_pane_status);
   return typeof raw === "string" ? raw.toLowerCase() : undefined;
 }
 
 function extractAgentName(event, context) {
-  return firstDefined(
-    context.agent?.name,
-    context.pane?.agent?.name,
-    event.agent?.name,
-    event.agent_name,
-    event.agentName,
-    "agent"
-  );
+  return firstDefined(event.data?.agent, context.focused_pane_agent, "agent");
 }
 
 function extractLocation(event, context) {
-  const workspaceId = firstDefined(
-    context.workspace?.id,
-    context.workspace_id,
-    event.workspace_id
-  );
-  const tabId = firstDefined(context.tab?.id, context.tab_id, event.tab_id);
-  const paneId = firstDefined(
-    context.pane?.id,
-    context.pane_id,
-    event.pane_id,
-    process.env.HERDR_PANE_ID
-  );
-  if (workspaceId && tabId) return `${workspaceId}:${tabId}`;
-  if (paneId) return String(paneId);
-  return "unknown location";
+  const label = firstDefined(context.workspace_label, event.data?.workspace_id);
+  const paneId = firstDefined(event.data?.pane_id, context.focused_pane_id);
+  if (label && paneId) return `${label} (${paneId})`;
+  return String(firstDefined(label, paneId, "unknown location"));
 }
 
 function dedupeKey(event, context) {
-  return firstDefined(
-    context.pane?.id,
-    context.pane_id,
-    event.pane_id,
-    process.env.HERDR_PANE_ID,
-    "default"
-  );
+  return firstDefined(event.data?.pane_id, context.focused_pane_id, "default");
 }
 
 async function sendTelegram(token, chatId, text) {
