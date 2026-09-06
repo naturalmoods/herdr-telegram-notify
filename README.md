@@ -80,7 +80,7 @@ Line by line, and the key that removes it:
 | Status header | the event's agent + status | always |
 | Session title | the agent's own pane title | `SHOW_TITLE` |
 | Workspace, branch, cwd | session snapshot + the repo's `.git/HEAD` | `SHOW_PROJECT`, `SHOW_BRANCH` |
-| Duration | the `working` → `done` gap this plugin records, or the turn in the transcript | `SHOW_DURATION` |
+| Duration | the `working` → stop gap this plugin records, or the turn in the transcript | `SHOW_DURATION` |
 | Tokens and cost | `usage` on the transcript's assistant records, summed over the turn | `SHOW_TOKENS` |
 | Clock time (off by default) | the moment of the status change | `SHOW_TIMESTAMP` |
 | Where it happened, and the command to jump back | session snapshot | `SHOW_PANE`, `SHOW_HOST` |
@@ -112,6 +112,10 @@ plain text rather than dropped.
   cost of a ping for every short turn in the pane you are looking at.
 - De-dupes: won't send twice in a row for the same pane if the status hasn't
   actually changed since the last notification.
+- The duration is the pane's own `working` → stop gap, but only while that gap
+  stays believable as one turn (under six hours). A machine that suspends
+  mid-turn notices the status change on waking, not when the agent stopped, so
+  past that the transcript's own turn is used instead.
 - Degrades instead of failing. Without the `herdr` CLI on the machine there is
   no snapshot, so the message falls back to what the event and the focused-pane
   context carry; an unreadable transcript just drops the body.

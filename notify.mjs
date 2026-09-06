@@ -42,6 +42,9 @@ const DEFAULTS = {
 
 const TELEGRAM_LIMIT = 4096;
 
+// Longest working→stop gap still believable as one turn; see main().
+const MAX_PANE_ELAPSED = 6 * 60 * 60 * 1000;
+
 // ---------------------------------------------------------------- utilities
 
 function readJson(envVar) {
@@ -511,8 +514,19 @@ async function main() {
   const key = stateKey(event, context);
   const previous = readState(stateDir, key);
   if (previous.status === status) return; // repeat of a state we already handled
-  const workingSince = status === "working" ? Date.now() : previous.workingSince;
-  writeState(stateDir, key, { status, workingSince, updatedAt: Date.now() });
+  const now = Date.now();
+  // `working` starts the clock and every other status stops it: this run spends
+  // the gap and the state file drops it. Carrying it forward instead made the
+  // next stop report a working stretch that had already ended — a done → idle →
+  // done flap, or a pane that sat in `working` while the machine slept, arrived
+  // as "ran 14h" for a turn of seconds.
+  const workingSince = status === "working" ? now : undefined;
+  const sinceWorking = status === "working" || !previous.workingSince ? undefined : now - previous.workingSince;
+  // Even so the clock can outlive the work: a suspended machine notices the
+  // status change on wake, not when the agent stopped. Past this the transcript's
+  // own turn is the more honest number.
+  const paneElapsed = sinceWorking !== undefined && sinceWorking <= MAX_PANE_ELAPSED ? sinceWorking : undefined;
+  writeState(stateDir, key, { status, workingSince, updatedAt: now });
 
   const notifyStatuses = new Set(
     String(cfg("NOTIFY_STATUSES"))
@@ -591,9 +605,9 @@ async function main() {
 
   const metaBits = [];
   if (isOn(cfg("SHOW_DURATION"))) {
-    // The pane's own working→done gap, or the turn the transcript recorded when
+    // The pane's own working→stop gap, or the turn the transcript recorded when
     // this plugin was not running for the whole of it.
-    const elapsed = workingSince ? Date.now() - workingSince : turn.duration;
+    const elapsed = paneElapsed ?? turn.duration;
     if (elapsed >= 1000) metaBits.push(`ran ${humanDuration(elapsed)}`);
   }
   if (isOn(cfg("SHOW_TOKENS"))) {
