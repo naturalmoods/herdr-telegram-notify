@@ -39,6 +39,7 @@ const DEFAULTS = {
   LAST_MESSAGE_CHARS: "600",
   SCREEN_LINES: "12",
   MIN_DURATION_SECONDS: "0",
+  QUIET_HOURS: "",
   DRY_RUN: "0",
 };
 
@@ -196,6 +197,21 @@ function humanTokens(n) {
   if (n < 1000) return String(n);
   if (n < 1000000) return `${(n / 1000).toFixed(n < 10000 ? 1 : 0).replace(/\.0$/, "")}k`;
   return `${(n / 1000000).toFixed(1).replace(/\.0$/, "")}M`;
+}
+
+// "23:00-07:00", a window that may run past midnight. Anything unparseable is
+// read as no window at all: a typo should cost you a silent night, not silence
+// every notification you have.
+function inQuietHours(spec, now = new Date()) {
+  const match = /^\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*$/.exec(String(spec ?? ""));
+  if (!match) return false;
+  const [fromH, fromM, toH, toM] = match.slice(1).map(Number);
+  if (fromH > 23 || toH > 23 || fromM > 59 || toM > 59) return false;
+  const from = fromH * 60 + fromM;
+  const to = toH * 60 + toM;
+  if (from === to) return false;
+  const minutes = now.getHours() * 60 + now.getMinutes();
+  return from < to ? minutes >= from && minutes < to : minutes >= from || minutes < to;
 }
 
 function clockTime(date) {
@@ -601,14 +617,20 @@ function retryAfterMs(body) {
   return undefined;
 }
 
-async function sendTelegram(token, chatId, message) {
+async function sendTelegram(token, chatId, message, { silent } = {}) {
   const url = `https://api.telegram.org/bot${token}/sendMessage`;
   const post = async (payload) => {
     try {
       const res = await fetch(url, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ chat_id: chatId, disable_web_page_preview: true, ...payload }),
+        body: JSON.stringify({
+          chat_id: chatId,
+          disable_web_page_preview: true,
+          // Delivered, listed, unread — just without the sound.
+          ...(silent ? { disable_notification: true } : {}),
+          ...payload,
+        }),
         signal: AbortSignal.timeout(SEND_TIMEOUT),
       });
       return { ok: res.ok, status: res.status, body: await res.text().catch(() => "") };
@@ -709,7 +731,7 @@ function queuePending(stateDir, parts) {
 // failure so nothing arrives out of order. Returns false only when a send
 // actually failed — the caller takes that as "still offline" and does not spend
 // another round of attempts proving it.
-async function flushPending(stateDir, token, chatId) {
+async function flushPending(stateDir, token, chatId, silent) {
   const waiting = readPending(stateDir);
   // Nothing worth sending — which includes a file holding only entries that have
   // aged out, so this is also where those stop taking up space.
@@ -724,7 +746,7 @@ async function flushPending(stateDir, token, chatId) {
     // Telegram stamps the message with its arrival time, which by now is a lie.
     const late = `🕘 delayed ${humanDuration(Date.now() - entry.at)}`;
     try {
-      await sendTelegram(token, chatId, buildMessage({ ...entry.parts, late }));
+      await sendTelegram(token, chatId, buildMessage({ ...entry.parts, late }), { silent });
     } catch (err) {
       console.error(
         `herdr-telegram-notify: ${waiting.length} message(s) still waiting: ${redact(err.message, token)}`
@@ -762,7 +784,10 @@ async function main() {
   // status change on any pane is the cue to try again — including the ones this
   // run is about to filter out, which is what keeps a queue from sitting there
   // until the next thing worth notifying happens.
-  const online = !dryRun && token && chatId ? await flushPending(stateDir, token, chatId) : true;
+  // Overnight the message still arrives and still waits in the chat; it just
+  // does not make a sound doing it.
+  const silent = inQuietHours(cfg("QUIET_HOURS"));
+  const online = !dryRun && token && chatId ? await flushPending(stateDir, token, chatId, silent) : true;
 
   const key = stateKey(event, context);
   const previous = readState(stateDir, key);
@@ -934,6 +959,7 @@ async function main() {
   const message = buildMessage(parts);
 
   if (dryRun) {
+    if (silent) console.log("--- (quiet hours: would be delivered without a sound) ---");
     console.log(`--- sent as HTML ---\n${message.html}\n\n--- plain-text fallback ---\n${message.plain}`);
     return;
   }
@@ -948,7 +974,7 @@ async function main() {
   }
 
   try {
-    await sendTelegram(token, chatId, message);
+    await sendTelegram(token, chatId, message, { silent });
   } catch (err) {
     console.error(`herdr-telegram-notify: ${redact(err.message, token)}`);
     // A refused connection or a Telegram that is down will look different in a
