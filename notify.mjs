@@ -67,6 +67,9 @@ const MAX_RETRY_AFTER = 30 * 1000;
 const PENDING_TTL = 6 * 60 * 60 * 1000;
 const PENDING_MAX = 20;
 
+// Longest a single head line may be before it is clipped; see buildMessage().
+const HEAD_LINE_CHARS = 300;
+
 // ---------------------------------------------------------------- utilities
 
 function readJson(envVar) {
@@ -518,34 +521,67 @@ function writeState(stateDir, key, state) {
 
 const STATUS_EMOJI = { done: "✅", blocked: "⚠️", working: "⏳", idle: "💤" };
 
+// A head line is short by nature, but nothing promises it: a pane title is
+// whatever the terminal last set it to. Clipping the source — before escaping,
+// so no entity is ever cut in half — keeps the whole head well inside the limit,
+// which leaves the budget below to be spent entirely on the body.
+function clip(text, max) {
+  const s = String(text);
+  return s.length <= max ? s : `${s.slice(0, max - 1)}…`;
+}
+
 function buildMessage(parts) {
-  const { emoji, agent, statusLabel, title, project, meta, pane, herd, body, bodyIsScreen } = parts;
+  const { emoji, agent, statusLabel, title, project, meta, pane, herd, bodyIsScreen, late } = parts;
 
-  const plain = [`${emoji} ${agent} · ${statusLabel}`];
-  const html = [`${emoji} <b>${escapeHtml(agent)} · ${escapeHtml(statusLabel)}</b>`];
+  const render = (body) => {
+    const plain = [];
+    const html = [];
+    if (late) {
+      plain.push(late);
+      html.push(escapeHtml(late));
+    }
+    plain.push(`${emoji} ${clip(agent, 60)} · ${clip(statusLabel, 60)}`);
+    html.push(`${emoji} <b>${escapeHtml(clip(agent, 60))} · ${escapeHtml(clip(statusLabel, 60))}</b>`);
 
-  if (title) {
-    plain.push(title);
-    html.push(`<i>${escapeHtml(title)}</i>`);
-  }
-  for (const line of [project, meta, pane, herd ? `🐑 ${herd}` : undefined].filter(Boolean)) {
-    plain.push(line);
-    html.push(escapeHtml(line));
-  }
-  if (body) {
-    plain.push("", bodyIsScreen ? body : stripEmphasis(body));
-    html.push(
-      "",
-      bodyIsScreen
-        ? `<pre>${escapeHtml(body)}</pre>`
-        : `<blockquote>${inlineMarkdown(escapeHtml(body))}</blockquote>`
-    );
-  }
-
-  return {
-    plain: plain.join("\n").slice(0, TELEGRAM_LIMIT),
-    html: html.join("\n").slice(0, TELEGRAM_LIMIT),
+    if (title) {
+      const shown = clip(title, HEAD_LINE_CHARS);
+      plain.push(shown);
+      html.push(`<i>${escapeHtml(shown)}</i>`);
+    }
+    for (const line of [project, meta, pane, herd ? `🐑 ${herd}` : undefined].filter(Boolean)) {
+      const shown = clip(line, HEAD_LINE_CHARS);
+      plain.push(shown);
+      html.push(escapeHtml(shown));
+    }
+    if (body) {
+      plain.push("", bodyIsScreen ? body : stripEmphasis(body));
+      html.push(
+        "",
+        bodyIsScreen
+          ? `<pre>${escapeHtml(body)}</pre>`
+          : `<blockquote>${inlineMarkdown(escapeHtml(body))}</blockquote>`
+      );
+    }
+    return { plain: plain.join("\n"), html: html.join("\n") };
   };
+
+  // Escaping turns one character into as many as six and the body is wrapped in
+  // tags, so the body's own length says little about the message's. Shrink the
+  // source and render again until it fits: cutting the finished HTML to length
+  // instead would leave a half-written tag behind, and Telegram rejects the
+  // whole message over it — every long message arrived stripped of its markup.
+  let body = parts.body;
+  let message = render(body);
+  while (body && (message.html.length > TELEGRAM_LIMIT || message.plain.length > TELEGRAM_LIMIT)) {
+    // Scale rather than subtract: a body of `<` renders four characters for
+    // every one it holds, and taking the overshoot off the source directly
+    // would cut the whole body away in a single step.
+    const rendered = Math.max(message.html.length, message.plain.length);
+    const room = Math.min(Math.floor((body.length * TELEGRAM_LIMIT) / rendered), body.length - 32);
+    body = room > 0 ? truncate(body, room) : undefined;
+    message = render(body);
+  }
+  return message;
 }
 
 // Worth another go: a connection that never landed (status 0), a rate limit, or
@@ -634,7 +670,7 @@ function readPending(stateDir) {
     if (!line.trim()) continue;
     try {
       const entry = JSON.parse(line);
-      if (entry?.html && entry.at > cutoff) entries.push(entry);
+      if (entry?.parts && entry.at > cutoff) entries.push(entry);
     } catch {}
   }
   return entries.slice(-PENDING_MAX);
@@ -655,13 +691,15 @@ function writePending(stateDir, entries) {
   } catch {}
 }
 
-function queuePending(stateDir, message) {
+function queuePending(stateDir, parts) {
   if (!pendingPath(stateDir)) {
     console.error("herdr-telegram-notify: no state directory, so the message could not be kept for later");
     return;
   }
   const entries = readPending(stateDir);
-  entries.push({ at: Date.now(), html: message.html, plain: message.plain });
+  // The parts, not the rendered message: a late delivery carries an extra line,
+  // and rendering it then is what keeps the result inside Telegram's limit.
+  entries.push({ at: Date.now(), parts });
   writePending(stateDir, entries);
   console.error(`herdr-telegram-notify: kept for the next event (${entries.length} waiting)`);
 }
@@ -685,10 +723,7 @@ async function flushPending(stateDir, token, chatId) {
     // Telegram stamps the message with its arrival time, which by now is a lie.
     const late = `🕘 delayed ${humanDuration(Date.now() - entry.at)}`;
     try {
-      await sendTelegram(token, chatId, {
-        html: `${late}\n${entry.html}`.slice(0, TELEGRAM_LIMIT),
-        plain: `${late}\n${entry.plain}`.slice(0, TELEGRAM_LIMIT),
-      });
+      await sendTelegram(token, chatId, buildMessage({ ...entry.parts, late }));
     } catch (err) {
       console.error(
         `herdr-telegram-notify: ${waiting.length} message(s) still waiting: ${redact(err.message, token)}`
@@ -878,7 +913,8 @@ async function main() {
     writeState(stateDir, guardKey, { status, endedAt: turn.endedAt, at: Date.now(), paneId });
   }
 
-  const message = buildMessage({ emoji, agent, statusLabel, title, project, meta, pane, herd, body, bodyIsScreen });
+  const parts = { emoji, agent, statusLabel, title, project, meta, pane, herd, body, bodyIsScreen };
+  const message = buildMessage(parts);
 
   if (dryRun) {
     console.log(`--- sent as HTML ---\n${message.html}\n\n--- plain-text fallback ---\n${message.plain}`);
@@ -889,7 +925,7 @@ async function main() {
     // The queue flush just proved the network is down; no point spending another
     // round of attempts on the same connection.
     console.error("herdr-telegram-notify: still offline, not retrying this one now");
-    queuePending(stateDir, message);
+    queuePending(stateDir, parts);
     process.exitCode = 1;
     return;
   }
@@ -901,7 +937,7 @@ async function main() {
     // A refused connection or a Telegram that is down will look different in a
     // minute; a rejected token or chat id will not, and queueing it would only
     // pile up messages that can never be sent.
-    if (isRetryable(err.status)) queuePending(stateDir, message);
+    if (isRetryable(err.status)) queuePending(stateDir, parts);
     process.exitCode = 1;
   }
 }

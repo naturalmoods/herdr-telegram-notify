@@ -109,6 +109,11 @@ Messages are sent as Telegram HTML, with the agent's `**bold**` and `` `code` ``
 carried over. If Telegram rejects the markup, the same message is re-sent as
 plain text rather than dropped.
 
+Telegram takes 4096 characters. A message that would run past that is fitted by
+shortening the body and rendering again, so what arrives is always whole markup
+— raising `LAST_MESSAGE_CHARS` or `SCREEN_LINES` past what fits costs you the
+tail of the text, never the formatting of the rest.
+
 A send that fails is tried up to three times — a request is given eight seconds,
 and a dropped connection, a 5xx or a rate limit earns another go (Telegram's own
 `retry_after` when it sends one, otherwise one second, then two). A rejected
