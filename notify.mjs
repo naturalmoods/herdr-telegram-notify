@@ -68,10 +68,26 @@ function firstDefined(...values) {
   return undefined;
 }
 
+// The .env holds the bot token, and anyone holding it can post as the bot. Herdr
+// creates the config dir with the default umask, so the file is usually born
+// world-readable — say so on every run that reads a loose one, with the fix.
+function warnIfWorldReadable(path) {
+  try {
+    const mode = statSync(path).mode & 0o777;
+    if (mode & 0o077) {
+      console.error(
+        `herdr-telegram-notify: ${path} is readable by other users (mode ${mode.toString(8)}) and holds your bot token — run: chmod 600 ${path}`
+      );
+    }
+  } catch {}
+}
+
 function loadEnvFile(dir) {
   if (!dir) return {};
   try {
-    const text = readFileSync(join(dir, ".env"), "utf8");
+    const file = join(dir, ".env");
+    const text = readFileSync(file, "utf8");
+    warnIfWorldReadable(file);
     const out = {};
     for (const line of text.split("\n")) {
       const trimmed = line.trim();

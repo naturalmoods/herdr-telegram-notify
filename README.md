@@ -31,6 +31,17 @@ Every other key in `.env.example` is optional and switches one part of the
 message on or off. `.env` is gitignored — the token belongs in the config
 directory, not in this repo.
 
+The config directory is created with your default umask, so the file usually
+lands world-readable. Anyone who can read it can post as your bot, so close it
+down once:
+
+```
+chmod 600 "$(herdr plugin config-dir naturalmoods.herdr-telegram-notify)/.env"
+```
+
+The plugin says so on stderr — visible in `herdr plugin log list` — on every run
+that reads a `.env` other users can read.
+
 ### Getting a bot token and a chat id
 
 1. **Create the bot.** In Telegram, open a chat with [@BotFather](https://t.me/BotFather)
