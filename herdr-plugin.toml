@@ -18,3 +18,11 @@ id = "mute"
 title = "Mute/unmute Telegram notifications"
 description = "Stop sending for MUTE_MINUTES (default an hour), or start again if already muted."
 command = ["/bin/sh", "run.sh", "mute.mjs"]
+
+# Check everything the notifier depends on and send one test message. The report
+# lands in `herdr plugin log list`; the verdict in a Herdr notification.
+[[actions]]
+id = "doctor"
+title = "Check Telegram notify setup"
+description = "Verify node, herdr, git, the config, the state directory and the bot credentials, then send a test message."
+command = ["/bin/sh", "run.sh", "doctor.mjs"]

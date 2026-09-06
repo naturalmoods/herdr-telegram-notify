@@ -230,6 +230,19 @@ rejected token or chat id is never queued, since nothing about it will change.
   no snapshot, so the message falls back to what the event and the focused-pane
   context carry; an unreadable transcript just drops the body.
 
+## Checking the setup
+
+```
+herdr plugin action invoke doctor
+```
+
+It reports Node, the `herdr` and `git` binaries, the config file and its
+permissions, every setting that is doing something, the state directory, and the
+bot credentials — then sends one silent test message, which is the only check
+that proves the token and the chat id together. The report lands in
+`herdr plugin log list` and the verdict in a Herdr notification. Bind it like
+the mute action if you want it on a key.
+
 ## When nothing arrives
 
 Most runs end without sending, on purpose: a status nobody asked about, a pane
