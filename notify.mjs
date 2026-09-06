@@ -217,10 +217,14 @@ function sleep(ms) {
 }
 
 // The bot token is in the request URL, so anything that quotes the URL back —
-// a fetch error, a stack trace — would put it in a log file.
+// a fetch error, a stack trace — would put it in a log file. The pattern catches
+// a token-shaped string even where the token itself was not passed in, which is
+// the case anywhere config has not been read yet.
 function redact(text, token) {
-  const s = String(text);
-  return token ? s.split(token).join("<token>") : s;
+  const s = token ? String(text).split(token).join("<token>") : String(text);
+  // No leading boundary: in a request URL the token follows `bot` directly, and
+  // `t8735…` is not a word boundary at all.
+  return s.replace(/\d{5,}:[A-Za-z0-9_-]{20,}/g, "<token>");
 }
 
 function escapeHtml(text) {
@@ -1301,4 +1305,10 @@ async function main() {
   }
 }
 
-main();
+// A hook that dies takes its message with it, and an unhandled rejection reports
+// that as a bare stack trace in the plugin log — through which the token would
+// travel if the failure came from anywhere near the request URL.
+main().catch((err) => {
+  console.error(`herdr-telegram-notify: unexpected failure — ${redact(err?.stack ?? err?.message ?? err)}`);
+  process.exitCode = 1;
+});
