@@ -254,6 +254,15 @@ function inQuietHours(spec, now = new Date()) {
   return from < to ? minutes >= from && minutes < to : minutes >= from || minutes < to;
 }
 
+// A turn that cost four tenths of a cent is the common case, and `$0.00` says
+// nothing about it — so the precision follows the number down. Two decimals
+// above a dime, because money written `$1.2` reads like a typo.
+function humanCost(cost) {
+  if (cost >= 0.1) return `$${cost.toFixed(2)}`;
+  if (cost < 0.0005) return "<$0.001";
+  return `$${cost.toFixed(cost >= 0.01 ? 3 : 4).replace(/0+$/, "")}`;
+}
+
 function clockTime(date) {
   return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
 }
@@ -1188,7 +1197,7 @@ async function main() {
   if (isOn(cfg("SHOW_TOKENS"))) {
     if (turn.out) metaBits.push(`${humanTokens(turn.out)} out`);
     if (turn.context) metaBits.push(`${humanTokens(turn.context)} ctx`);
-    if (turn.cost) metaBits.push(`$${turn.cost.toFixed(2)}`);
+    if (turn.cost) metaBits.push(humanCost(turn.cost));
   }
   if (isOn(cfg("SHOW_TIMESTAMP"))) metaBits.push(`at ${clockTime(new Date())}`);
   const meta = metaBits.length ? `⏱ ${metaBits.join(" · ")}` : undefined;
