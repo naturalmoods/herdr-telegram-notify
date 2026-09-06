@@ -150,11 +150,33 @@ function loadEnvFile(dir) {
   }
 }
 
+// Keys the plugin reads that have no default: the two required ones, and the one
+// only the mute action looks at.
+const EXTRA_KEYS = ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "MUTE_MINUTES"];
+
+// A .env key nobody reads is silent by nature: SHOW_TOKEN looks exactly like a
+// setting that is working, and the message it was meant to change never changes.
+function warnUnknownKeys(fileEnv) {
+  const known = [...Object.keys(DEFAULTS), ...EXTRA_KEYS];
+  const lookup = known.map((k) => k.toLowerCase());
+  for (const key of Object.keys(fileEnv)) {
+    if (known.includes(key)) continue;
+    const lower = key.toLowerCase();
+    // A wrong case, a missing letter or one too many — the typos a list of every
+    // valid key would not help you find.
+    const index = lookup.findIndex((k) => k === lower || k.startsWith(lower) || lower.startsWith(k));
+    console.error(
+      `herdr-telegram-notify: .env sets ${key}, which this plugin does not read${index === -1 ? "" : ` — did you mean ${known[index]}?`}`
+    );
+  }
+}
+
 // The process env wins over the config dir's .env, which wins over DEFAULTS —
 // so a single run can be overridden (DRY_RUN=1, SCREEN_LINES=40) without
 // editing the file that holds the persistent setup.
 function loadConfig() {
   const fileEnv = loadEnvFile(process.env.HERDR_PLUGIN_CONFIG_DIR);
+  warnUnknownKeys(fileEnv);
   return (key) => firstDefined(process.env[key], fileEnv[key], DEFAULTS[key]);
 }
 
