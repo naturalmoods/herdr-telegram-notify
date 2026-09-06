@@ -26,6 +26,8 @@ import { spawnSync } from "node:child_process";
 const DEFAULTS = {
   NOTIFY_STATUSES: "done,blocked",
   SHOW_TITLE: "1",
+  SHOW_PROMPT: "1",
+  PROMPT_CHARS: "120",
   SHOW_PROJECT: "1",
   SHOW_BRANCH: "1",
   SHOW_DURATION: "1",
@@ -443,6 +445,18 @@ function usageOf(message) {
   };
 }
 
+// What the person actually typed, out of a record that also carries whatever the
+// harness wrapped around it.
+function promptText(raw) {
+  const text = String(raw ?? "");
+  // A slash command arrives as a wrapper around its name; the name is the ask.
+  const command = /<command-name>([^<]+)<\/command-name>/.exec(text);
+  if (command) return command[1].trim();
+  return text
+    .replace(/<(system-reminder|local-command-[a-z]+|command-[a-z]+)>[\s\S]*?<\/\1>/g, "")
+    .trim();
+}
+
 // A tool result is also a `user` record; the turn starts at the last one a
 // person actually typed.
 function isHumanPrompt(record, message) {
@@ -463,6 +477,7 @@ function readTurn(path, maxRecords = 200) {
   const lines = tail.split("\n").filter((l) => l.trim());
 
   let text;
+  let prompt;
   let endedAt;
   let startedAt;
   let out = 0;
@@ -496,6 +511,7 @@ function readTurn(path, maxRecords = 200) {
     }
     if (role === "user" && isHumanPrompt(record, message)) {
       startedAt = record.timestamp;
+      prompt = promptText(blocksToText(message.content)) || undefined;
       break; // start of this turn
     }
   }
@@ -504,6 +520,7 @@ function readTurn(path, maxRecords = 200) {
   const to = Date.parse(endedAt ?? "");
   return {
     text,
+    prompt,
     // Identifies the turn: two panes on one session read the same last record.
     endedAt,
     duration: Number.isFinite(from) && Number.isFinite(to) && to > from ? to - from : undefined,
@@ -695,7 +712,7 @@ function clip(text, max) {
 }
 
 function buildMessage(parts) {
-  const { emoji, agent, statusLabel, title, project, meta, pane, herd, bodyIsScreen, late } = parts;
+  const { emoji, agent, statusLabel, title, prompt, project, meta, pane, herd, bodyIsScreen, late } = parts;
 
   const render = (body) => {
     const plain = [];
@@ -712,7 +729,7 @@ function buildMessage(parts) {
       plain.push(shown);
       html.push(`<i>${escapeHtml(shown)}</i>`);
     }
-    for (const line of [project, meta, pane, herd ? `🐑 ${herd}` : undefined].filter(Boolean)) {
+    for (const line of [prompt, project, meta, pane, herd ? `🐑 ${herd}` : undefined].filter(Boolean)) {
       const shown = clip(line, HEAD_LINE_CHARS);
       plain.push(shown);
       html.push(escapeHtml(shown));
@@ -1058,6 +1075,7 @@ async function main() {
     isOn(cfg("SHOW_LAST_MESSAGE")) ||
     isOn(cfg("SHOW_TOKENS")) ||
     isOn(cfg("SHOW_DURATION")) ||
+    isOn(cfg("SHOW_PROMPT")) ||
     minSeconds > 0;
   const transcript = wantsTurn ? transcriptPath(info.session) : undefined;
   const turn = transcript ? readTurn(transcript) : {};
@@ -1076,6 +1094,14 @@ async function main() {
     );
     return;
   }
+
+  // The ask this turn answered. The pane title is the session's own summary,
+  // which is older and vaguer than the question actually put to it — and on a
+  // long-running session, often about something else entirely.
+  const prompt =
+    isOn(cfg("SHOW_PROMPT")) && turn.prompt
+      ? `▸ ${truncate(turn.prompt, toInt(cfg("PROMPT_CHARS"), 120)).replace(/\s*\n+\s*/g, " ")}`
+      : undefined;
 
   const metaBits = [];
   if (isOn(cfg("SHOW_DURATION"))) {
@@ -1135,7 +1161,7 @@ async function main() {
     writeState(stateDir, guardKey, { status, endedAt: turn.endedAt, at: Date.now(), paneId });
   }
 
-  const parts = { emoji, agent, statusLabel, title, project, meta, pane, herd, body, bodyIsScreen };
+  const parts = { emoji, agent, statusLabel, title, prompt, project, meta, pane, herd, body, bodyIsScreen };
   const message = buildMessage(parts);
 
   if (dryRun) {

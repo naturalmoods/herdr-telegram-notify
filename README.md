@@ -111,6 +111,7 @@ long its turn took.
 ```
 ✅ claude · done
 Fix the flaky checkout test
+▸ run it fifty times and tell me if it is actually green
 📁 storefront · main · ~/projects/storefront
 ⏱ ran 4m 12s · 18k out · 143k ctx
 🖥 workbench · tab API · herdr agent focus wC:p4
@@ -126,6 +127,7 @@ Line by line, and the key that removes it:
 | --- | --- | --- |
 | Status header | the event's agent + status | always |
 | Session title | the agent's own pane title | `SHOW_TITLE` |
+| The turn's ask | the prompt the turn started from, in the transcript | `SHOW_PROMPT`, `PROMPT_CHARS` |
 | Workspace, branch, cwd | session snapshot + the repo's `.git/HEAD` | `SHOW_PROJECT`, `SHOW_BRANCH` |
 | Duration | the `working` → stop gap this plugin records, or the turn in the transcript | `SHOW_DURATION` |
 | Tokens and cost | `usage` on the transcript's assistant records, summed over the turn | `SHOW_TOKENS` |
@@ -134,6 +136,11 @@ Line by line, and the key that removes it:
 | What the other agents are doing | session snapshot | `SHOW_HERD` |
 | Last message | the agent's transcript (`~/.claude/projects/*.jsonl`, pi's session file) | `SHOW_LAST_MESSAGE`, `LAST_MESSAGE_CHARS` |
 | Screen tail (blocked only) | `herdr pane read` — the question it is waiting on | `SHOW_SCREEN_ON_BLOCKED`, `SCREEN_LINES` |
+
+The `▸` line is the question this turn answered, which is not the `<i>` line
+above it: that one is the session's own summary, older and vaguer, and on a
+session that has run all afternoon usually about something else entirely. A turn
+started by a slash command shows the command.
 
 The `🖥` line ends in a raw pane id because `herdr agent focus` takes exactly
 that form — the workspace label and the tab name are not accepted as targets.
