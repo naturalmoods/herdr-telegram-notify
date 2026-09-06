@@ -49,6 +49,7 @@ const DEFAULTS = {
   TELEGRAM_TOPICS: "",
   NOTIFY_WORKSPACES: "",
   IGNORE_WORKSPACES: "",
+  DEBUG: "0",
   DRY_RUN: "0",
 };
 
@@ -1041,10 +1042,20 @@ async function main() {
   const context = readJson("HERDR_PLUGIN_CONTEXT_JSON");
   const cfg = loadConfig();
   const data = event.data ?? {};
+  // Most runs end at one of the returns below, having printed nothing — which is
+  // right for a hook that fires on every status change of every pane, and no help
+  // at all the day you are asking why the phone stayed quiet.
+  const debug = isOn(cfg("DEBUG"));
+  const note = (why) => {
+    if (debug) console.log(`herdr-telegram-notify: ${why}`);
+  };
 
   const rawStatus = firstDefined(data.agent_status, context.focused_pane_status);
   const status = typeof rawStatus === "string" ? rawStatus.toLowerCase() : undefined;
-  if (!status) return;
+  if (!status) {
+    note("the event carried no agent status");
+    return;
+  }
 
   // Record every transition — the working→done gap is where the duration comes
   // from — then decide whether this one is worth a message.
@@ -1072,7 +1083,11 @@ async function main() {
 
   const key = stateKey(event, context);
   const previous = readState(stateDir, key);
-  if (previous.status === status) return; // repeat of a state we already handled
+  if (previous.status === status) {
+    // A repeat of a state already handled.
+    note(`${firstDefined(data.pane_id, "the pane")} was already ${status}`);
+    return;
+  }
   const now = Date.now();
   // `working` starts the clock and every other status stops it: this run spends
   // the gap and the state file drops it. Carrying it forward instead made the
@@ -1093,7 +1108,10 @@ async function main() {
       .map((s) => s.trim().toLowerCase())
       .filter(Boolean)
   );
-  if (!notifyStatuses.has(status)) return;
+  if (!notifyStatuses.has(status)) {
+    note(`${status} is not in NOTIFY_STATUSES (${[...notifyStatuses].join(", ")})`);
+    return;
+  }
 
   // Recorded above whatever happens — a mute should not cost the next message
   // its duration — but nothing goes out while it holds.
@@ -1120,6 +1138,7 @@ async function main() {
     isOn(cfg("SHOW_TITLE"));
   const snap = wantsSnapshot ? sessionSnapshot() : undefined;
   const info = paneInfo(snap, paneId);
+  if (wantsSnapshot && !snap) note("no session snapshot; falling back to what the event itself carries");
 
   // The context describes the focused pane, so it only stands in for the event
   // pane when they are the same one.
@@ -1189,6 +1208,9 @@ async function main() {
     minSeconds > 0;
   const transcript = wantsTurn ? transcriptPath(info.session) : undefined;
   const turn = transcript ? readTurn(transcript) : {};
+  if (wantsTurn && !transcript) {
+    note(`no transcript found for ${JSON.stringify(info.session ?? null)}; the message loses its body, duration and tokens`);
+  }
 
   // The pane's own working→stop gap, or the turn the transcript recorded when
   // this plugin was not running for the whole of it.

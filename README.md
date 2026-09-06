@@ -230,6 +230,21 @@ rejected token or chat id is never queued, since nothing about it will change.
   no snapshot, so the message falls back to what the event and the focused-pane
   context carry; an unreadable transcript just drops the body.
 
+## When nothing arrives
+
+Most runs end without sending, on purpose: a status nobody asked about, a pane
+already in that state. `DEBUG=1` in the `.env` turns that silence into a line,
+and `herdr plugin log list` is where the lines land:
+
+```
+herdr-telegram-notify: working is not in NOTIFY_STATUSES (done, blocked)
+herdr-telegram-notify: wA:p7 was already done
+herdr-telegram-notify: no transcript found for {"kind":"id","value":"…"}
+```
+
+The same log carries the warnings that are always on — a world-readable `.env`,
+a key the plugin does not read, a send that failed and what it is waiting for.
+
 ## Testing a change
 
 `DRY_RUN=1` prints the message instead of sending it. Env vars override the
