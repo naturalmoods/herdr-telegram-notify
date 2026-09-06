@@ -271,6 +271,18 @@ HERDR_PLUGIN_CONTEXT_JSON='{}' DRY_RUN=1 node notify.mjs
 Use a real `pane_id` from `herdr pane list` — the snapshot lookup and the
 transcript both hang off it.
 
+The half of the plugin with no side effects lives in `lib.mjs` — the formatting,
+the config resolution, the transcript reader — and is covered by:
+
+```
+node --test test/lib.test.mjs
+```
+
+`notify.mjs` is the hook wrapped around it and is exercised by running it, as
+above. CI runs both on Node 18, 20, 22 and 24, plus one run with nothing
+configured at all, since degrading rather than throwing is most of what this
+plugin promises.
+
 ## Uninstall
 
 ```
