@@ -383,6 +383,75 @@ export function retryAfterMs(body) {
   return undefined;
 }
 
+// ------------------------------------------------------ reading a screen
+
+// A panel's left edge is what gives a split screen away: every one of its lines
+// begins in the same column, with a margin in front of it. Prose starts its words
+// wherever they fall, so nothing in a single column comes close to these.
+const MIN_ROWS_FOR_COLUMNS = 6;
+const MIN_BOUNDARY_COLUMN = 24; // below this it is indentation, not a panel
+const BOUNDARY_EDGE_SHARE = 0.4; // rows beginning a run in exactly this column
+const BOUNDARY_MARGIN_BLANK = 0.8; // with the column before it blank
+
+// Both sides then have to be lived in: one deep indent among ordinary lines can
+// look like an edge, and its near-empty other half gives it away.
+const MIN_BLOCK_OCCUPANCY = 0.25;
+
+// What a question looks like when an agent is waiting on one.
+const PROMPT_MARKER = /(^|\s)❯|^\s*\d+\.\s+(yes|no)\b|\bdo you want\b|\bwould you like\b|\(y\/n\)/i;
+
+// The character ranges a screen's rows divide into, or nothing at all when it is
+// the ordinary single column. Looking for a blank gutter does not work: a panel
+// wraps its text to its own full width, so the space between the two is often a
+// single column and sometimes none.
+export function screenColumns(rows) {
+  const filled = rows.filter((row) => row.trim());
+  if (filled.length < MIN_ROWS_FOR_COLUMNS) return [];
+  const width = Math.max(...filled.map((row) => row.length));
+
+  const boundaries = [];
+  for (let col = MIN_BOUNDARY_COLUMN; col < width; col += 1) {
+    let starts = 0;
+    let margin = 0;
+    for (const row of filled) {
+      const here = col < row.length ? row[col] : " ";
+      const before = col - 1 < row.length ? row[col - 1] : " ";
+      if (before === " ") {
+        margin += 1;
+        if (here !== " ") starts += 1;
+      }
+    }
+    if (starts / filled.length >= BOUNDARY_EDGE_SHARE && margin / filled.length >= BOUNDARY_MARGIN_BLANK) {
+      boundaries.push(col);
+    }
+  }
+  if (!boundaries.length) return [];
+
+  const cuts = [0, ...boundaries, width];
+  const blocks = cuts.slice(0, -1).map((from, i) => [from, cuts[i + 1]]);
+  const lived = blocks.filter(
+    ([from, to]) =>
+      filled.filter((row) => row.slice(from, to).trim()).length / filled.length >= MIN_BLOCK_OCCUPANCY
+  );
+  return lived.length >= 2 ? lived : [];
+}
+
+// A pane can be showing two things at once — an agent's transcript with a diff
+// panel beside it — and then every row of the screen holds a piece of each. Read
+// as lines they interleave into a paragraph that reads as neither, so one column
+// is kept and the rest of each row dropped. The question the agent is waiting on
+// decides which; failing that the widest, on the grounds that the main view is
+// what the pane gave the room to.
+export function cropScreen(rows) {
+  const blocks = screenColumns(rows);
+  if (blocks.length < 2) return rows;
+
+  const sliced = ([from, to]) => rows.map((row) => row.slice(from, to));
+  const asking = blocks.find((block) => sliced(block).some((line) => PROMPT_MARKER.test(line)));
+  const chosen = asking ?? blocks.reduce((a, b) => (b[1] - b[0] > a[1] - a[0] ? b : a));
+  return sliced(chosen);
+}
+
 // -------------------------------------------------- reading a transcript
 
 // Herdr reports the agent session as either a transcript path (pi) or a session

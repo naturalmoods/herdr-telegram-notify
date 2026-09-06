@@ -32,6 +32,7 @@ import {
   buildMessage,
   clip,
   clockTime,
+  cropScreen,
   escapeHtml,
   firstDefined,
   herdr,
@@ -248,17 +249,23 @@ function gitBranch(cwd) {
 
 // A blocked agent's question lives on screen, not in the transcript.
 function screenTail(paneId, maxLines) {
-  const out = herdr(["pane", "read", paneId, "--lines", String(maxLines * 2), "--format", "text"]);
+  // More rows than will be shown: finding the column boundary is a question
+  // about the shape of the whole screen, and a handful of rows cannot answer it.
+  const rows = Math.max(maxLines * 2, 24);
+  const out = herdr(["pane", "read", paneId, "--lines", String(rows), "--format", "text"]);
   if (!out) return undefined;
-  const lines = out
+
+  // Escapes and box drawing go first and column positions are kept: a vertical
+  // rule between two columns has to read as blank space before the gutter it
+  // sits in can be seen at all.
+  const screen = out
     .split("\n")
-    .map((line) =>
-      line
-        .replace(/\u001b\[[0-9;?]*[A-Za-z]/g, "")
-        .replace(/[─-╿▀-▟]/g, " ")
-        .replace(/\s+/g, " ")
-        .trim()
-    )
+    .map((line) => line.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, "").replace(/[─-╿▀-▟]/g, " ").replace(/\s+$/, ""));
+
+  const lines = cropScreen(screen)
+    // Only now: with one column in hand, the runs of spaces left in a row are
+    // its own alignment rather than the wall between it and the next column.
+    .map((line) => line.replace(/\s+/g, " ").trim())
     // Drop separators and the agent's own chrome: the empty input prompt and
     // the shortcut hint line under it carry nothing worth a notification.
     .filter((line) => line && !/^[·•\-–—_=.]+$/.test(line) && !/^[❯>]$/.test(line) && !/^⏵/.test(line));

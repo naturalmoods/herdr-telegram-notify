@@ -138,7 +138,14 @@ Line by line, and the key that removes it:
 | Where it happened, and the command to jump back | session snapshot | `SHOW_PANE`, `SHOW_HOST` |
 | What the other agents are doing | session snapshot | `SHOW_HERD` |
 | Last message | the agent's transcript (`~/.claude/projects/*.jsonl`, pi's session file) | `SHOW_LAST_MESSAGE`, `LAST_MESSAGE_CHARS` |
-| Screen tail (blocked only) | `herdr pane read` — the question it is waiting on | `SHOW_SCREEN_ON_BLOCKED`, `SCREEN_LINES` |
+| Screen tail (blocked only) | `herdr pane read` — the question it is waiting on, cropped to one column | `SHOW_SCREEN_ON_BLOCKED`, `SCREEN_LINES` |
+
+When the pane is split down the middle — an agent with a diff panel beside it —
+every terminal row holds a piece of both, and read as lines they interleave into
+a paragraph that is neither. Only one column is sent: the one the question is in,
+or the wider one when nothing is being asked. A panel gives itself away by
+starting every line in the same column; where there is no such edge, nothing is
+cropped.
 
 The `✎` line is the working tree as it stands, not a diff of the turn alone —
 what it separates is an agent that thought about the problem from one that

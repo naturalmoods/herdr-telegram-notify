@@ -13,6 +13,7 @@ import {
   TELEGRAM_LIMIT,
   buildMessage,
   clip,
+  cropScreen,
   escapeHtml,
   firstDefined,
   humanCost,
@@ -28,6 +29,7 @@ import {
   readTurn,
   redact,
   retryAfterMs,
+  screenColumns,
   toInt,
   toolSummary,
   topicFor,
@@ -267,4 +269,108 @@ test("buildMessage renders a late delivery with its marker, still within the lim
   assert.ok(html.startsWith("🕘 delayed 23m\n"));
   assert.ok(plain.startsWith("🕘 delayed 23m\n"));
   assert.ok(html.length <= TELEGRAM_LIMIT);
+});
+
+// ----------------------------------------------------------------- screen
+
+// A pane showing an agent's transcript on the left and a diff panel on the
+// right: every row holds a piece of each, which is what the cropping is for.
+// Built by padding rather than written out, so the panel's edge really is in one
+// column — which is the whole signal the detector runs on.
+const GUTTER_AT = 66;
+const side = (left, right) => left.padEnd(GUTTER_AT, " ") + right;
+const twoColumn = [
+  side("  ● Átnéztem a fájlt és javítottam a hibát.", "29 -Local dev DB runs in docker"),
+  side("", "30 +Local dev DB runs in podman"),
+  side("  Ez a leghosszabb sor a bal hasábban, majdnem a széléig ér.", "31  Secrets live in .env.local"),
+  side("  Do you want to make this edit?", "32 -CI runs lint then build"),
+  side("  ❯ 1. Yes", "33 +CI runs lint, test, build"),
+  side("    2. No, tell Claude what to do differently", "34  Deploy is manual for now"),
+  side("    3. No, and stop asking", "35  Backups run nightly"),
+];
+
+test("screenColumns finds the panel's edge", () => {
+  const blocks = screenColumns(twoColumn);
+  assert.ok(blocks.length >= 2, JSON.stringify(blocks));
+  assert.equal(blocks[0][0], 0);
+  assert.equal(blocks[0][1], GUTTER_AT); // the cut lands on the panel's first column
+});
+
+test("screenColumns leaves an ordinary screen as one column", () => {
+  const rows = [
+    "  ● Kész, a tesztek zöldek.",
+    "",
+    "  Lefuttattam mind a huszonhármat, egy sem bukott el.",
+    "",
+    "  Do you want to make this edit?",
+    "  ❯ 1. Yes",
+    "    2. No, tell Claude what to do differently",
+    "    3. No, and stop asking",
+  ];
+  assert.deepEqual(screenColumns(rows), []); // one column, so nothing to choose between
+  assert.deepEqual(cropScreen(rows), rows);
+});
+
+// The case that made the first attempt at this fail: a panel wraps its text to
+// its own full width, so between the two columns there is no blank gutter to
+// find — only the panel's edge, in the same column on every row.
+test("screenColumns finds the edge with no gutter to help it", () => {
+  const rows = [
+    "  Lefuttattam a teszteket és mind a huszonkilenc lezöldült, egy sem" + "  383    return rows;",
+    "  bukott el, úgyhogy a hasábfelismerés mostantól az él alapján megy" + "  384  }",
+    "  és nem a folyosó alapján, ami sokkal megbízhatóbbnak bizonyult itt" + "  385",
+    "  ● Frissítettem a dokumentációt is, hogy stimmeljen a viselkedéssel" + "  386 +// A panel edge",
+    "  Do you want to make this edit?                                   " + "  387 +const MIN = 24;",
+    "  ❯ 1. Yes                                                         " + "  388 +const SHARE = 0.4;",
+    "    2. No, tell Claude what to do differently                       " + "  389 +const BLANK = 0.8;",
+  ];
+  // No run of blank columns spans every row, so a gutter search finds nothing.
+  const filled = rows.filter((r) => r.trim());
+  const alwaysBlank = [...Array(Math.max(...filled.map((r) => r.length))).keys()].filter((c) =>
+    filled.every((r) => c >= r.length || r[c] === " ")
+  );
+  const widestGutter = alwaysBlank.reduce(
+    ({ run, best }, c, i) => {
+      const next = i > 0 && alwaysBlank[i - 1] === c - 1 ? run + 1 : 1;
+      return { run: next, best: Math.max(best, next) };
+    },
+    { run: 0, best: 0 }
+  ).best;
+  assert.ok(widestGutter < 3, `a gutter of ${widestGutter} would make this test prove nothing`);
+
+  const cropped = cropScreen(rows).map((l) => l.trim()).join("\n");
+  assert.ok(cropped.includes("1. Yes"), cropped);
+  assert.ok(!cropped.includes("const MIN"), cropped);
+  assert.ok(!cropped.includes("383"), cropped);
+});
+
+test("cropScreen keeps the column the question is in", () => {
+  const cropped = cropScreen(twoColumn).map((l) => l.trim());
+  assert.ok(cropped.some((l) => l.startsWith("❯ 1. Yes")));
+  // Nothing from the diff panel may survive into it.
+  assert.ok(!cropped.join("\n").includes("podman"), cropped.join("|"));
+  assert.ok(!cropped.join("\n").includes("29"), cropped.join("|"));
+});
+
+test("cropScreen follows the question to whichever side it is on", () => {
+  const mirrored = twoColumn.map((row) => {
+    const [left, right] = [row.slice(0, 66), row.slice(66)];
+    return right.padEnd(34, " ") + "   " + left.trim();
+  });
+  const cropped = cropScreen(mirrored).map((l) => l.trim()).join("\n");
+  assert.ok(cropped.includes("1. Yes"), cropped);
+  assert.ok(!cropped.includes("podman"), cropped);
+});
+
+test("cropScreen falls back to the wider column when nothing is being asked", () => {
+  const noQuestion = twoColumn.map((row) => row.replace("❯ 1. Yes", "  folytatom").replace("Do you want to make this edit?", "A következő lépés jön."));
+  const cropped = cropScreen(noQuestion).map((l) => l.trim()).join("\n");
+  assert.ok(cropped.includes("folytatom"), cropped);
+  assert.ok(!cropped.includes("podman"), cropped);
+});
+
+test("cropScreen will not guess a column out of a handful of rows", () => {
+  const few = twoColumn.slice(0, 3);
+  assert.deepEqual(screenColumns(few), []); // no answer, rather than a wrong one
+  assert.deepEqual(cropScreen(few), few);
 });

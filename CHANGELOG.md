@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- The blocked-screen block is cropped to one column when the pane is split. An
+  agent with a diff panel beside it put a piece of both in every terminal row,
+  and collapsing the whitespace out of those rows welded them into a paragraph
+  that read as neither.
+
 ## 0.5.0
 
 What the message says, and being able to find out why it did not arrive.
