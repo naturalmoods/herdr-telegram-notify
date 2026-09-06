@@ -132,6 +132,7 @@ Line by line, and the key that removes it:
 | Workspace, branch, cwd | session snapshot + the repo's `.git/HEAD` | `SHOW_PROJECT`, `SHOW_BRANCH` |
 | Uncommitted changes | `git diff --shortstat HEAD` and the untracked files, in that cwd | `SHOW_CHANGES` |
 | Duration | the `working` → stop gap this plugin records, or the turn in the transcript | `SHOW_DURATION` |
+| What it reached for (off by default) | `tool_use` blocks in the turn, the busiest four | `SHOW_TOOLS` |
 | Tokens and cost | `usage` on the transcript's assistant records, summed over the turn | `SHOW_TOKENS` |
 | Clock time (off by default) | the moment of the status change | `SHOW_TIMESTAMP` |
 | Where it happened, and the command to jump back | session snapshot | `SHOW_PANE`, `SHOW_HOST` |

@@ -34,6 +34,7 @@ const DEFAULTS = {
   SHOW_DURATION: "1",
   SHOW_TIMESTAMP: "0",
   SHOW_TOKENS: "1",
+  SHOW_TOOLS: "0",
   SHOW_PANE: "1",
   SHOW_HOST: "1",
   SHOW_HERD: "1",
@@ -524,6 +525,7 @@ function readTurn(path, maxRecords = 200) {
 
   let text;
   let prompt;
+  const tools = new Map();
   let endedAt;
   let startedAt;
   let out = 0;
@@ -545,6 +547,11 @@ function readTurn(path, maxRecords = 200) {
 
     if (role === "assistant") {
       if (!endedAt) endedAt = record.timestamp;
+      for (const block of Array.isArray(message.content) ? message.content : []) {
+        if (block?.type === "tool_use" && block.name) {
+          tools.set(block.name, (tools.get(block.name) ?? 0) + 1);
+        }
+      }
       const body = blocksToText(message.content);
       if (!text && body) text = body;
       const usage = usageOf(message);
@@ -567,6 +574,7 @@ function readTurn(path, maxRecords = 200) {
   return {
     text,
     prompt,
+    tools,
     // Identifies the turn: two panes on one session read the same last record.
     endedAt,
     duration: Number.isFinite(from) && Number.isFinite(to) && to > from ? to - from : undefined,
@@ -574,6 +582,17 @@ function readTurn(path, maxRecords = 200) {
     context,
     cost,
   };
+}
+
+// The shape of the work: what it reached for, and how often. The busiest four
+// carry it — a list of every tool a long turn touched is a paragraph, not a line.
+function toolSummary(tools) {
+  if (!tools?.size) return undefined;
+  const ranked = [...tools.entries()].sort((a, b) => b[1] - a[1]);
+  const shown = ranked.slice(0, 4).map(([name, n]) => `${n} ${name}`);
+  const rest = ranked.slice(4).reduce((sum, [, n]) => sum + n, 0);
+  if (rest) shown.push(`+${rest} more`);
+  return shown.join(" · ");
 }
 
 // A blocked agent's question lives on screen, not in the transcript.
@@ -758,7 +777,7 @@ function clip(text, max) {
 }
 
 function buildMessage(parts) {
-  const { emoji, agent, statusLabel, title, prompt, project, changes, meta, pane, herd, bodyIsScreen, late } = parts;
+  const { emoji, agent, statusLabel, title, prompt, project, changes, tools, meta, pane, herd, bodyIsScreen, late } = parts;
 
   const render = (body) => {
     const plain = [];
@@ -775,7 +794,7 @@ function buildMessage(parts) {
       plain.push(shown);
       html.push(`<i>${escapeHtml(shown)}</i>`);
     }
-    for (const line of [prompt, project, changes, meta, pane, herd ? `🐑 ${herd}` : undefined].filter(Boolean)) {
+    for (const line of [prompt, project, changes, tools, meta, pane, herd ? `🐑 ${herd}` : undefined].filter(Boolean)) {
       const shown = clip(line, HEAD_LINE_CHARS);
       plain.push(shown);
       html.push(escapeHtml(shown));
@@ -1125,6 +1144,7 @@ async function main() {
     isOn(cfg("SHOW_TOKENS")) ||
     isOn(cfg("SHOW_DURATION")) ||
     isOn(cfg("SHOW_PROMPT")) ||
+    isOn(cfg("SHOW_TOOLS")) ||
     minSeconds > 0;
   const transcript = wantsTurn ? transcriptPath(info.session) : undefined;
   const turn = transcript ? readTurn(transcript) : {};
@@ -1151,6 +1171,9 @@ async function main() {
     isOn(cfg("SHOW_PROMPT")) && turn.prompt
       ? `▸ ${truncate(turn.prompt, toInt(cfg("PROMPT_CHARS"), 120)).replace(/\s*\n+\s*/g, " ")}`
       : undefined;
+
+  const tooled = isOn(cfg("SHOW_TOOLS")) ? toolSummary(turn.tools) : undefined;
+  const tools = tooled ? `🔧 ${tooled}` : undefined;
 
   const metaBits = [];
   if (isOn(cfg("SHOW_DURATION"))) {
@@ -1210,7 +1233,7 @@ async function main() {
     writeState(stateDir, guardKey, { status, endedAt: turn.endedAt, at: Date.now(), paneId });
   }
 
-  const parts = { emoji, agent, statusLabel, title, prompt, project, changes, meta, pane, herd, body, bodyIsScreen };
+  const parts = { emoji, agent, statusLabel, title, prompt, project, changes, tools, meta, pane, herd, body, bodyIsScreen };
   const message = buildMessage(parts);
 
   if (dryRun) {
