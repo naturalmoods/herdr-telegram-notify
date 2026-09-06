@@ -116,6 +116,12 @@ token or chat id is not retried: nothing about it will be different next time.
 Everything is bounded, so the hook never outlives the failure by more than half
 a minute.
 
+A send that still fails is kept in the state directory rather than dropped, and
+the next status change on any pane — notified or not — delivers it, marked with
+how late it is. The queue holds the twenty most recent messages for six hours:
+a wifi that comes back should hand you the news, not a wall of yesterday. A
+rejected token or chat id is never queued, since nothing about it will change.
+
 ## Behavior
 
 - Fires on Herdr's `pane.agent_status_changed` event.
@@ -139,6 +145,7 @@ a minute.
   past that the transcript's own turn is used instead.
 - Housekeeping: state files for panes untouched for a week are removed on the
   next event, along with anything an earlier version of the plugin left behind.
+  Undelivered messages live in `pending.jsonl` in the same directory.
 - Degrades instead of failing. Without the `herdr` CLI on the machine there is
   no snapshot, so the message falls back to what the event and the focused-pane
   context carry; an unreadable transcript just drops the body.

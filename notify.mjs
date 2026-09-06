@@ -61,6 +61,12 @@ const SEND_ATTEMPTS = 3;
 const SEND_BACKOFF = 1000;
 const MAX_RETRY_AFTER = 30 * 1000;
 
+// Messages the network was down for. Kept short and few on purpose: a queue that
+// grows without limit answers a wifi coming back with a wall of notifications,
+// and a `done` from this morning is history rather than news.
+const PENDING_TTL = 6 * 60 * 60 * 1000;
+const PENDING_MAX = 20;
+
 // ---------------------------------------------------------------- utilities
 
 function readJson(envVar) {
@@ -602,7 +608,98 @@ async function sendTelegram(token, chatId, message) {
     );
     await sleep(wait);
   }
-  throw new Error(`Telegram API ${result.status || "unreachable"}: ${result.body}`);
+  const error = new Error(`Telegram API ${result.status || "unreachable"}: ${result.body}`);
+  error.status = result.status;
+  throw error;
+}
+
+// ------------------------------------------------------------------ pending
+
+function pendingPath(stateDir) {
+  return stateDir ? join(stateDir, "pending.jsonl") : undefined;
+}
+
+function readPending(stateDir) {
+  const path = pendingPath(stateDir);
+  if (!path) return [];
+  let text;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch {
+    return [];
+  }
+  const cutoff = Date.now() - PENDING_TTL;
+  const entries = [];
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const entry = JSON.parse(line);
+      if (entry?.html && entry.at > cutoff) entries.push(entry);
+    } catch {}
+  }
+  return entries.slice(-PENDING_MAX);
+}
+
+function writePending(stateDir, entries) {
+  const path = pendingPath(stateDir);
+  if (!path) return;
+  try {
+    if (!entries.length) {
+      try {
+        unlinkSync(path);
+      } catch {}
+      return;
+    }
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(path, `${entries.slice(-PENDING_MAX).map((e) => JSON.stringify(e)).join("\n")}\n`);
+  } catch {}
+}
+
+function queuePending(stateDir, message) {
+  if (!pendingPath(stateDir)) {
+    console.error("herdr-telegram-notify: no state directory, so the message could not be kept for later");
+    return;
+  }
+  const entries = readPending(stateDir);
+  entries.push({ at: Date.now(), html: message.html, plain: message.plain });
+  writePending(stateDir, entries);
+  console.error(`herdr-telegram-notify: kept for the next event (${entries.length} waiting)`);
+}
+
+// Deliver what the network was down for, oldest first, and stop at the first
+// failure so nothing arrives out of order. Returns false only when a send
+// actually failed — the caller takes that as "still offline" and does not spend
+// another round of attempts proving it.
+async function flushPending(stateDir, token, chatId) {
+  const waiting = readPending(stateDir);
+  // Nothing worth sending — which includes a file holding only entries that have
+  // aged out, so this is also where those stop taking up space.
+  if (!waiting.length) {
+    writePending(stateDir, []);
+    return true;
+  }
+
+  let online = true;
+  while (waiting.length) {
+    const entry = waiting[0];
+    // Telegram stamps the message with its arrival time, which by now is a lie.
+    const late = `🕘 delayed ${humanDuration(Date.now() - entry.at)}`;
+    try {
+      await sendTelegram(token, chatId, {
+        html: `${late}\n${entry.html}`.slice(0, TELEGRAM_LIMIT),
+        plain: `${late}\n${entry.plain}`.slice(0, TELEGRAM_LIMIT),
+      });
+    } catch (err) {
+      console.error(
+        `herdr-telegram-notify: ${waiting.length} message(s) still waiting: ${redact(err.message, token)}`
+      );
+      online = false;
+      break;
+    }
+    waiting.shift();
+  }
+  writePending(stateDir, waiting);
+  return online;
 }
 
 // --------------------------------------------------------------------- main
@@ -621,6 +718,16 @@ async function main() {
   // from — then decide whether this one is worth a message.
   const stateDir = process.env.HERDR_PLUGIN_STATE_DIR;
   sweepState(stateDir);
+
+  const dryRun = isOn(cfg("DRY_RUN"));
+  const token = cfg("TELEGRAM_BOT_TOKEN");
+  const chatId = cfg("TELEGRAM_CHAT_ID");
+  // Whatever the network was down for waits in the state directory, and any
+  // status change on any pane is the cue to try again — including the ones this
+  // run is about to filter out, which is what keeps a queue from sitting there
+  // until the next thing worth notifying happens.
+  const online = !dryRun && token && chatId ? await flushPending(stateDir, token, chatId) : true;
+
   const key = stateKey(event, context);
   const previous = readState(stateDir, key);
   if (previous.status === status) return; // repeat of a state we already handled
@@ -646,9 +753,6 @@ async function main() {
   );
   if (!notifyStatuses.has(status)) return;
 
-  const dryRun = isOn(cfg("DRY_RUN"));
-  const token = cfg("TELEGRAM_BOT_TOKEN");
-  const chatId = cfg("TELEGRAM_CHAT_ID");
   if (!dryRun && (!token || !chatId)) {
     console.error("herdr-telegram-notify: missing TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID");
     process.exitCode = 1;
@@ -781,10 +885,23 @@ async function main() {
     return;
   }
 
+  if (!online) {
+    // The queue flush just proved the network is down; no point spending another
+    // round of attempts on the same connection.
+    console.error("herdr-telegram-notify: still offline, not retrying this one now");
+    queuePending(stateDir, message);
+    process.exitCode = 1;
+    return;
+  }
+
   try {
     await sendTelegram(token, chatId, message);
   } catch (err) {
     console.error(`herdr-telegram-notify: ${redact(err.message, token)}`);
+    // A refused connection or a Telegram that is down will look different in a
+    // minute; a rejected token or chat id will not, and queueing it would only
+    // pile up messages that can never be sent.
+    if (isRetryable(err.status)) queuePending(stateDir, message);
     process.exitCode = 1;
   }
 }
