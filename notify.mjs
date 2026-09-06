@@ -40,7 +40,7 @@ const DEFAULTS = {
   SHOW_HERD: "1",
   SHOW_LAST_MESSAGE: "1",
   SHOW_SCREEN_ON_BLOCKED: "1",
-  LAST_MESSAGE_CHARS: "600",
+  LAST_MESSAGE_CHARS: "1200",
   SCREEN_LINES: "12",
   MIN_DURATION_SECONDS: "0",
   BLOCKED_REMINDER_MINUTES: "0",
@@ -84,6 +84,10 @@ const PENDING_MAX = 20;
 
 // Longest a single head line may be before it is clipped; see buildMessage().
 const HEAD_LINE_CHARS = 300;
+
+// Past this the quote is sent collapsed, with Telegram's own "show more" on it.
+// Below it, collapsing costs a tap and saves nothing.
+const EXPANDABLE_QUOTE_CHARS = 300;
 
 // ---------------------------------------------------------------- utilities
 
@@ -805,7 +809,9 @@ function buildMessage(parts) {
         "",
         bodyIsScreen
           ? `<pre>${escapeHtml(body)}</pre>`
-          : `<blockquote>${inlineMarkdown(escapeHtml(body))}</blockquote>`
+          : `<blockquote${body.length > EXPANDABLE_QUOTE_CHARS ? " expandable" : ""}>${inlineMarkdown(
+              escapeHtml(body)
+            )}</blockquote>`
       );
     }
     return { plain: plain.join("\n"), html: html.join("\n") };

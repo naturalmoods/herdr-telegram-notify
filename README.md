@@ -160,6 +160,11 @@ Messages are sent as Telegram HTML, with the agent's `**bold**` and `` `code` ``
 carried over. If Telegram rejects the markup, the same message is re-sent as
 plain text rather than dropped.
 
+A last message past a few lines is sent as a collapsed quote with Telegram's own
+"show more" on it, so a long answer costs one line in the chat until you want the
+rest of it. That is why `LAST_MESSAGE_CHARS` defaults to 1200 rather than
+something a phone screen could hold.
+
 Telegram takes 4096 characters. A message that would run past that is fitted by
 shortening the body and rendering again, so what arrives is always whole markup
 — raising `LAST_MESSAGE_CHARS` or `SCREEN_LINES` past what fits costs you the
