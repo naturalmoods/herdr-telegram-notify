@@ -80,7 +80,7 @@ In a group with Topics turned on, `TELEGRAM_TOPICS` gives each workspace its own
 thread rather than one stream carrying every project:
 
 ```
-TELEGRAM_TOPICS=marys.hu:12,jegykezelo:15,wB:15
+TELEGRAM_TOPICS=storefront:12,billing-service:15,wB:15
 TELEGRAM_TOPIC_ID=7
 ```
 
@@ -96,7 +96,7 @@ one in Telegram and the text reaches the agent that message was about.
 
 ```
 ⚠️ claude · blocked
-▸ frissítsd a függőségeket
+▸ bump the dependencies and see if anything breaks
 📁 storefront · main · ~/projects/storefront
 
   Do you want to make this edit?
@@ -257,7 +257,7 @@ rejected token or chat id is never queued, since nothing about it will change.
   `blocked`, which is a question waiting on you however briefly it ran.
 - `NOTIFY_WORKSPACES` and `IGNORE_WORKSPACES` decide which workspaces may reach
   the phone at all. Comma separated, matched against the workspace's label and
-  its id, so `marys.hu` and `wA` name the same one. An empty allowlist means all
+  its id, so `storefront` and `wA` name the same one. An empty allowlist means all
   of them; the denylist wins either way.
 - `QUIET_HOURS=23:00-07:00` delivers without a sound inside that window (local
   time, may run past midnight). The message still arrives and still waits in the
