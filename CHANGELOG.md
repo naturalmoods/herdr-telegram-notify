@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.6.0
+
+The other direction.
 
 - `REPLIES=1` makes the notifications answerable: reply to one in Telegram and
   the text reaches the agent that message was about — typed in and entered for a
