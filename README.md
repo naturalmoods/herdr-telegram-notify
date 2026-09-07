@@ -4,6 +4,10 @@ A Herdr plugin that sends a Telegram message when an agent finishes (`done`)
 or needs input (`blocked`) — with enough detail to tell, from the phone, which
 agent it was and what it did.
 
+Reply to that message and the text goes back to the agent it was about, so a
+blocked agent waiting on `1. Yes` can be answered from wherever you are. Off by
+default; see [Replying from the chat](#replying-from-the-chat).
+
 Requires Herdr 0.8 or newer, Node 18+, and Linux or macOS. Herdr's server does
 not inherit your shell's PATH, so `run.sh` locates Node itself — an nvm, fnm or
 volta install would otherwise be invisible to it.
