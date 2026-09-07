@@ -69,26 +69,26 @@ test("humanCost keeps a sub-cent turn legible", () => {
 });
 
 test("truncate cuts at a word and marks the cut", () => {
-  assert.equal(truncate("  már minden kint van  ", 100), "már minden kint van");
-  assert.equal(truncate("egy kettő három négy", 12), "egy kettő …");
+  assert.equal(truncate("  everything is already pushed  ", 100), "everything is already pushed");
+  assert.equal(truncate("one two three four", 12), "one two …");
   assert.equal(truncate("a\n\n\n\nb", 100), "a\n\nb");
 });
 
 test("clip bounds a head line without cutting an entity in half", () => {
-  assert.equal(clip("rövid", 10), "rövid");
+  assert.equal(clip("short", 10), "short");
   assert.equal(clip("x".repeat(20), 10), "x".repeat(9) + "…");
 });
 
 test("escapeHtml runs before inlineMarkdown, and survives it", () => {
   assert.equal(escapeHtml("<b> & </b>"), "&lt;b&gt; &amp; &lt;/b&gt;");
-  assert.equal(inlineMarkdown(escapeHtml("**félkövér** és `kód`")), "<b>félkövér</b> és <code>kód</code>");
+  assert.equal(inlineMarkdown(escapeHtml("**bold** and `code`")), "<b>bold</b> and <code>code</code>");
 });
 
 test("redact hides a token even where it was not passed in", () => {
   assert.equal(redact("bot123:SECRET failed", "123:SECRET"), "bot<token> failed");
   // A URL puts the token straight after `bot`, so there is no word boundary.
   assert.equal(
-    redact("https://api.telegram.org/bot8735496367:AAFakeTokenLooksLikeThis12345/sendMessage"),
+    redact("https://api.telegram.org/bot1234567890:AAFakeTokenShapedLikeThis123/sendMessage"),
     "https://api.telegram.org/bot<token>/sendMessage"
   );
   assert.equal(redact("nothing to hide"), "nothing to hide");
@@ -103,32 +103,32 @@ test("isOn, toInt and firstDefined treat empty as unset", () => {
   assert.equal(isOn(undefined), false);
   assert.equal(toInt("12", 5), 12);
   assert.equal(toInt("", 5), 5);
-  assert.equal(toInt("nem szám", 5), 5);
+  assert.equal(toInt("not a number", 5), 5);
   assert.equal(firstDefined(undefined, "", null, "x", "y"), "x");
 });
 
 test("loadEnvFile skips comments and unquotes values", () => {
   const dir = mkdtempSync(join(scratch, "env-"));
-  writeFileSync(join(dir, ".env"), '# comment\nA=1\nB="két szó"\nC=\'x\'\nnot a pair\n\nD=a=b\n');
+  writeFileSync(join(dir, ".env"), '# comment\nA=1\nB="two words"\nC=\'x\'\nnot a pair\n\nD=a=b\n');
   chmodSync(join(dir, ".env"), 0o600);
-  assert.deepEqual(loadEnvFile(dir), { A: "1", B: "két szó", C: "x", D: "a=b" });
+  assert.deepEqual(loadEnvFile(dir), { A: "1", B: "two words", C: "x", D: "a=b" });
   assert.deepEqual(loadEnvFile(undefined), {});
 });
 
 test("listMatches separates 'nothing said' from 'said no'", () => {
-  assert.equal(listMatches("", "marys.hu", "wA"), undefined);
-  assert.equal(listMatches("marys.hu, lerant.hu", "marys.hu", "wA"), true);
-  assert.equal(listMatches("WA", "marys.hu", "wA"), true); // id, any case
-  assert.equal(listMatches("egyéb", "marys.hu", "wA"), false);
+  assert.equal(listMatches("", "storefront", "wA"), undefined);
+  assert.equal(listMatches("storefront, billing-service", "storefront", "wA"), true);
+  assert.equal(listMatches("WA", "storefront", "wA"), true); // id, any case
+  assert.equal(listMatches("warehouse", "storefront", "wA"), false);
 });
 
 test("topicFor falls back from the map to the default to nothing", () => {
   const cfg = (map, fallback) => (key) => (key === "TELEGRAM_TOPICS" ? map : fallback);
-  assert.equal(topicFor(cfg("marys.hu:12,wB:15", "7"), "marys.hu", "wA"), 12);
-  assert.equal(topicFor(cfg("marys.hu:12,wB:15", "7"), "jegykezelo", "wB"), 15);
-  assert.equal(topicFor(cfg("marys.hu:12", "7"), "egyéb", "wC"), 7);
-  assert.equal(topicFor(cfg("", ""), "egyéb", "wC"), undefined);
-  assert.equal(topicFor(cfg("marys.hu:nonsense", ""), "marys.hu", "wA"), undefined);
+  assert.equal(topicFor(cfg("storefront:12,wB:15", "7"), "storefront", "wA"), 12);
+  assert.equal(topicFor(cfg("storefront:12,wB:15", "7"), "billing-service", "wB"), 15);
+  assert.equal(topicFor(cfg("storefront:12", "7"), "warehouse", "wC"), 7);
+  assert.equal(topicFor(cfg("", ""), "warehouse", "wC"), undefined);
+  assert.equal(topicFor(cfg("storefront:nonsense", ""), "storefront", "wA"), undefined);
 });
 
 test("inQuietHours handles a window that runs past midnight", () => {
@@ -174,21 +174,21 @@ const assistant = (content, s, extra = {}) => ({
 test("promptText keeps what a person typed and drops what was wrapped round it", () => {
   assert.equal(promptText("<command-name>/code-review</command-name>\n<command-args>high</command-args>"), "/code-review");
   assert.equal(promptText("<system-reminder>injected</system-reminder>\nfuttasd le"), "futtasd le");
-  assert.equal(promptText("sima kérdés"), "sima kérdés");
+  assert.equal(promptText("a plain question"), "a plain question");
 });
 
 test("readTurn measures from the last thing a person typed", () => {
   const path = transcript("turn", [
-    user("egy korábbi kérdés", 0),
-    assistant([{ type: "text", text: "korábbi válasz" }], 5),
-    user("a mostani kérdés", 10),
+    user("an earlier question", 0),
+    assistant([{ type: "text", text: "an earlier answer" }], 5),
+    user("the question this turn answers", 10),
     assistant([{ type: "tool_use", name: "Bash", id: "a", input: {} }], 20),
     { type: "user", timestamp: at(25), message: { role: "user", content: [{ type: "tool_result", content: "ok" }] } },
-    assistant([{ type: "text", text: "kész vagyok" }], 40),
+    assistant([{ type: "text", text: "all done" }], 40),
   ]);
   const turn = readTurn(path);
-  assert.equal(turn.prompt, "a mostani kérdés");
-  assert.equal(turn.text, "kész vagyok");
+  assert.equal(turn.prompt, "the question this turn answers");
+  assert.equal(turn.text, "all done");
   assert.equal(turn.duration, 30_000); // 10s -> 40s, not from the earlier prompt
   assert.equal(turn.out, 20); // both assistant records of this turn, not the earlier one
   assert.equal(turn.tools.get("Bash"), 1);
@@ -205,21 +205,21 @@ test("readTurn reads a pi turn as well as a Claude one", () => {
     message: { role, content, ...(usage ? { usage } : {}) },
   });
   const path = transcript("pi", [
-    piMessage("user", [{ type: "text", text: "tedd fel githubra" }], 0),
-    piMessage("assistant", [{ type: "thinking", text: "gondolkodom" }, { type: "toolCall", name: "bash", id: "c1", arguments: {} }], 5, {
+    piMessage("user", [{ type: "text", text: "push it to github" }], 0),
+    piMessage("assistant", [{ type: "thinking", text: "thinking" }, { type: "toolCall", name: "bash", id: "c1", arguments: {} }], 5, {
       input: 100,
       output: 180,
       cacheRead: 900,
       cacheWrite: 50,
       cost: { total: 0.108 },
     }),
-    piMessage("assistant", [{ type: "thinking", text: "még gondolkodom" }, { type: "toolCall", name: "bash", id: "c2", arguments: {} }], 10, {
+    piMessage("assistant", [{ type: "thinking", text: "still thinking" }, { type: "toolCall", name: "bash", id: "c2", arguments: {} }], 10, {
       input: 10,
       output: 30,
       cacheRead: 20,
       cost: { total: 0.019 },
     }),
-    piMessage("assistant", [{ type: "thinking", text: "kész" }, { type: "text", text: "A push sikeres volt." }], 20, {
+    piMessage("assistant", [{ type: "thinking", text: "nearly there" }, { type: "text", text: "The push went through." }], 20, {
       input: 5,
       output: 210,
       cacheRead: 5,
@@ -227,8 +227,8 @@ test("readTurn reads a pi turn as well as a Claude one", () => {
     }),
   ]);
   const turn = readTurn(path);
-  assert.equal(turn.prompt, "tedd fel githubra");
-  assert.equal(turn.text, "A push sikeres volt."); // the thinking block is not the answer
+  assert.equal(turn.prompt, "push it to github");
+  assert.equal(turn.text, "The push went through."); // the thinking block is not the answer
   assert.equal(turn.duration, 20_000);
   assert.equal(turn.out, 420); // 180 + 30 + 210
   assert.equal(turn.context, 1050); // the largest single record, not the sum
@@ -238,9 +238,9 @@ test("readTurn reads a pi turn as well as a Claude one", () => {
 
 test("readTurn ignores a subagent's records", () => {
   const path = transcript("side", [
-    user("csináld", 0),
+    user("do it", 0),
     assistant([{ type: "tool_use", name: "Edit", id: "s", input: {} }], 5, { isSidechain: true }),
-    assistant([{ type: "tool_use", name: "Bash", id: "m", input: {} }, { type: "text", text: "kész" }], 10),
+    assistant([{ type: "tool_use", name: "Bash", id: "m", input: {} }, { type: "text", text: "done" }], 10),
   ]);
   const turn = readTurn(path);
   assert.equal(turn.tools.get("Edit"), undefined);
@@ -249,8 +249,8 @@ test("readTurn ignores a subagent's records", () => {
 
 test("readTurn says so when the turn is longer than it looked", () => {
   const path = transcript("long", [
-    user("a régi kérdés", 0),
-    ...Array.from({ length: 30 }, (_, i) => assistant([{ type: "text", text: `lépés ${i}` }], 10 + i)),
+    user("the question, long ago", 0),
+    ...Array.from({ length: 30 }, (_, i) => assistant([{ type: "text", text: `step ${i}` }], 10 + i)),
   ]);
   assert.equal(readTurn(path, 5).truncated, true);
   assert.equal(readTurn(path).truncated, false);
@@ -271,7 +271,7 @@ test("buildMessage puts the lines in order and escapes the head", () => {
   const { html, plain } = buildMessage({
     ...head,
     title: "a & b",
-    prompt: "▸ mit csináljak",
+    prompt: "▸ what should I do",
     project: "📁 repo",
     changes: "✎ 1 file",
     meta: "⏱ ran 4m",
@@ -280,20 +280,20 @@ test("buildMessage puts the lines in order and escapes the head", () => {
   });
   assert.equal(
     plain.split("\n").join("|"),
-    "✅ claude · done|a & b|▸ mit csináljak|📁 repo|✎ 1 file|⏱ ran 4m|🖥 host|🐑 1 idle"
+    "✅ claude · done|a & b|▸ what should I do|📁 repo|✎ 1 file|⏱ ran 4m|🖥 host|🐑 1 idle"
   );
   assert.match(html, /<i>a &amp; b<\/i>/);
 });
 
 test("buildMessage collapses a long quote and leaves a short one alone", () => {
-  assert.match(buildMessage({ ...head, body: "rövid válasz" }).html, /<blockquote>/);
+  assert.match(buildMessage({ ...head, body: "a short answer" }).html, /<blockquote>/);
   assert.match(buildMessage({ ...head, body: "x".repeat(400) }).html, /<blockquote expandable>/);
-  assert.match(buildMessage({ ...head, body: "kérdés?", bodyIsScreen: true }).html, /<pre>/);
+  assert.match(buildMessage({ ...head, body: "a question?", bodyIsScreen: true }).html, /<pre>/);
 });
 
 test("buildMessage fits the limit by shortening the body, never the markup", () => {
-  for (const filler of ["sima szöveg. ", "<script>&amp;</script> ", "**bold** `code` <tag> "]) {
-    const { html, plain } = buildMessage({ ...head, title: "cím", body: filler.repeat(3000) });
+  for (const filler of ["plain prose. ", "<script>&amp;</script> ", "**bold** `code` <tag> "]) {
+    const { html, plain } = buildMessage({ ...head, title: "a title", body: filler.repeat(3000) });
     assert.ok(html.length <= TELEGRAM_LIMIT, `${filler}: ${html.length}`);
     assert.ok(plain.length <= TELEGRAM_LIMIT, `${filler}: ${plain.length}`);
     assert.ok(html.endsWith("</blockquote>"), `${filler}: ${html.slice(-30)}`);
@@ -304,7 +304,7 @@ test("buildMessage fits the limit by shortening the body, never the markup", () 
 });
 
 test("buildMessage clips a head line rather than spending the body's budget on it", () => {
-  const { html } = buildMessage({ ...head, title: "cím ".repeat(2000), body: "x".repeat(2000) });
+  const { html } = buildMessage({ ...head, title: "a title ".repeat(2000), body: "x".repeat(2000) });
   assert.ok(html.length <= TELEGRAM_LIMIT);
   assert.match(html, /<blockquote expandable>/); // the body survived
 });
@@ -325,9 +325,9 @@ test("buildMessage renders a late delivery with its marker, still within the lim
 const GUTTER_AT = 66;
 const side = (left, right) => left.padEnd(GUTTER_AT, " ") + right;
 const twoColumn = [
-  side("  ● Átnéztem a fájlt és javítottam a hibát.", "29 -Local dev DB runs in docker"),
+  side("  ● Read the file and fixed the bug.", "29 -Local dev DB runs in docker"),
   side("", "30 +Local dev DB runs in podman"),
-  side("  Ez a leghosszabb sor a bal hasábban, majdnem a széléig ér.", "31  Secrets live in .env.local"),
+  side("  This is the longest line in the left column, nearly to its edge.", "31  Secrets live in .env.local"),
   side("  Do you want to make this edit?", "32 -CI runs lint then build"),
   side("  ❯ 1. Yes", "33 +CI runs lint, test, build"),
   side("    2. No, tell Claude what to do differently", "34  Deploy is manual for now"),
@@ -343,9 +343,9 @@ test("screenColumns finds the panel's edge", () => {
 
 test("screenColumns leaves an ordinary screen as one column", () => {
   const rows = [
-    "  ● Kész, a tesztek zöldek.",
+    "  ● Done, the tests are green.",
     "",
-    "  Lefuttattam mind a huszonhármat, egy sem bukott el.",
+    "  All twenty-three of them ran and not one of them failed.",
     "",
     "  Do you want to make this edit?",
     "  ❯ 1. Yes",
@@ -360,15 +360,28 @@ test("screenColumns leaves an ordinary screen as one column", () => {
 // its own full width, so between the two columns there is no blank gutter to
 // find — only the panel's edge, in the same column on every row.
 test("screenColumns finds the edge with no gutter to help it", () => {
-  const rows = [
-    "  Lefuttattam a teszteket és mind a huszonkilenc lezöldült, egy sem" + "  383    return rows;",
-    "  bukott el, úgyhogy a hasábfelismerés mostantól az él alapján megy" + "  384  }",
-    "  és nem a folyosó alapján, ami sokkal megbízhatóbbnak bizonyult itt" + "  385",
-    "  ● Frissítettem a dokumentációt is, hogy stimmeljen a viselkedéssel" + "  386 +// A panel edge",
-    "  Do you want to make this edit?                                   " + "  387 +const MIN = 24;",
-    "  ❯ 1. Yes                                                         " + "  388 +const SHARE = 0.4;",
-    "    2. No, tell Claude what to do differently                       " + "  389 +const BLANK = 0.8;",
+  // The left column is padded to its own full width, so the only thing marking
+  // the boundary is where the right column starts.
+  const left = [
+    "  All twenty-nine tests came back green, so the detection now runs",
+    "  from the panel's own edge rather than from a blank gutter, which",
+    "  turned out to be the only one of the two a real screen ever has.",
+    "  ● Updated the documentation to match, and the config template.",
+    "  Do you want to make this edit?",
+    "  ❯ 1. Yes",
+    "    2. No, tell Claude what to do differently",
   ];
+  const right = [
+    "  383    return rows;",
+    "  384  }",
+    "  385",
+    "  386 +// A panel edge",
+    "  387 +const MIN = 24;",
+    "  388 +const SHARE = 0.4;",
+    "  389 +const BLANK = 0.8;",
+  ];
+  const edge = Math.max(...left.map((line) => line.length));
+  const rows = left.map((line, i) => line.padEnd(edge, " ") + right[i]);
   // No run of blank columns spans every row, so a gutter search finds nothing.
   const filled = rows.filter((r) => r.trim());
   const alwaysBlank = [...Array(Math.max(...filled.map((r) => r.length))).keys()].filter((c) =>
@@ -408,9 +421,17 @@ test("cropScreen follows the question to whichever side it is on", () => {
 });
 
 test("cropScreen falls back to the wider column when nothing is being asked", () => {
-  const noQuestion = twoColumn.map((row) => row.replace("❯ 1. Yes", "  folytatom").replace("Do you want to make this edit?", "A következő lépés jön."));
+  const noQuestion = [
+    side("  ● Read the file and fixed the bug.", "29 -Local dev DB runs in docker"),
+    side("", "30 +Local dev DB runs in podman"),
+    side("  This is the longest line in the left column, nearly to its edge.", "31  Secrets live in .env.local"),
+    side("  On to the next step.", "32 -CI runs lint then build"),
+    side("  carrying on", "33 +CI runs lint, test, build"),
+    side("  nothing here is a question", "34  Deploy is manual for now"),
+    side("  so the wider column wins", "35  Backups run nightly"),
+  ];
   const cropped = cropScreen(noQuestion).map((l) => l.trim()).join("\n");
-  assert.ok(cropped.includes("folytatom"), cropped);
+  assert.ok(cropped.includes("carrying on"), cropped);
   assert.ok(!cropped.includes("podman"), cropped);
 });
 

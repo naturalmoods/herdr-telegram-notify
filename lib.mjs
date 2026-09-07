@@ -200,7 +200,7 @@ export function listMatches(list, ...values) {
   return values.some((v) => v !== undefined && wanted.includes(String(v).toLowerCase()));
 }
 
-// `marys.hu:12,wB:15` — which topic of a forum group a workspace's messages
+// `storefront:12,wB:15` — which topic of a forum group a workspace's messages
 // belong in. Falls back to TELEGRAM_TOPIC_ID, and to the group's General topic
 // when neither names one.
 export function topicFor(cfg, label, id) {

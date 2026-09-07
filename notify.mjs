@@ -741,7 +741,7 @@ async function main() {
 
   // Five agents running and two of them worth interrupting for: name the ones
   // that may reach the phone, or the ones that may not. A workspace answers to
-  // its label and to its id, so `marys.hu` and `wA` both work — the label is
+  // its label and to its id, so `storefront` and `wA` both work — the label is
   // what you think in, the id is what survives renaming it.
   const workspaceId = firstDefined(info.workspaceId, data.workspace_id);
   const topicId = topicFor(cfg, workspaceLabel, workspaceId);
