@@ -568,7 +568,10 @@ export function readTurn(path, maxRecords = 1500) {
     if (role === "assistant") {
       if (!endedAt) endedAt = record.timestamp;
       for (const block of Array.isArray(message.content) ? message.content : []) {
-        if (block?.type === "tool_use" && block.name) {
+        // Claude writes `tool_use`, pi writes `toolCall`; the name is in the same
+        // place either way. Counting only Claude's spelling left every pi turn
+        // reporting no tools at all rather than reporting none.
+        if ((block?.type === "tool_use" || block?.type === "toolCall") && block.name) {
           tools.set(block.name, (tools.get(block.name) ?? 0) + 1);
         }
       }

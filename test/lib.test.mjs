@@ -191,6 +191,47 @@ test("readTurn measures from the last thing a person typed", () => {
   assert.equal(turn.truncated, false);
 });
 
+// pi writes the same turn a different way: the record type is "message", tools
+// are `toolCall` rather than `tool_use`, the usage keys are camelCase, thinking
+// is a block of its own, and the cost is recorded where Claude records none.
+test("readTurn reads a pi turn as well as a Claude one", () => {
+  const piMessage = (role, content, s, usage) => ({
+    type: "message",
+    timestamp: at(s),
+    message: { role, content, ...(usage ? { usage } : {}) },
+  });
+  const path = transcript("pi", [
+    piMessage("user", [{ type: "text", text: "tedd fel githubra" }], 0),
+    piMessage("assistant", [{ type: "thinking", text: "gondolkodom" }, { type: "toolCall", name: "bash", id: "c1", arguments: {} }], 5, {
+      input: 100,
+      output: 180,
+      cacheRead: 900,
+      cacheWrite: 50,
+      cost: { total: 0.108 },
+    }),
+    piMessage("assistant", [{ type: "thinking", text: "még gondolkodom" }, { type: "toolCall", name: "bash", id: "c2", arguments: {} }], 10, {
+      input: 10,
+      output: 30,
+      cacheRead: 20,
+      cost: { total: 0.019 },
+    }),
+    piMessage("assistant", [{ type: "thinking", text: "kész" }, { type: "text", text: "A push sikeres volt." }], 20, {
+      input: 5,
+      output: 210,
+      cacheRead: 5,
+      cost: { total: 0.023 },
+    }),
+  ]);
+  const turn = readTurn(path);
+  assert.equal(turn.prompt, "tedd fel githubra");
+  assert.equal(turn.text, "A push sikeres volt."); // the thinking block is not the answer
+  assert.equal(turn.duration, 20_000);
+  assert.equal(turn.out, 420); // 180 + 30 + 210
+  assert.equal(turn.context, 1050); // the largest single record, not the sum
+  assert.equal(Number(turn.cost.toFixed(3)), 0.15);
+  assert.equal(toolSummary(turn.tools), "2 bash");
+});
+
 test("readTurn ignores a subagent's records", () => {
   const path = transcript("side", [
     user("csináld", 0),

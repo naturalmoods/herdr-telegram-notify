@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- `SHOW_TOOLS` counts pi's tool calls. pi writes `toolCall` blocks where Claude
+  writes `tool_use`, and only Claude's spelling was recognised, so every pi turn
+  reported no tools rather than reporting none.
+
 ## 0.5.1
 
 - The blocked-screen block is cropped to one column when the pane is split. An
