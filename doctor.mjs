@@ -139,7 +139,9 @@ if (token && chatId) {
     const topic = Number.parseInt(String(cfg("TELEGRAM_TOPIC_ID") ?? ""), 10);
     const sent = await callTelegram("sendMessage", {
       chat_id: chatId,
-      text: `🩺 herdr-telegram-notify on ${hostname()}: this is the test message from the doctor action.`,
+      // Said plainly, because it looks like a notification and is not one: the
+      // doctor sends it directly, so nothing recorded which pane it was about.
+      text: `🩺 herdr-telegram-notify on ${hostname()}: this is the doctor's test message, not a notification — replying to this one has nowhere to go.`,
       disable_notification: true,
       ...(Number.isFinite(topic) && topic > 0 ? { message_thread_id: topic } : {}),
     });
