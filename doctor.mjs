@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { hostname } from "node:os";
 import { spawnSync } from "node:child_process";
 
-import { DEFAULTS, EXTRA_KEYS, herdr, herdrBin, loadConfig, redact } from "./lib.mjs";
+import { DEFAULTS, EXTRA_KEYS, herdr, herdrBin, isOn, loadConfig, redact } from "./lib.mjs";
 
 const results = [];
 const ok = (what, detail) => results.push({ ok: true, what, detail });
@@ -67,6 +67,7 @@ for (const [key, what] of [
   ["QUIET_HOURS", "delivered without a sound in this window"],
   ["MIN_DURATION_SECONDS", "turns shorter than this are dropped"],
   ["BLOCKED_REMINDER_MINUTES", "a blocked agent is nudged again after this"],
+  ["REPLIES", "a reply in the chat is passed to that agent"],
   ["TELEGRAM_TOPIC_ID", "default forum topic"],
   ["TELEGRAM_TOPICS", "per-workspace forum topics"],
 ]) {
@@ -97,6 +98,20 @@ if (!stateDir) {
     const waiting = readFileSync(join(stateDir, "pending.jsonl"), "utf8").split("\n").filter((l) => l.trim()).length;
     if (waiting) bad("queued", `${waiting} message(s) waiting for the network to come back`);
   } catch {}
+
+  // The poller is a separate process, so "configured" and "running" are two
+  // different questions and the second is the one that matters.
+  if (isOn(cfg("REPLIES"))) {
+    let pid;
+    try {
+      pid = JSON.parse(readFileSync(join(stateDir, "replies.lock"), "utf8"))?.pid;
+      process.kill(pid, 0);
+    } catch {
+      pid = undefined;
+    }
+    if (pid) ok("replies", `poller running, pid ${pid} — reply to a notification to answer that agent`);
+    else bad("replies", "REPLIES is on but no poller is running; the next status change starts one");
+  }
 }
 
 // ------------------------------------------------------------- and Telegram

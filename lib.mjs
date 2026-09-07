@@ -3,7 +3,18 @@
 // and how not to print a bot token. One copy, so a fix to any of it reaches all
 // three. The message itself is built in notify.mjs.
 
-import { readFileSync, readdirSync, existsSync, statSync, openSync, readSync, fstatSync, closeSync } from "node:fs";
+import {
+  readFileSync,
+  readdirSync,
+  writeFileSync,
+  mkdirSync,
+  existsSync,
+  statSync,
+  openSync,
+  readSync,
+  fstatSync,
+  closeSync,
+} from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { spawnSync } from "node:child_process";
@@ -36,6 +47,7 @@ export const DEFAULTS = {
   TELEGRAM_TOPICS: "",
   NOTIFY_WORKSPACES: "",
   IGNORE_WORKSPACES: "",
+  REPLIES: "0",
   DEBUG: "0",
   DRY_RUN: "0",
 };
@@ -450,6 +462,76 @@ export function cropScreen(rows) {
   const asking = blocks.find((block) => sliced(block).some((line) => PROMPT_MARKER.test(line)));
   const chosen = asking ?? blocks.reduce((a, b) => (b[1] - b[0] > a[1] - a[0] ? b : a));
   return sliced(chosen);
+}
+
+// ------------------------------------------------------ replies from the chat
+
+// How many notifications stay answerable, and for how long. A reply to something
+// older than this has no pane left worth guessing at.
+const MESSAGE_MAP_MAX = 300;
+const MESSAGE_MAP_TTL = 24 * 60 * 60 * 1000;
+
+function messageMapPath(stateDir) {
+  return stateDir ? join(stateDir, "messages.jsonl") : undefined;
+}
+
+// Which pane each sent notification was about, so a reply to one knows where to
+// go. Written by the notifier, read by the poller.
+export function rememberMessage(stateDir, messageId, paneId) {
+  const path = messageMapPath(stateDir);
+  if (!path || !messageId || !paneId) return;
+  const kept = [...readMessageMap(stateDir), { id: messageId, paneId, at: Date.now() }].slice(-MESSAGE_MAP_MAX);
+  try {
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(path, `${kept.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+  } catch {}
+}
+
+export function readMessageMap(stateDir) {
+  const path = messageMapPath(stateDir);
+  if (!path) return [];
+  const cutoff = Date.now() - MESSAGE_MAP_TTL;
+  const entries = [];
+  try {
+    for (const line of readFileSync(path, "utf8").split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const entry = JSON.parse(line);
+        if (entry?.id && entry.paneId && entry.at > cutoff) entries.push(entry);
+      } catch {}
+    }
+  } catch {}
+  return entries;
+}
+
+export function paneForMessage(stateDir, messageId) {
+  return readMessageMap(stateDir).findLast((entry) => entry.id === messageId)?.paneId;
+}
+
+// Which updates are this plugin's to act on. The chat id is the whole security
+// boundary here: a bot's username is public, anyone can write to it, and what
+// arrives goes to an agent's terminal. Only a reply counts, so text can only
+// ever reach the pane whose notification it answers — never one of its choosing.
+export function usableReply(update, chatId) {
+  const message = update?.message;
+  if (!message || String(message.chat?.id ?? "") !== String(chatId)) return undefined;
+  const text = String(message.text ?? "").trim();
+  if (!text) return undefined;
+  return { text, messageId: message.message_id, replyTo: message.reply_to_message?.message_id };
+}
+
+// How the reply reaches the pane. A blocked agent is sitting at a prompt that
+// wants a keystroke — `herdr agent prompt` refuses it outright with
+// agent_blocked — so the text is typed in and entered. Anything else takes it as
+// a new turn.
+export function replyCommands(paneId, status, text) {
+  if (status === "blocked") {
+    return [
+      ["pane", "send-text", paneId, text],
+      ["pane", "send-keys", paneId, "Enter"],
+    ];
+  }
+  return [["agent", "prompt", paneId, text]];
 }
 
 // -------------------------------------------------- reading a transcript

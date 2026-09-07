@@ -20,7 +20,8 @@ import {
 } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir, hostname } from "node:os";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 import {
   DEFAULTS,
@@ -52,6 +53,7 @@ import {
   readTail,
   readTurn,
   redact,
+  rememberMessage,
   retryAfterMs,
   sleep,
   stripEmphasis,
@@ -92,6 +94,9 @@ const SEND_BACKOFF = 1000;
 // and a `done` from this morning is history rather than news.
 const PENDING_TTL = 6 * 60 * 60 * 1000;
 const PENDING_MAX = 20;
+
+// The reply poller's log is rotated once past this; see ensurePoller().
+const POLLER_LOG_MAX = 256 * 1024;
 
 // ---------------------------------------------------------------- utilities
 
@@ -411,10 +416,11 @@ async function remindBlocked(stateDir, cfg, { token, chatId, silent }) {
     // could be delivered the wait it reports is no longer the wait there is.
     writeState(stateDir, file.replace(/^state-|\.json$/g, ""), { ...state, remindedAt: Date.now() });
     try {
-      await sendTelegram(token, chatId, message, {
+      const messageId = await sendTelegram(token, chatId, message, {
         silent,
         topicId: topicFor(cfg, info.workspaceLabel, workspaceId),
       });
+      rememberMessage(stateDir, messageId, paneId);
     } catch (err) {
       console.error(`herdr-telegram-notify: reminder for ${paneId} failed: ${redact(err.message, token)}`);
     }
@@ -456,7 +462,11 @@ async function sendTelegram(token, chatId, message, { silent, topicId } = {}) {
     result = await post(payload);
     if (result.ok) {
       console.log(`herdr-telegram-notify: sent, response: ${result.body}`);
-      return;
+      try {
+        return JSON.parse(result.body)?.result?.message_id;
+      } catch {
+        return undefined;
+      }
     }
     if (result.status === 400 && payload.parse_mode) {
       // Markup Telegram rejected (an entity we failed to escape, or a server too
@@ -479,6 +489,40 @@ async function sendTelegram(token, chatId, message, { silent, topicId } = {}) {
   const error = new Error(`Telegram API ${result.status || "unreachable"}: ${result.body}`);
   error.status = result.status;
   throw error;
+}
+
+// ------------------------------------------------------------------ replies
+
+// The poller runs for as long as it is wanted, which is longer than any one
+// hook. Every event checks that it is still there — a lock file read, when it
+// is — rather than anything having to be started by hand.
+function ensurePoller(stateDir) {
+  if (!stateDir) return;
+  try {
+    const pid = JSON.parse(readFileSync(join(stateDir, "replies.lock"), "utf8"))?.pid;
+    if (Number.isInteger(pid)) {
+      process.kill(pid, 0); // throws unless it is alive
+      return;
+    }
+  } catch {}
+
+  // Its output would otherwise go nowhere: the hook that starts it is gone
+  // seconds later, and a detached process has no plugin log of its own.
+  let log = "ignore";
+  try {
+    mkdirSync(stateDir, { recursive: true });
+    const path = join(stateDir, "replies.log");
+    if ((statSync(path, { throwIfNoEntry: false })?.size ?? 0) > POLLER_LOG_MAX) writeFileSync(path, "");
+    log = openSync(path, "a");
+  } catch {}
+
+  try {
+    const script = join(fileURLToPath(new URL(".", import.meta.url)), "replies.mjs");
+    spawn(process.execPath, [script], { detached: true, stdio: ["ignore", log, log] }).unref();
+    console.log("herdr-telegram-notify: started the reply poller");
+  } catch (err) {
+    console.error(`herdr-telegram-notify: could not start the reply poller: ${err.message}`);
+  }
 }
 
 // ------------------------------------------------------------------ pending
@@ -523,7 +567,7 @@ function writePending(stateDir, entries) {
   } catch {}
 }
 
-function queuePending(stateDir, parts, topicId) {
+function queuePending(stateDir, parts, topicId, paneId) {
   if (!pendingPath(stateDir)) {
     console.error("herdr-telegram-notify: no state directory, so the message could not be kept for later");
     return;
@@ -531,7 +575,7 @@ function queuePending(stateDir, parts, topicId) {
   const entries = readPending(stateDir);
   // The parts, not the rendered message: a late delivery carries an extra line,
   // and rendering it then is what keeps the result inside Telegram's limit.
-  entries.push({ at: Date.now(), parts, topicId });
+  entries.push({ at: Date.now(), parts, topicId, paneId });
   writePending(stateDir, entries);
   console.error(`herdr-telegram-notify: kept for the next event (${entries.length} waiting)`);
 }
@@ -555,10 +599,11 @@ async function flushPending(stateDir, token, chatId, silent) {
     // Telegram stamps the message with its arrival time, which by now is a lie.
     const late = `🕘 delayed ${humanDuration(Date.now() - entry.at)}`;
     try {
-      await sendTelegram(token, chatId, buildMessage({ ...entry.parts, late }), {
+      const messageId = await sendTelegram(token, chatId, buildMessage({ ...entry.parts, late }), {
         silent,
         topicId: entry.topicId,
       });
+      rememberMessage(stateDir, messageId, entry.paneId);
     } catch (err) {
       console.error(
         `herdr-telegram-notify: ${waiting.length} message(s) still waiting: ${redact(err.message, token)}`
@@ -610,6 +655,9 @@ async function main() {
   // does not make a sound doing it.
   const silent = inQuietHours(cfg("QUIET_HOURS"));
   const muted = mutedUntil(stateDir);
+  // Replies are the other direction, and a mute does not apply to them: silence
+  // is about what arrives on the phone, not about being able to answer.
+  if (!dryRun && isOn(cfg("REPLIES")) && token && chatId) ensurePoller(stateDir);
   const online =
     !dryRun && !muted && token && chatId ? await flushPending(stateDir, token, chatId, silent) : true;
 
@@ -849,19 +897,21 @@ async function main() {
     // The queue flush just proved the network is down; no point spending another
     // round of attempts on the same connection.
     console.error("herdr-telegram-notify: still offline, not retrying this one now");
-    queuePending(stateDir, parts, topicId);
+    queuePending(stateDir, parts, topicId, paneId);
     process.exitCode = 1;
     return;
   }
 
   try {
-    await sendTelegram(token, chatId, message, { silent, topicId });
+    const messageId = await sendTelegram(token, chatId, message, { silent, topicId });
+    // Which pane this message was about, so a reply to it lands in the right one.
+    rememberMessage(stateDir, messageId, paneId);
   } catch (err) {
     console.error(`herdr-telegram-notify: ${redact(err.message, token)}`);
     // A refused connection or a Telegram that is down will look different in a
     // minute; a rejected token or chat id will not, and queueing it would only
     // pile up messages that can never be sent.
-    if (isRetryable(err.status)) queuePending(stateDir, parts, topicId);
+    if (isRetryable(err.status)) queuePending(stateDir, parts, topicId, paneId);
     process.exitCode = 1;
   }
 }

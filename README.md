@@ -85,6 +85,45 @@ not name, and with neither set the messages go to the group's General topic. To
 read a topic's id, open it in Telegram Web — the number at the end of the URL is
 it.
 
+## Replying from the chat
+
+`REPLIES=1` in the `.env` turns the notifications into a conversation: reply to
+one in Telegram and the text reaches the agent that message was about.
+
+```
+⚠️ claude · blocked
+▸ frissítsd a függőségeket
+📁 storefront · main · ~/projects/storefront
+
+  Do you want to make this edit?
+  ❯ 1. Yes
+    2. No, tell Claude what to do differently
+
+      ↳  you: 1
+      ↳  bot: → typed into wC:p4
+```
+
+A blocked agent is sitting at a prompt that wants a keystroke, so the reply is
+typed in and entered — `1` picks the first option. Any other agent takes the
+reply as a new turn, the way typing it into the pane would.
+
+What it will and will not act on:
+
+- **Only your chat.** A bot's username is public and anyone can write to it, so
+  the configured `TELEGRAM_CHAT_ID` is the boundary. Messages from anywhere else
+  are ignored without an answer.
+- **Only replies.** Text can reach the pane whose notification it answers and no
+  other, so nothing typed into the chat can pick a pane for itself. A message
+  that is not a reply gets a sentence explaining that; a reply to a notification
+  older than a day gets one too, since the pane behind it is no longer certain.
+- **It says what it did.** Every reply is answered in the chat with the pane it
+  reached, or with what herdr refused and why.
+
+The polling runs in a separate process, started by the next status change after
+you turn `REPLIES` on and stopped by the next poll after you turn it off. One at
+a time, held by a lock file; `herdr plugin action invoke doctor` says whether it
+is running, and its own log is `replies.log` in the state directory.
+
 ## Muting it
 
 One action mutes the notifier and lifts the mute when it is already on, so a

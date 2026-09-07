@@ -21,7 +21,7 @@ jobs:
           node-version: ${{ matrix.node }}
       - name: Parse every entry point
         run: |
-          for f in lib.mjs notify.mjs mute.mjs doctor.mjs; do node --check "$f"; done
+          for f in lib.mjs notify.mjs mute.mjs doctor.mjs replies.mjs; do node --check "$f"; done
       - name: Shell syntax
         run: sh -n run.sh
       - name: Tests

@@ -26,7 +26,10 @@ import {
   listMatches,
   loadEnvFile,
   promptText,
+  paneForMessage,
   readTurn,
+  rememberMessage,
+  replyCommands,
   redact,
   retryAfterMs,
   screenColumns,
@@ -34,6 +37,7 @@ import {
   toolSummary,
   topicFor,
   truncate,
+  usableReply,
 } from "../lib.mjs";
 
 const scratch = mkdtempSync(join(tmpdir(), "herdr-telegram-notify-test-"));
@@ -414,4 +418,47 @@ test("cropScreen will not guess a column out of a handful of rows", () => {
   const few = twoColumn.slice(0, 3);
   assert.deepEqual(screenColumns(few), []); // no answer, rather than a wrong one
   assert.deepEqual(cropScreen(few), few);
+});
+
+// ---------------------------------------------------------------- replies
+
+test("usableReply accepts only this chat's text", () => {
+  const message = { message_id: 9, chat: { id: 42 }, text: "  folytasd  ", reply_to_message: { message_id: 7 } };
+  assert.deepEqual(usableReply({ message }, 42), { text: "folytasd", messageId: 9, replyTo: 7 });
+  assert.deepEqual(usableReply({ message }, "42"), { text: "folytasd", messageId: 9, replyTo: 7 });
+  // The whole security boundary: a bot's username is public and what arrives
+  // here goes to a terminal.
+  assert.equal(usableReply({ message: { ...message, chat: { id: 99 } } }, 42), undefined);
+  assert.equal(usableReply({ message: { ...message, text: "   " } }, 42), undefined);
+  assert.equal(usableReply({ edited_message: message }, 42), undefined);
+  assert.equal(usableReply({}, 42), undefined);
+  // Not a reply: usable, but with nothing to aim it at.
+  assert.equal(usableReply({ message: { ...message, reply_to_message: undefined } }, 42).replyTo, undefined);
+});
+
+test("replyCommands types at a blocked agent and prompts anything else", () => {
+  // `herdr agent prompt` refuses a blocked agent outright, and the prompt it is
+  // sitting at wants a keystroke rather than a turn.
+  assert.deepEqual(replyCommands("wC:p4", "blocked", "1"), [
+    ["pane", "send-text", "wC:p4", "1"],
+    ["pane", "send-keys", "wC:p4", "Enter"],
+  ]);
+  for (const status of ["idle", "done", "working", undefined]) {
+    assert.deepEqual(replyCommands("wC:p4", status, "folytasd"), [["agent", "prompt", "wC:p4", "folytasd"]]);
+  }
+});
+
+test("the message map remembers which pane a notification was about", () => {
+  const dir = mkdtempSync(join(scratch, "map-"));
+  rememberMessage(dir, 11, "wA:p1");
+  rememberMessage(dir, 12, "wB:p2");
+  assert.equal(paneForMessage(dir, 11), "wA:p1");
+  assert.equal(paneForMessage(dir, 12), "wB:p2");
+  assert.equal(paneForMessage(dir, 99), undefined);
+  // A pane that sends twice: the reply belongs to the newer message.
+  rememberMessage(dir, 13, "wA:p1");
+  assert.equal(paneForMessage(dir, 13), "wA:p1");
+  // Nothing to write to, and nothing to read back.
+  rememberMessage(undefined, 14, "wC:p3");
+  assert.equal(paneForMessage(undefined, 14), undefined);
 });

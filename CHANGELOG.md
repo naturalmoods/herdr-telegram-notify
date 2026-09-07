@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `REPLIES=1` makes the notifications answerable: reply to one in Telegram and
+  the text reaches the agent that message was about — typed in and entered for a
+  blocked agent, taken as a new turn by any other. Only your own chat is
+  listened to, and only replies are acted on, so nothing in the chat can pick a
+  pane for itself.
+
 - `SHOW_TOOLS` counts pi's tool calls. pi writes `toolCall` blocks where Claude
   writes `tool_use`, and only Claude's spelling was recognised, so every pi turn
   reported no tools rather than reporting none.
