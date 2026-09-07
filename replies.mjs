@@ -8,7 +8,16 @@ import { readFileSync, writeFileSync, mkdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 
-import { herdrBin, isOn, loadConfig, paneForMessage, redact, replyCommands, usableReply } from "./lib.mjs";
+import {
+  herdrBin,
+  isOn,
+  loadConfig,
+  paneForMessage,
+  readMessageMap,
+  redact,
+  replyCommands,
+  usableReply,
+} from "./lib.mjs";
 
 const POLL_SECONDS = 50; // how long Telegram holds the request open with nothing to say
 const IDLE_BACKOFF = 5000; // after a failed poll, before trying again
@@ -122,12 +131,20 @@ function agentStatus(paneId) {
 async function deliver(reply) {
   const paneId = paneForMessage(stateDir, reply.replyTo);
   if (!paneId) {
-    // Either not a reply at all, or a reply to something older than the map
-    // keeps. Both mean there is no pane to be sure of, and guessing at one is
-    // the last thing this should do.
+    // No pane recorded for what this answers, and guessing at one is the last
+    // thing this should do. Three ways to get here and they need telling apart,
+    // because two of them are the setup rather than a mistake: a notification
+    // sent before replies were switched on was never recorded, one older than
+    // the map keeps has been forgotten, and a message that is not a reply has
+    // nothing to look up. The id goes in the answer as well as the log — it is
+    // the one thing that says which of the three this was.
+    const known = readMessageMap(stateDir).length;
+    console.log(
+      `herdr-telegram-notify: no pane recorded for message ${reply.replyTo ?? "(not a reply)"}; ${known} answerable`
+    );
     await say(
       reply.replyTo
-        ? "That notification is too old to answer — reply to a recent one instead."
+        ? `I have no pane recorded for message ${reply.replyTo}. Only notifications sent while replies were running can be answered (${known} of them right now).`
         : "Reply to one of my notifications and I will pass it to that agent.",
       reply.messageId
     );
