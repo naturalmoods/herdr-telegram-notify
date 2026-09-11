@@ -1,9 +1,9 @@
 id = "naturalmoods.herdr-telegram-notify"
 name = "Herdr Telegram Notify"
-version = "0.6.0"
+version = "0.7.0"
 min_herdr_version = "0.8.0"
 description = "Sends a Telegram message when a Herdr-managed agent finishes or gets blocked — session title, project, duration, token use and its last message — and passes your reply back to that agent."
-platforms = ["linux", "macos"]
+platforms = ["linux"]
 
 [[events]]
 on = "pane.agent_status_changed"

@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.7.0
+
+One agent, one conversation — and enough locking to mean it.
 
 - `doctor` checks the config strictly instead of only reporting it. Every value
   it is about to use is parsed with the notifier's own rules — statuses,
@@ -50,9 +52,11 @@
   to it, and a write that cannot be locked is reported rather than made. One
   sweeper, one poller, one sweep at a time, however they were started.
 
-  This makes the plugin Linux-only, which the README now says and `doctor`
-  checks. Without `flock` the notifications still send; the queue, the message
-  map and the two background processes stop, rather than running unprotected.
+  This makes the plugin Linux-only, which the README now says, `doctor` checks
+  and the manifest no longer contradicts — it listed `macos`, which has no
+  `flock(1)` to hold any of this with. Without `flock` the notifications still
+  send; the queue, the message map and the two background processes stop,
+  rather than running unprotected.
 
 ## 0.6.0
 
