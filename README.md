@@ -27,6 +27,23 @@ and neither background process starts — none of that is done unlocked.
 herdr plugin install naturalmoods/herdr-telegram-notify --yes
 ```
 
+### Letting Claude Code do it
+
+The repo carries a skill for the setup below — the chat id in particular is
+easier to have read out of the bot than to hunt for by hand. Copy it once and
+ask your agent to set the plugin up:
+
+```
+cp -r .claude/skills/herdr-telegram-notify ~/.claude/skills/
+```
+
+That is from a clone; if you installed the plugin instead, `herdr plugin list`
+prints the directory it lives in and the skill is in the same place under it.
+
+It covers the token, the chat id, `doctor` and the reply poller, and the order
+to check things in when a reply does not arrive. Everything it does is written
+out below as well; the skill saves the typing, not the understanding.
+
 ## Configure
 
 ```
