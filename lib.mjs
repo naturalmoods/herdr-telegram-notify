@@ -585,6 +585,7 @@ const FLOCK_CANDIDATES = ["/usr/bin/flock", "/bin/flock", "/usr/local/bin/flock"
 // much longer than that to wait for the child to say which way it went.
 const LOCK_WAIT_SECONDS = 10;
 const LOCK_START_GRACE_MS = 5000;
+const RELEASE_WAIT_MS = 1000;
 
 // FLOCK_BIN_PATH names it outright, the way HERDR_BIN_PATH does. Pointed
 // somewhere that is not there, the answer is "no flock" rather than one of the
@@ -666,6 +667,14 @@ export function holdFlock(path, { waitSeconds = 0 } = {}) {
         try {
           child.kill("SIGKILL");
         } catch {}
+        // The kernel frees the lock when the child actually dies, which is a
+        // moment after the signal rather than at it. Without waiting for that,
+        // release() is a lie: the caller looks again, or asks for the lock
+        // again without waiting, and finds its own lock still held. Bounded,
+        // because a waiter taking it the instant it comes free looks the same
+        // from here and is just as good an answer.
+        const until = Date.now() + RELEASE_WAIT_MS;
+        while (Date.now() < until && flockHeld(path)) sleepSync(2);
       };
       release.pid = Number.parseInt(marker, 10);
       return release;
@@ -690,6 +699,12 @@ export function flockHeld(path) {
   const bin = flockBin();
   if (!bin || !existsSync(path)) return false;
   const res = spawnSync(bin, ["-n", path, "true"], { timeout: 4000 });
+  // Only flock's own refusal is evidence of a holder. A probe that could not
+  // run at all — spawn refused, killed, past the timeout on a loaded machine —
+  // exits with no status, and reading that as "someone holds it" is the
+  // expensive direction to be wrong in: the hook at ensureDaemon() takes it as
+  // "the daemon is already running" and never starts one.
+  if (res.error || res.status === null) return false;
   return res.status !== 0;
 }
 

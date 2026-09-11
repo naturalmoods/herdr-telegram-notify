@@ -294,9 +294,12 @@ test("the offset is kept, so a restarted poller does not replay what it answered
     messages: [{ id: 100, paneId: "wA:p1", session: "id:s1" }],
   });
   try {
-    await runPoller(fx, first.base, { until: () => first.sent.length >= 1 });
+    // The offset is written after the batch is answered, so waiting on the
+    // answer alone would race the poller's own bookkeeping.
+    const offsetFile = join(fx.stateDir, "replies.json");
+    await runPoller(fx, first.base, { until: () => first.sent.length >= 1 && existsSync(offsetFile) });
     assert.equal(first.polls[0].offset, 0);
-    assert.deepEqual(JSON.parse(readFileSync(join(fx.stateDir, "replies.json"), "utf8")), { offset: 42 });
+    assert.deepEqual(JSON.parse(readFileSync(offsetFile, "utf8")), { offset: 42 });
   } finally {
     first.close();
   }

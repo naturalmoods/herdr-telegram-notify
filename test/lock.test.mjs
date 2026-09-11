@@ -149,6 +149,11 @@ test("the lock is the kernel's: exclusive while held, gone when the holder dies"
   assert.equal(flockHeld(path), true);
   release();
   assert.equal(flockHeld(path), false);
+  // Free the moment release() returns, not a few milliseconds later: the same
+  // process takes it again without waiting for anything.
+  const again = holdFlock(path);
+  assert.ok(again, "the lock was still held when release() returned");
+  again();
 });
 
 // Nothing here has a timeout that hands out a lock, and nothing decides a
@@ -454,3 +459,4 @@ test("a sweeper started by hand refuses to be the second one", async () => {
     tg.close();
   }
 });
+

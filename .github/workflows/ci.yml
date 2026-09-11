@@ -25,7 +25,7 @@ jobs:
       - name: Shell syntax
         run: sh -n run.sh
       - name: Tests
-        run: node --test test/
+        run: node --test test/*.test.mjs
       - name: The hook runs with nothing configured
         # No herdr, no config, no state: it must degrade rather than throw.
         run: |
