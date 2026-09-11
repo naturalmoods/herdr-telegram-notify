@@ -1,7 +1,7 @@
 #!/bin/sh
 # Herdr's server does not inherit an interactive shell's PATH, so a node
-# installed by nvm, fnm or volta is usually invisible to it. Find one, then hand
-# over to the script named as the first argument (the notifier by default).
+# installed by nvm, fnm, volta or mise is usually invisible to it. Find one, then
+# hand over to the script named as the first argument (the notifier by default).
 # Node 18+ is required (fetch, ?? and ?.).
 
 dir=$(dirname "$0")
@@ -22,6 +22,7 @@ fi
 for candidate in \
   "$HOME"/.nvm/versions/node/*/bin/node \
   "$HOME"/.config/nvm/versions/node/*/bin/node \
+  "$HOME"/.local/share/mise/installs/node/*/bin/node \
   "$HOME"/.volta/bin/node \
   "$HOME"/.local/share/fnm/node-versions/*/installation/bin/node \
   /opt/homebrew/bin/node \

@@ -9,7 +9,19 @@ import { join } from "node:path";
 import { hostname } from "node:os";
 import { spawnSync } from "node:child_process";
 
-import { DEFAULTS, EXTRA_KEYS, herdr, herdrBin, isOn, loadConfig, redact } from "./lib.mjs";
+import {
+  DEFAULTS,
+  EXTRA_KEYS,
+  configProblems,
+  flockBin,
+  flockHeld,
+  herdr,
+  herdrBin,
+  isOn,
+  loadConfig,
+  redact,
+  toInt,
+} from "./lib.mjs";
 
 const results = [];
 const ok = (what, detail) => results.push({ ok: true, what, detail });
@@ -34,6 +46,18 @@ if (snapshot) {
 const gitVersion = spawnSync("git", ["--version"], { encoding: "utf8", timeout: 3000 });
 if (!gitVersion.error && gitVersion.status === 0) ok("git", gitVersion.stdout.trim());
 else bad("git", "not runnable — the ✎ changed-files line will be missing");
+
+// Everything several runs of this plugin share is written under an flock, so
+// that a hook, the sweeper and the poller cannot overwrite each other's queue
+// or start two of each other. It comes from util-linux, so this is Linux only.
+if (flockBin()) {
+  ok("flock", `${flockBin()} — the queue, the message map and the background processes are locked with it`);
+} else {
+  bad(
+    "flock",
+    "not found (util-linux, Linux only) — notifications still send, but nothing is queued or recorded and neither background process starts"
+  );
+}
 
 // -------------------------------------------------------------- the config
 
@@ -60,19 +84,32 @@ const known = [...Object.keys(DEFAULTS), ...EXTRA_KEYS];
 const set = known.filter((k) => process.env[k] !== undefined).sort();
 if (set.length) ok("env overrides", `${set.join(", ")} — these beat the .env for this run`);
 
-ok("statuses", `notifying on ${cfg("NOTIFY_STATUSES")}`);
+// A misspelt value is invisible at runtime — nothing fails, the setting simply
+// does not do what it says — so it is the one class of problem a doctor has to
+// find. What it costs differs per key and configProblems says which, because
+// "the default is used instead" is only true of the ones that parse a number:
+// a mistyped status or user id is dropped and the rest of the list goes on.
+// A key that failed here is not reported OK below.
+const broken = new Set();
+for (const { key, detail } of configProblems(cfg)) {
+  broken.add(key);
+  bad(key, detail);
+}
+
+if (!broken.has("NOTIFY_STATUSES")) ok("statuses", `notifying on ${cfg("NOTIFY_STATUSES")}`);
 for (const [key, what] of [
   ["NOTIFY_WORKSPACES", "only these workspaces send"],
   ["IGNORE_WORKSPACES", "these workspaces never send"],
   ["QUIET_HOURS", "delivered without a sound in this window"],
   ["MIN_DURATION_SECONDS", "turns shorter than this are dropped"],
   ["BLOCKED_REMINDER_MINUTES", "a blocked agent is nudged again after this"],
+  ["SWEEP_MINUTES", "the queue and the reminders are swept this often"],
   ["REPLIES", "a reply in the chat is passed to that agent"],
   ["TELEGRAM_TOPIC_ID", "default forum topic"],
   ["TELEGRAM_TOPICS", "per-workspace forum topics"],
 ]) {
   const value = cfg(key);
-  if (value && value !== "0") ok(key, `${value} — ${what}`);
+  if (value && value !== "0" && !broken.has(key)) ok(key, `${value} — ${what}`);
 }
 
 // --------------------------------------------------------------- the state
@@ -102,15 +139,25 @@ if (!stateDir) {
   // The poller is a separate process, so "configured" and "running" are two
   // different questions and the second is the one that matters.
   if (isOn(cfg("REPLIES"))) {
-    let pid;
-    try {
-      pid = JSON.parse(readFileSync(join(stateDir, "replies.lock"), "utf8"))?.pid;
-      process.kill(pid, 0);
-    } catch {
-      pid = undefined;
+    // Whether the lock is held is the question, and the kernel answers it: a
+    // poller that died is not holding anything, whatever it left on disk.
+    if (flockHeld(join(stateDir, "replies.lock"))) {
+      ok("replies", "poller running — reply to a notification to answer that agent");
+    } else {
+      bad("replies", "REPLIES is on but no poller is running; the next status change starts one");
     }
-    if (pid) ok("replies", `poller running, pid ${pid} — reply to a notification to answer that agent`);
-    else bad("replies", "REPLIES is on but no poller is running; the next status change starts one");
+  }
+
+  // Same two questions for the timer that sweeps the queue and the reminders.
+  // Nothing sweeps without somewhere to send to, so an unconfigured machine is
+  // not missing a sweeper — it is missing the two lines above.
+  const sweepMinutes = toInt(cfg("SWEEP_MINUTES"), 0);
+  if (sweepMinutes && token && chatId) {
+    if (flockHeld(join(stateDir, "sweep.lock"))) {
+      ok("sweeper", `running — the queue and the reminders are swept every ${sweepMinutes} min`);
+    } else {
+      bad("sweeper", `SWEEP_MINUTES is ${sweepMinutes} but nothing is sweeping; the next status change starts it`);
+    }
   }
 }
 
@@ -136,14 +183,14 @@ if (token && chatId) {
   else bad("bot", `getMe says ${me.status}: ${me.body?.description ?? "no answer"}`);
 
   if (me.body?.ok) {
-    const topic = Number.parseInt(String(cfg("TELEGRAM_TOPIC_ID") ?? ""), 10);
+    const topic = toInt(cfg("TELEGRAM_TOPIC_ID"), undefined);
     const sent = await callTelegram("sendMessage", {
       chat_id: chatId,
       // Said plainly, because it looks like a notification and is not one: the
       // doctor sends it directly, so nothing recorded which pane it was about.
       text: `🩺 herdr-telegram-notify on ${hostname()}: this is the doctor's test message, not a notification — replying to this one has nowhere to go.`,
       disable_notification: true,
-      ...(Number.isFinite(topic) && topic > 0 ? { message_thread_id: topic } : {}),
+      ...(topic ? { message_thread_id: topic } : {}),
     });
     if (sent.body?.ok) ok("test message", `delivered, message_id ${sent.body.result.message_id}`);
     else bad("test message", `sendMessage says ${sent.status}: ${sent.body?.description ?? "no answer"}`);
@@ -161,4 +208,6 @@ spawnSync(herdrBin(), ["notification", "show", title, "--body", body, "--sound",
   encoding: "utf8",
   timeout: 4000,
 });
-if (problems.length) process.exitCode = 1;
+// 2 says the config itself is wrong, which is the one outcome a caller can fix
+// without reading the report; 1 is everything else that failed.
+if (problems.length) process.exitCode = broken.size ? 2 : 1;

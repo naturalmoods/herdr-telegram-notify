@@ -2,23 +2,28 @@
 // The other direction: a reply in Telegram reaches the agent the message was
 // about. Long-polls getUpdates and hands each reply to herdr. Started by
 // notify.mjs when REPLIES is on, and it stops itself when that is turned off —
-// see README.md. One instance at a time, held by a lock file in the state dir.
+// see README.md. One instance at a time, held by an flock on a file in the
+// state dir — so a poller that crashes takes its lock with it.
 
-import { readFileSync, writeFileSync, mkdirSync, unlinkSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 
 import {
+  flockAvailable,
   herdrBin,
+  holdFlock,
   isOn,
   loadConfig,
-  paneForMessage,
   readMessageMap,
   redact,
   replyCommands,
+  sessionKey,
+  targetForMessage,
   usableReply,
 } from "./lib.mjs";
 
+const TELEGRAM_API = process.env.TELEGRAM_API_BASE ?? "https://api.telegram.org";
 const POLL_SECONDS = 50; // how long Telegram holds the request open with nothing to say
 const IDLE_BACKOFF = 5000; // after a failed poll, before trying again
 const MAX_TEXT = 4000; // a prompt longer than this is a paste accident
@@ -34,37 +39,19 @@ const offsetPath = join(stateDir, "replies.json");
 
 // ------------------------------------------------------------------- lock
 
-function runningElsewhere() {
-  try {
-    const pid = JSON.parse(readFileSync(lockPath, "utf8"))?.pid;
-    if (!Number.isInteger(pid) || pid === process.pid) return false;
-    process.kill(pid, 0); // throws unless that process is alive
-    return pid;
-  } catch {
-    return false;
-  }
-}
-
-const other = runningElsewhere();
-if (other) {
-  console.log(`herdr-telegram-notify: replies already being polled by pid ${other}`);
+// One poller, whether a hook started this or someone ran it by hand. The lock
+// is the kernel's: held for as long as this process lives and released by the
+// kernel however it dies, so there is nothing to clean up after a crash and
+// nothing to check on the way round the loop.
+const release = holdFlock(lockPath);
+if (!release) {
+  console.log(
+    flockAvailable()
+      ? "herdr-telegram-notify: replies are already being polled"
+      : "herdr-telegram-notify: replies need flock(1) to be sure only one poller runs — see doctor"
+  );
   process.exit(0);
 }
-try {
-  mkdirSync(stateDir, { recursive: true });
-  writeFileSync(lockPath, JSON.stringify({ pid: process.pid, since: Date.now() }));
-} catch (err) {
-  console.error(`herdr-telegram-notify: could not take the reply lock: ${err.message}`);
-  process.exit(1);
-}
-
-function release() {
-  try {
-    if (JSON.parse(readFileSync(lockPath, "utf8"))?.pid === process.pid) unlinkSync(lockPath);
-  } catch {}
-}
-process.on("exit", release);
-for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(signal, () => process.exit(0));
 
 // --------------------------------------------------------------- telegram
 
@@ -78,7 +65,7 @@ if (!token || !chatId) {
 
 async function telegram(method, payload, timeoutMs) {
   try {
-    const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+    const res = await fetch(`${TELEGRAM_API}/bot${token}/${method}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(payload),
@@ -116,11 +103,14 @@ function herdrRun(args) {
   return { ok: true, out: res.stdout };
 }
 
-function agentStatus(paneId) {
+// What is in that pane right now: the status decides how the reply is delivered,
+// the session decides whether it may be delivered at all.
+function liveAgent(paneId) {
   const res = herdrRun(["agent", "get", paneId]);
   if (!res.ok) return undefined;
   try {
-    return JSON.parse(res.out).result?.agent?.agent_status;
+    const agent = JSON.parse(res.out).result?.agent;
+    return agent && { status: agent.agent_status, session: sessionKey(agent.agent_session) };
   } catch {
     return undefined;
   }
@@ -129,8 +119,8 @@ function agentStatus(paneId) {
 // --------------------------------------------------------------- dispatch
 
 async function deliver(reply) {
-  const paneId = paneForMessage(stateDir, reply.replyTo);
-  if (!paneId) {
+  const target = targetForMessage(stateDir, reply.replyTo);
+  if (!target) {
     // No pane recorded for what this answers, and guessing at one is the last
     // thing this should do. Three ways to get here and they need telling apart,
     // because two of them are the setup rather than a mistake: a notification
@@ -151,8 +141,27 @@ async function deliver(reply) {
     return;
   }
 
+  // A pane outlives the agent that was in it: the session ends, the next one
+  // starts in the same place, and a reply written before that would land in a
+  // conversation it was never part of. The session the notification was about
+  // has to be the session that is there now — anything else, including a pane
+  // that no longer answers or a notification remembered before sessions were
+  // recorded, is refused rather than guessed at.
+  const { paneId } = target;
+  const live = liveAgent(paneId);
+  if (!target.session || !live?.session || live.session !== target.session) {
+    const reason = !target.session
+      ? "that notification was sent before this plugin recorded agent sessions"
+      : !live?.session
+        ? `no agent is running in ${paneId} now`
+        : `${paneId} is running a different agent session now`;
+    console.log(`herdr-telegram-notify: refused a reply to ${paneId}: ${reason}`);
+    await say(`✗ not delivered — ${reason}. Reply to a newer notification from that agent.`, reply.messageId);
+    return;
+  }
+
   const text = reply.text.slice(0, MAX_TEXT);
-  const status = agentStatus(paneId);
+  const status = live.status;
   for (const args of replyCommands(paneId, status, text)) {
     const res = herdrRun(args);
     if (!res.ok) {
@@ -200,7 +209,7 @@ for (;;) {
 
   for (const update of updates.result ?? []) {
     offset = Math.max(offset, update.update_id + 1);
-    const reply = usableReply(update, chatId);
+    const reply = usableReply(update, chatId, cfg("REPLY_ALLOWED_USER_IDS"));
     if (reply) await deliver(reply);
   }
   saveOffset();

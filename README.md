@@ -8,9 +8,18 @@ Reply to that message and the text goes back to the agent it was about, so a
 blocked agent waiting on `1. Yes` can be answered from wherever you are. Off by
 default; see [Replying from the chat](#replying-from-the-chat).
 
-Requires Herdr 0.8 or newer, Node 18+, and Linux or macOS. Herdr's server does
-not inherit your shell's PATH, so `run.sh` locates Node itself — an nvm, fnm or
-volta install would otherwise be invisible to it.
+Requires Herdr 0.8 or newer, Node 18+, and Linux. Herdr's server does
+not inherit your shell's PATH, so `run.sh` locates Node itself — an nvm, fnm,
+volta or mise install would otherwise be invisible to it.
+
+Linux rather than any Unix because of `flock(1)`, from util-linux. Every hook
+run is its own process, and the reply poller and the sweeper are two more, all
+writing one state directory: the queue, the message map and "is one of these
+already running" are all held with a kernel lock, which is the kind that is
+released when the process holding it dies rather than left behind for the next
+one to puzzle over. `doctor` checks for it. Without it the notifications
+themselves still send, but nothing is queued for later, no reply can be routed,
+and neither background process starts — none of that is done unlocked.
 
 ## Install
 
@@ -120,8 +129,23 @@ What it will and will not act on:
   other, so nothing typed into the chat can pick a pane for itself. A message
   that is not a reply gets a sentence explaining that; a reply to a notification
   older than a day gets one too, since the pane behind it is no longer certain.
+- **Only the agent it was written to.** A pane outlives the agent in it: that
+  session ends, the next one starts in the same pane, and a reply written before
+  that would land in a conversation it was never part of. Each notification
+  records the agent session it was about, and the reply is delivered only if
+  that session is still the one running there. A pane that has moved on, a pane
+  with no agent left, and a notification from before this was recorded are all
+  refused with a line saying so — never delivered to whoever is there now.
+- **Only named people, if you say so.** Set `REPLY_ALLOWED_USER_IDS` to a
+  comma-separated list of Telegram user ids and only those may reply. Empty (the
+  default) means anyone who can write in `TELEGRAM_CHAT_ID` — which in a private
+  chat is only you, and in a group is everyone in the group, so set the list
+  there. With a list set, a sender that cannot be named is refused without an
+  answer: an anonymous group admin and a channel post arrive as `sender_chat`,
+  with no user id of their own. `@userinfobot` tells you your id.
 - **It says what it did.** Every reply is answered in the chat with the pane it
-  reached, or with what herdr refused and why.
+  reached, or with what herdr refused and why. A message from the wrong chat, or
+  from someone off the allowlist, gets no answer at all.
 
 The polling runs in a separate process, started by the next status change after
 you turn `REPLIES` on and stopped by the next poll after you turn it off. One at
@@ -229,9 +253,11 @@ a minute.
 
 A send that still fails is kept in the state directory rather than dropped, and
 the next status change on any pane — notified or not — delivers it, marked with
-how late it is. The queue holds the twenty most recent messages for six hours:
-a wifi that comes back should hand you the news, not a wall of yesterday. A
-rejected token or chat id is never queued, since nothing about it will change.
+how late it is. The last message of an outage would otherwise sit there until
+some pane happens to change status, so `SWEEP_MINUTES` retries it on a timer as
+well. The queue holds the twenty most recent messages for six hours: a wifi that
+comes back should hand you the news, not a wall of yesterday. A rejected token
+or chat id is never queued, since nothing about it will change.
 
 ## Behavior
 
@@ -251,6 +277,23 @@ rejected token or chat id is never queued, since nothing about it will change.
   there and the screen it is standing on; it is sent once per blocked stretch,
   and only after the live session confirms the agent is still blocked, so an
   answered pane is never nagged about. Off by default.
+- `SWEEP_MINUTES` is how often the two things above happen on their own: the
+  queue is retried and the reminders go out every this many minutes, whether or
+  not any pane changes status. A blocked agent raises no further events by
+  definition — it is standing still — so without this its reminder waits for
+  some other pane to finish, which on a quiet machine is the morning. `0` by
+  default, which is to say off: nothing runs in the background until you ask for
+  it, and until you do, a sweep only happens when some pane changes status. `5`
+  is a sensible start, and it is what makes `BLOCKED_REMINDER_MINUTES` arrive
+  when it says it will.
+
+  The sweeping runs in a separate process, started by the next status change
+  after you set `SWEEP_MINUTES` and stopped by its next pass after you set it
+  back to `0` (up to that many minutes later, or immediately if you kill the pid
+  in `sweep.lock`). One at a time, held by that lock file; `herdr plugin action
+  invoke doctor` says whether it is running, and its own log is `sweep.log` in
+  the state directory. Nothing to start by hand, and nothing left running once
+  it is off.
 - `MIN_DURATION_SECONDS` drops turns shorter than it — a turn you sat through
   does not need a notification, and a phone that buzzes for those is a phone you
   stop reading. Off by default; 60 is a sensible start. Never applies to
@@ -286,12 +329,23 @@ rejected token or chat id is never queued, since nothing about it will change.
 herdr plugin action invoke doctor
 ```
 
-It reports Node, the `herdr` and `git` binaries, the config file and its
+It reports Node, the `herdr`, `git` and `flock` binaries, the config file and its
 permissions, every setting that is doing something, the state directory, and the
 bot credentials — then sends one silent test message, which is the only check
 that proves the token and the chat id together. The report lands in
 `herdr plugin log list` and the verdict in a Herdr notification. Bind it like
 the mute action if you want it on a key.
+
+It also parses every value it is going to use, with the same rules the notifier
+parses them with, and reports the ones it cannot read: a status that is not one
+(`blocke`), a `QUIET_HOURS` that is not `HH:MM-HH:MM`, a count carrying a unit
+(`SWEEP_MINUTES=5min`), a negative or zero where a size is wanted, a topic id
+or a Telegram user id that is not a number, a `TELEGRAM_TOPICS` entry that is
+not a `workspace:topic` pair. Each of those falls back to the default at
+runtime, which is what makes it worth a check: the setting silently never
+happens. A key reported this way is never also reported OK, and the exit code
+is `2` when the config is what is wrong (`1` for anything else that failed).
+Values are printed as written, except the token, which is never printed at all.
 
 ## When nothing arrives
 

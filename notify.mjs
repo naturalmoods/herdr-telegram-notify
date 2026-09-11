@@ -21,6 +21,7 @@ import {
 import { join, dirname } from "node:path";
 import { homedir, hostname } from "node:os";
 import { spawn, spawnSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -66,6 +67,13 @@ import {
   usageOf,
   warnIfWorldReadable,
   warnUnknownKeys,
+  flockAvailable,
+  flockHeld,
+  holdFlock,
+  readLines,
+  sleepSync,
+  withFileLock,
+  writeLines,
 } from "./lib.mjs";
 
 // Longest working→stop gap still believable as one turn; see main().
@@ -95,8 +103,18 @@ const SEND_BACKOFF = 1000;
 const PENDING_TTL = 6 * 60 * 60 * 1000;
 const PENDING_MAX = 20;
 
-// The reply poller's log is rotated once past this; see ensurePoller().
+// One sweep at a time on this machine, whoever asked for it.
+const SWEEP_RUN_LOCK = "sweep-run.lock";
+
+// How long a hook waits for a background process it started to take its lock.
+const DAEMON_START_MS = 5000;
+
+// A background process's log is rotated once past this; see ensureDaemon().
 const POLLER_LOG_MAX = 256 * 1024;
+
+// Where the sends go. Overridable so a test can point a real run at a local
+// stub; nothing in normal use sets it.
+const TELEGRAM_API = process.env.TELEGRAM_API_BASE ?? "https://api.telegram.org";
 
 // ---------------------------------------------------------------- utilities
 
@@ -308,10 +326,15 @@ function sweepState(stateDir) {
     for (const name of readdirSync(stateDir)) {
       // `last-status-<pane>.txt` is the 0.1 scheme; nothing reads it now.
       const obsolete = name.startsWith("last-status-") && name.endsWith(".txt");
-      if (!obsolete && !(name.startsWith("state-") && name.endsWith(".json"))) continue;
+      const state = name.startsWith("state-") && name.endsWith(".json");
+      // How a lock reports that it was taken; one still here an hour later
+      // belongs to a process that died between asking and hearing back.
+      const leftover = name.endsWith(".ready");
+      if (!obsolete && !state && !leftover) continue;
       const path = join(stateDir, name);
+      const ttl = leftover ? 60 * 60 * 1000 : STATE_TTL;
       try {
-        if (obsolete || now - statSync(path).mtimeMs > STATE_TTL) unlinkSync(path);
+        if (obsolete || now - statSync(path).mtimeMs > ttl) unlinkSync(path);
       } catch {}
     }
   } catch {}
@@ -420,7 +443,7 @@ async function remindBlocked(stateDir, cfg, { token, chatId, silent }) {
         silent,
         topicId: topicFor(cfg, info.workspaceLabel, workspaceId),
       });
-      rememberMessage(stateDir, messageId, paneId);
+      rememberMessage(stateDir, messageId, paneId, info.session);
     } catch (err) {
       console.error(`herdr-telegram-notify: reminder for ${paneId} failed: ${redact(err.message, token)}`);
     }
@@ -432,7 +455,7 @@ async function remindBlocked(stateDir, cfg, { token, chatId, silent }) {
 const STATUS_EMOJI = { done: "✅", blocked: "⚠️", working: "⏳", idle: "💤" };
 
 async function sendTelegram(token, chatId, message, { silent, topicId } = {}) {
-  const url = `https://api.telegram.org/bot${token}/sendMessage`;
+  const url = `${TELEGRAM_API}/bot${token}/sendMessage`;
   const post = async (payload) => {
     try {
       const res = await fetch(url, {
@@ -491,37 +514,64 @@ async function sendTelegram(token, chatId, message, { silent, topicId } = {}) {
   throw error;
 }
 
-// ------------------------------------------------------------------ replies
+// ---------------------------------------------------- background processes
 
-// The poller runs for as long as it is wanted, which is longer than any one
-// hook. Every event checks that it is still there — a lock file read, when it
-// is — rather than anything having to be started by hand.
-function ensurePoller(stateDir) {
+const scriptDir = fileURLToPath(new URL(".", import.meta.url));
+
+// The reply poller and the sweeper both run for as long as they are wanted,
+// which is longer than any one hook. Every event checks the ones it wants are
+// still there — a lock file read, when they are — rather than anything having to
+// be started by hand. The lock is written here rather than by the child, so a
+// process that dies on startup is not spawned again by every event after it.
+function ensureDaemon(stateDir, { lock, script, args = [], log: logName, label }) {
   if (!stateDir) return;
-  try {
-    const pid = JSON.parse(readFileSync(join(stateDir, "replies.lock"), "utf8"))?.pid;
-    if (Number.isInteger(pid)) {
-      process.kill(pid, 0); // throws unless it is alive
-      return;
-    }
-  } catch {}
+  if (!flockAvailable()) {
+    console.error(
+      `herdr-telegram-notify: no flock(1) found, so the ${label} is not started — see doctor. Notifications still work.`
+    );
+    return;
+  }
+  const lockPath = join(stateDir, lock);
+  if (flockHeld(lockPath)) return; // already running
 
-  // Its output would otherwise go nowhere: the hook that starts it is gone
-  // seconds later, and a detached process has no plugin log of its own.
-  let log = "ignore";
+  // One hook at a time gets as far as spawning: the process it starts takes its
+  // own lock a moment later, and until it has, a second hook would find that
+  // lock free and start a second copy behind it.
+  const starting = holdFlock(`${lockPath}.start`);
+  if (!starting) return;
   try {
-    mkdirSync(stateDir, { recursive: true });
-    const path = join(stateDir, "replies.log");
-    if ((statSync(path, { throwIfNoEntry: false })?.size ?? 0) > POLLER_LOG_MAX) writeFileSync(path, "");
-    log = openSync(path, "a");
-  } catch {}
+    if (flockHeld(lockPath)) return; // someone started it while we waited
 
-  try {
-    const script = join(fileURLToPath(new URL(".", import.meta.url)), "replies.mjs");
-    spawn(process.execPath, [script], { detached: true, stdio: ["ignore", log, log] }).unref();
-    console.log("herdr-telegram-notify: started the reply poller");
+    // Its output would otherwise go nowhere: the hook that starts it is gone
+    // seconds later, and a detached process has no plugin log of its own.
+    let log = "ignore";
+    try {
+      mkdirSync(stateDir, { recursive: true });
+      const path = join(stateDir, logName);
+      if ((statSync(path, { throwIfNoEntry: false })?.size ?? 0) > POLLER_LOG_MAX) writeFileSync(path, "");
+      log = openSync(path, "a");
+    } catch {}
+
+    const child = spawn(process.execPath, [join(scriptDir, script), ...args], {
+      detached: true,
+      stdio: ["ignore", log, log],
+    });
+    child.unref();
+
+    // Held here until it has the lock, so the next event finds it taken. If it
+    // never does — a process that dies on startup — the lock is free again and
+    // the next event tries once more, which is the honest answer.
+    const deadline = Date.now() + DAEMON_START_MS;
+    while (Date.now() < deadline && !flockHeld(lockPath)) sleepSync(25);
+    console.log(
+      flockHeld(lockPath)
+        ? `herdr-telegram-notify: started the ${label}`
+        : `herdr-telegram-notify: the ${label} did not start; see ${logName}`
+    );
   } catch (err) {
-    console.error(`herdr-telegram-notify: could not start the reply poller: ${err.message}`);
+    console.error(`herdr-telegram-notify: could not start the ${label}: ${err.message}`);
+  } finally {
+    starting();
   }
 }
 
@@ -531,53 +581,47 @@ function pendingPath(stateDir) {
   return stateDir ? join(stateDir, "pending.jsonl") : undefined;
 }
 
+function pendingLock(stateDir) {
+  return join(stateDir, "pending.lock");
+}
+
+// What a queued message is called when it has to be found again. Entries queued
+// by 0.6 and earlier have no id of their own; their content is one.
+function entryId(entry) {
+  return entry?.id ?? createHash("sha1").update(JSON.stringify(entry)).digest("hex").slice(0, 16);
+}
+
+// Read under the caller's lock: what is still waiting, oldest first, without
+// the ones too old to be news.
 function readPending(stateDir) {
-  const path = pendingPath(stateDir);
-  if (!path) return [];
-  let text;
-  try {
-    text = readFileSync(path, "utf8");
-  } catch {
-    return [];
-  }
   const cutoff = Date.now() - PENDING_TTL;
-  const entries = [];
-  for (const line of text.split("\n")) {
-    if (!line.trim()) continue;
-    try {
-      const entry = JSON.parse(line);
-      if (entry?.parts && entry.at > cutoff) entries.push(entry);
-    } catch {}
-  }
-  return entries.slice(-PENDING_MAX);
+  return readLines(pendingPath(stateDir))
+    .filter((entry) => entry?.parts && entry.at > cutoff)
+    .slice(-PENDING_MAX);
 }
 
-function writePending(stateDir, entries) {
+function queuePending(stateDir, parts, topicId, paneId, session) {
   const path = pendingPath(stateDir);
-  if (!path) return;
-  try {
-    if (!entries.length) {
-      try {
-        unlinkSync(path);
-      } catch {}
-      return;
-    }
-    mkdirSync(stateDir, { recursive: true });
-    writeFileSync(path, `${entries.slice(-PENDING_MAX).map((e) => JSON.stringify(e)).join("\n")}\n`);
-  } catch {}
-}
-
-function queuePending(stateDir, parts, topicId, paneId) {
-  if (!pendingPath(stateDir)) {
+  if (!path) {
     console.error("herdr-telegram-notify: no state directory, so the message could not be kept for later");
     return;
   }
-  const entries = readPending(stateDir);
-  // The parts, not the rendered message: a late delivery carries an extra line,
-  // and rendering it then is what keeps the result inside Telegram's limit.
-  entries.push({ at: Date.now(), parts, topicId, paneId });
-  writePending(stateDir, entries);
-  console.error(`herdr-telegram-notify: kept for the next event (${entries.length} waiting)`);
+  try {
+    const waiting = withFileLock(pendingLock(stateDir), () => {
+      // The parts, not the rendered message: a late delivery carries an extra
+      // line, and rendering it then is what keeps the result inside Telegram's
+      // limit.
+      const entries = [...readPending(stateDir), { id: randomUUID(), at: Date.now(), parts, topicId, paneId, session }];
+      writeLines(path, entries.slice(-PENDING_MAX));
+      return entries.length;
+    });
+    console.error(`herdr-telegram-notify: kept for the next event (${waiting} waiting)`);
+  } catch (err) {
+    // Nothing was written, which is the point: half a queue file loses more
+    // than this one message. Loud, because this one is gone.
+    console.error(`herdr-telegram-notify: the message could not be kept for later — ${err.message}`);
+    process.exitCode = 1;
+  }
 }
 
 // Deliver what the network was down for, oldest first, and stop at the first
@@ -585,16 +629,28 @@ function queuePending(stateDir, parts, topicId, paneId) {
 // actually failed — the caller takes that as "still offline" and does not spend
 // another round of attempts proving it.
 async function flushPending(stateDir, token, chatId, silent) {
-  const waiting = readPending(stateDir);
-  // Nothing worth sending — which includes a file holding only entries that have
-  // aged out, so this is also where those stop taking up space.
-  if (!waiting.length) {
-    writePending(stateDir, []);
-    return true;
-  }
+  if (!pendingPath(stateDir)) return true;
+  const path = pendingPath(stateDir);
+  const lock = pendingLock(stateDir);
 
-  let online = true;
-  while (waiting.length) {
+  // The lock is taken around each read and each write, never across the send:
+  // a hook queueing a message while this is talking to Telegram waits for a
+  // couple of syscalls, not for the network. Only one process flushes at a
+  // time — sweep() holds the sweep lock for that — so the entry read here is
+  // still the one being sent when it comes off the queue below.
+  //
+  // ponytail: at-least-once. A crash between Telegram accepting a message and
+  // it coming off the queue sends that one again on the next pass;
+  // deduplicating it would need an id Telegram itself checked, and it has no
+  // such thing. Nothing is lost, which is the half that matters here.
+  for (;;) {
+    const waiting = withFileLock(lock, () => {
+      const entries = readPending(stateDir);
+      writeLines(path, entries); // the aged-out ones stop taking up space here
+      return entries;
+    });
+    if (!waiting.length) return true;
+
     const entry = waiting[0];
     // Telegram stamps the message with its arrival time, which by now is a lie.
     const late = `🕘 delayed ${humanDuration(Date.now() - entry.at)}`;
@@ -603,18 +659,109 @@ async function flushPending(stateDir, token, chatId, silent) {
         silent,
         topicId: entry.topicId,
       });
-      rememberMessage(stateDir, messageId, entry.paneId);
+      rememberMessage(stateDir, messageId, entry.paneId, entry.session);
     } catch (err) {
       console.error(
         `herdr-telegram-notify: ${waiting.length} message(s) still waiting: ${redact(err.message, token)}`
       );
-      online = false;
+      return false;
+    }
+    // Re-read rather than write back the list from before the send: another
+    // process may have queued something while it was in flight.
+    withFileLock(lock, () => {
+      const id = entryId(entry);
+      writeLines(
+        path,
+        readPending(stateDir).filter((e) => entryId(e) !== id)
+      );
+    });
+  }
+}
+
+// -------------------------------------------------------------------- sweep
+
+// The half of a run that needs no status event: deliver what the network was
+// down for, then nudge about whoever is still blocked. Muting drops the messages
+// it covers rather than delaying them (see mutedUntil), a dry run sends nothing
+// at all, and without credentials there is nowhere to send to. Returns false
+// only when a send actually failed, which the hook reads as "still offline".
+async function sweep(stateDir, cfg) {
+  const token = cfg("TELEGRAM_BOT_TOKEN");
+  const chatId = cfg("TELEGRAM_CHAT_ID");
+  if (isOn(cfg("DRY_RUN")) || !token || !chatId || mutedUntil(stateDir)) return true;
+
+  // The timer and any number of hooks can arrive here at once, and two sweeps
+  // running together send the queue twice and nudge twice about the same
+  // blocked pane. Whoever finds it busy leaves it to them and says nothing is
+  // wrong with the network — the caller's own send will find out if there is.
+  // Nothing is skipped by leaving: the queue is still there for whoever holds
+  // the lock, and for the next pass if they fail.
+  const release = stateDir ? holdFlock(join(stateDir, SWEEP_RUN_LOCK)) : () => {};
+  if (!release) return true;
+
+  try {
+    const silent = inQuietHours(cfg("QUIET_HOURS"));
+    const online = await flushPending(stateDir, token, chatId, silent);
+    // A queue that just failed proves the network is down; the reminders can wait
+    // for the next pass rather than spend another round of attempts on it.
+    if (online) await remindBlocked(stateDir, cfg, { token, chatId, silent });
+    return online;
+  } catch (err) {
+    // A lock we could not get: the queue is untouched and the next pass, or the
+    // next event, will find it exactly as it is.
+    console.error(`herdr-telegram-notify: the sweep stopped early — ${err.message}`);
+    return true;
+  } finally {
+    release();
+  }
+}
+
+// `notify.mjs --sweep`: the same sweep on a timer, in the detached copy of this
+// script that ensureDaemon() starts from any event. A status change is the only
+// other cue there is, and it is precisely the thing that does not arrive while
+// an agent stands blocked or the wifi is out — so without this a reminder waits
+// for someone else's pane to finish, and the last message of an outage stays in
+// the queue until it does.
+async function sweepLoop() {
+  const stateDir = process.env.HERDR_PLUGIN_STATE_DIR;
+  if (!stateDir) {
+    console.error("herdr-telegram-notify: the sweeper needs a state directory to read the queue and the blocked panes");
+    process.exitCode = 1;
+    return;
+  }
+  // One sweeper, whether a hook started it or someone ran it by hand: the lock
+  // is held by the kernel for as long as this process lives, and released by
+  // the kernel however it dies.
+  const release = holdFlock(join(stateDir, "sweep.lock"));
+  if (!release) {
+    console.log(
+      flockAvailable()
+        ? "herdr-telegram-notify: a sweeper is already running"
+        : "herdr-telegram-notify: the sweeper needs flock(1) — see doctor"
+    );
+    return;
+  }
+
+  console.log(`herdr-telegram-notify: sweeping (pid ${process.pid})`);
+  for (;;) {
+    // Re-read on every pass, so SWEEP_MINUTES=0 in the .env stops this without
+    // anyone having to find the process — the same way REPLIES stops the poller.
+    const cfg = loadConfig();
+    const minutes = toInt(cfg("SWEEP_MINUTES"), 0);
+    if (!minutes) {
+      console.log("herdr-telegram-notify: SWEEP_MINUTES is 0, stopping the sweeper");
       break;
     }
-    waiting.shift();
+    // Cached for the length of a hook run, which is not the length of this one:
+    // every pass has to ask the herd what it looks like now, or a reminder goes
+    // out about an agent that answered an hour ago.
+    snapshotCache = undefined;
+    snapshotLoaded = false;
+    sweepState(stateDir);
+    await sweep(stateDir, cfg);
+    await sleep(minutes * 60 * 1000);
   }
-  writePending(stateDir, waiting);
-  return online;
+  release();
 }
 
 // --------------------------------------------------------------------- main
@@ -647,23 +794,35 @@ async function main() {
   const dryRun = isOn(cfg("DRY_RUN"));
   const token = cfg("TELEGRAM_BOT_TOKEN");
   const chatId = cfg("TELEGRAM_CHAT_ID");
-  // Whatever the network was down for waits in the state directory, and any
-  // status change on any pane is the cue to try again — including the ones this
-  // run is about to filter out, which is what keeps a queue from sitting there
-  // until the next thing worth notifying happens.
   // Overnight the message still arrives and still waits in the chat; it just
   // does not make a sound doing it.
   const silent = inQuietHours(cfg("QUIET_HOURS"));
   const muted = mutedUntil(stateDir);
   // Replies are the other direction, and a mute does not apply to them: silence
   // is about what arrives on the phone, not about being able to answer.
-  if (!dryRun && isOn(cfg("REPLIES")) && token && chatId) ensurePoller(stateDir);
-  const online =
-    !dryRun && !muted && token && chatId ? await flushPending(stateDir, token, chatId, silent) : true;
-
-  if (!dryRun && !muted && online && token && chatId) {
-    await remindBlocked(stateDir, cfg, { token, chatId, silent });
+  if (!dryRun && isOn(cfg("REPLIES")) && token && chatId) {
+    ensureDaemon(stateDir, { lock: "replies.lock", script: "replies.mjs", log: "replies.log", label: "reply poller" });
   }
+  // ponytail: one idle process per machine while SWEEP_MINUTES is set, doing two
+  // directory reads a pass. Worth it for a queue and a reminder that no longer
+  // wait on someone else's pane; if that ever needs to cost nothing, the
+  // sweeper would have to exit when there is nothing queued and no reminders
+  // configured, and be woken again by the event that queues one.
+  if (!dryRun && toInt(cfg("SWEEP_MINUTES"), 0) > 0 && token && chatId) {
+    ensureDaemon(stateDir, {
+      lock: "sweep.lock",
+      script: "notify.mjs",
+      args: ["--sweep"],
+      log: "sweep.log",
+      label: "reminder sweeper",
+    });
+  }
+  // Whatever the network was down for waits in the state directory, and any
+  // status change on any pane is a cue to try again — including the ones this
+  // run is about to filter out, which is what keeps a queue from sitting there
+  // until the next thing worth notifying happens. The sweeper above is the cue
+  // for when no status change comes at all.
+  const online = await sweep(stateDir, cfg);
 
   const key = stateKey(event, context);
   const previous = readState(stateDir, key);
@@ -867,20 +1026,41 @@ async function main() {
   // turn, so the second pane's copy of it is recognisable; with no transcript to
   // read, a short window stands in. Keyed on the session, and never against the
   // pane that sent it, so a pane's own later turns are unaffected.
+  // Herdr can report one agent session on two panes — a resumed session, or the
+  // same agent adopted by a second pane — and each pane raises its own status
+  // change, so one turn arrives twice. The transcript's last record pins the
+  // turn, so the second pane's copy of it is recognisable; with no transcript
+  // to read, a short window stands in. Read and written under one lock: both
+  // panes raise their change at the same moment, and a check followed by a
+  // separate write is exactly the race this guard exists to stop.
   const guardKey = info.session?.value ? `send-${sanitizeKey(info.session.value)}` : undefined;
-  if (guardKey) {
-    const last = readState(stateDir, guardKey);
-    const sameTurn =
-      turn.endedAt && last.endedAt
-        ? last.endedAt === turn.endedAt
-        : Date.now() - (last.at ?? 0) < SESSION_GUARD_WINDOW;
-    if (last.status === status && last.paneId && last.paneId !== paneId && sameTurn) {
+  if (guardKey && stateDir) {
+    const claim = () => {
+      const last = readState(stateDir, guardKey);
+      const sameTurn =
+        turn.endedAt && last.endedAt
+          ? last.endedAt === turn.endedAt
+          : Date.now() - (last.at ?? 0) < SESSION_GUARD_WINDOW;
+      if (last.status === status && last.paneId && last.paneId !== paneId && sameTurn) return last.paneId;
+      writeState(stateDir, guardKey, { status, endedAt: turn.endedAt, at: Date.now(), paneId });
+      return undefined;
+    };
+    let alreadySentBy;
+    try {
+      alreadySentBy = withFileLock(join(stateDir, "state.lock"), claim);
+    } catch (err) {
+      // Nothing was written. Sending anyway is the lesser of the two: the worst
+      // it costs is the duplicate this guard saves you from on the rare turn
+      // two panes both report, where not sending could cost the notification
+      // altogether.
+      console.error(`herdr-telegram-notify: sending without the duplicate guard — ${err.message}`);
+    }
+    if (alreadySentBy) {
       console.log(
-        `herdr-telegram-notify: ${status} already sent for this session from pane ${last.paneId}, skipping ${paneId}`
+        `herdr-telegram-notify: ${status} already sent for this session from pane ${alreadySentBy}, skipping ${paneId}`
       );
       return;
     }
-    writeState(stateDir, guardKey, { status, endedAt: turn.endedAt, at: Date.now(), paneId });
   }
 
   const parts = { emoji, agent, statusLabel, title, prompt, project, changes, tools, meta, pane, herd, body, bodyIsScreen };
@@ -897,21 +1077,22 @@ async function main() {
     // The queue flush just proved the network is down; no point spending another
     // round of attempts on the same connection.
     console.error("herdr-telegram-notify: still offline, not retrying this one now");
-    queuePending(stateDir, parts, topicId, paneId);
+    queuePending(stateDir, parts, topicId, paneId, info.session);
     process.exitCode = 1;
     return;
   }
 
   try {
     const messageId = await sendTelegram(token, chatId, message, { silent, topicId });
-    // Which pane this message was about, so a reply to it lands in the right one.
-    rememberMessage(stateDir, messageId, paneId);
+    // Which pane this message was about and which agent was in it, so a reply to
+    // it lands in the right one — and nowhere else once that agent is gone.
+    rememberMessage(stateDir, messageId, paneId, info.session);
   } catch (err) {
     console.error(`herdr-telegram-notify: ${redact(err.message, token)}`);
     // A refused connection or a Telegram that is down will look different in a
     // minute; a rejected token or chat id will not, and queueing it would only
     // pile up messages that can never be sent.
-    if (isRetryable(err.status)) queuePending(stateDir, parts, topicId, paneId);
+    if (isRetryable(err.status)) queuePending(stateDir, parts, topicId, paneId, info.session);
     process.exitCode = 1;
   }
 }
@@ -919,7 +1100,9 @@ async function main() {
 // A hook that dies takes its message with it, and an unhandled rejection reports
 // that as a bare stack trace in the plugin log — through which the token would
 // travel if the failure came from anywhere near the request URL.
-main().catch((err) => {
+// The event hook by default; the timer when the detached copy is started with
+// --sweep. One file, because the sweep is the same code either way.
+(process.argv.includes("--sweep") ? sweepLoop() : main()).catch((err) => {
   console.error(`herdr-telegram-notify: unexpected failure — ${redact(err?.stack ?? err?.message ?? err)}`);
   process.exitCode = 1;
 });

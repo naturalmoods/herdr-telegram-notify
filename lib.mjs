@@ -14,10 +14,12 @@ import {
   readSync,
   fstatSync,
   closeSync,
+  unlinkSync,
 } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { homedir } from "node:os";
-import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { spawn, spawnSync } from "node:child_process";
 
 
 // Every key is overridable from the plugin config dir's .env (see .env.example).
@@ -42,12 +44,14 @@ export const DEFAULTS = {
   SCREEN_LINES: "12",
   MIN_DURATION_SECONDS: "0",
   BLOCKED_REMINDER_MINUTES: "0",
+  SWEEP_MINUTES: "0",
   QUIET_HOURS: "",
   TELEGRAM_TOPIC_ID: "",
   TELEGRAM_TOPICS: "",
   NOTIFY_WORKSPACES: "",
   IGNORE_WORKSPACES: "",
   REPLIES: "0",
+  REPLY_ALLOWED_USER_IDS: "",
   DEBUG: "0",
   DRY_RUN: "0",
 };
@@ -131,15 +135,94 @@ export function loadConfig() {
   return (key) => firstDefined(process.env[key], fileEnv[key], DEFAULTS[key]);
 }
 
+// The statuses herdr reports, and so the only ones NOTIFY_STATUSES can name.
+export const STATUSES = ["done", "blocked", "working", "idle"];
+
+// A value the runtime cannot parse falls back to the default, silently — the
+// failure mode of `SWEEP_MINUTES=5min` is a sweeper that never runs and a config
+// file that looks right. Every rule here is the runtime's own parser (toInt,
+// parseQuietHours, the status split), so the two cannot disagree: this only
+// names what the runtime would ignore. Keys, never values, of anything secret.
+export function configProblems(cfg) {
+  const problems = [];
+  const say = (key, detail) => problems.push({ key, detail });
+
+  // Empty means "the default", which is always valid; 0 is off for the three
+  // switches that measure a duration and is not allowed for the sizes.
+  for (const [key, min] of [
+    ["PROMPT_CHARS", 1],
+    ["LAST_MESSAGE_CHARS", 1],
+    ["SCREEN_LINES", 1],
+    ["MUTE_MINUTES", 1],
+    ["TELEGRAM_TOPIC_ID", 1],
+    ["MIN_DURATION_SECONDS", 0],
+    ["BLOCKED_REMINDER_MINUTES", 0],
+    ["SWEEP_MINUTES", 0],
+  ]) {
+    const raw = String(cfg(key) ?? "").trim();
+    if (!raw) continue;
+    if (toInt(raw, undefined) === undefined && !(min === 0 && raw === "0")) {
+      say(key, `${raw} is not a whole number of ${min} or more — the value is ignored and the default used instead`);
+    }
+  }
+
+  const statuses = String(cfg("NOTIFY_STATUSES") ?? "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  // An unset key falls back to the default, so only a value that parses to
+  // nothing gets here — and it would drop every message.
+  // The list is used as written, typo and all — there is no falling back to the
+  // default here, which is what makes a misspelt status quieter than a missing
+  // key: everything else in the list goes on sending.
+  if (!statuses.length) say("NOTIFY_STATUSES", "names no status, so nothing would ever send");
+  const unknown = statuses.filter((s) => !STATUSES.includes(s));
+  if (unknown.length) {
+    const rest = statuses.filter((s) => STATUSES.includes(s));
+    say(
+      "NOTIFY_STATUSES",
+      `${unknown.join(", ")} — not a status (${STATUSES.join(", ")}); it matches nothing, so only ${rest.join(", ") || "nothing"} sends`
+    );
+  }
+
+  const quiet = String(cfg("QUIET_HOURS") ?? "").trim();
+  if (quiet && !parseQuietHours(quiet)) {
+    say("QUIET_HOURS", `${quiet} — not HH:MM-HH:MM, or an empty window; no hours are kept quiet`);
+  }
+
+  for (const pair of String(cfg("TELEGRAM_TOPICS") ?? "").split(",")) {
+    const text = pair.trim();
+    if (!text) continue;
+    const at = text.lastIndexOf(":");
+    if (at < 1 || !toInt(text.slice(at + 1), undefined)) {
+      say("TELEGRAM_TOPICS", `${text} — not a workspace:topic pair with a positive topic id; the pair routes nothing`);
+    }
+  }
+
+  for (const id of String(cfg("REPLY_ALLOWED_USER_IDS") ?? "").split(",")) {
+    const text = id.trim();
+    if (text && !toInt(text, undefined)) {
+      // The list stays in force with the rest of its ids: a typo here narrows
+      // who may reply, it does not turn the allowlist off.
+      say("REPLY_ALLOWED_USER_IDS", `${text} — not a Telegram user id; it matches no one, and the other ids still apply`);
+    }
+  }
+
+  return problems;
+}
+
 // Undefined when the list is empty — "nothing said", which is not the same
 
 export function isOn(value) {
   return ["1", "true", "yes", "on"].includes(String(value ?? "").toLowerCase());
 }
 
+// Whole number or nothing: `12min` is a typo, and taking the 12 out of it would
+// hide the typo behind a value that happens to work. The doctor reports exactly
+// what this rejects, which is why it is one function and not two.
 export function toInt(value, fallback) {
-  const n = Number.parseInt(String(value ?? ""), 10);
-  return Number.isFinite(n) && n > 0 ? n : fallback;
+  const raw = String(value ?? "").trim();
+  return /^\d+$/.test(raw) && Number(raw) > 0 ? Number(raw) : fallback;
 }
 
 // The bot token is in the request URL, so anything that quotes the URL back —
@@ -257,14 +340,20 @@ export function humanTokens(n) {
 // "23:00-07:00", a window that may run past midnight. Anything unparseable is
 // read as no window at all: a typo should cost you a silent night, not silence
 // every notification you have.
-export function inQuietHours(spec, now = new Date()) {
+export function parseQuietHours(spec) {
   const match = /^\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*$/.exec(String(spec ?? ""));
-  if (!match) return false;
+  if (!match) return undefined;
   const [fromH, fromM, toH, toM] = match.slice(1).map(Number);
-  if (fromH > 23 || toH > 23 || fromM > 59 || toM > 59) return false;
+  if (fromH > 23 || toH > 23 || fromM > 59 || toM > 59) return undefined;
   const from = fromH * 60 + fromM;
   const to = toH * 60 + toM;
-  if (from === to) return false;
+  return from === to ? undefined : { from, to };
+}
+
+export function inQuietHours(spec, now = new Date()) {
+  const window = parseQuietHours(spec);
+  if (!window) return false;
+  const { from, to } = window;
   const minutes = now.getHours() * 60 + now.getMinutes();
   return from < to ? minutes >= from && minutes < to : minutes >= from || minutes < to;
 }
@@ -464,6 +553,201 @@ export function cropScreen(rows) {
   return sliced(chosen);
 }
 
+// ---------------------------------------------------------------- locking
+
+// Several copies of this plugin run at once by design: one hook process per
+// status change, plus the sweeper and the reply poller, all writing one state
+// directory. Exclusion between them is the kernel's, through flock(2): a lock
+// held by a process that dies — crash, kill -9, the machine going down — is
+// released by the kernel when the file descriptor closes. There is no stale
+// lock to detect, no pid to believe, and no reclaim protocol to get subtly
+// wrong. That is the whole reason for it.
+//
+// Node has no flock binding, so the lock is held by a small shell child:
+//
+//   sh -c 'exec 9>"$1"; "$2" -w N 9 || { echo no > "$0"; exit 3; }
+//          echo $$ > "$0"; read ignored'  <ready> <lockfile> <flock>
+//
+// It reports through the ready file whether it got the lock, then blocks
+// reading a pipe this process holds open. Releasing closes that pipe; if this
+// process dies without releasing, the pipe closes anyway and the kernel drops
+// the lock with it. One extra process per lock, which is the price of a lock
+// that cannot outlive its owner.
+//
+// This needs flock(1) from util-linux, so it needs Linux — `doctor` checks for
+// it and says what stops working without it. Without it nothing here touches
+// shared state at all: the queue, the message map and the background processes
+// stop, the notification itself does not.
+
+const FLOCK_CANDIDATES = ["/usr/bin/flock", "/bin/flock", "/usr/local/bin/flock"];
+
+// How long a short critical section may wait for another process's, and how
+// much longer than that to wait for the child to say which way it went.
+const LOCK_WAIT_SECONDS = 10;
+const LOCK_START_GRACE_MS = 5000;
+
+// FLOCK_BIN_PATH names it outright, the way HERDR_BIN_PATH does. Pointed
+// somewhere that is not there, the answer is "no flock" rather than one of the
+// usual paths: an override that silently falls back to something else is how
+// you end up testing the wrong binary.
+export function flockBin() {
+  const named = process.env.FLOCK_BIN_PATH;
+  if (named) return existsSync(named) ? named : undefined;
+  for (const candidate of FLOCK_CANDIDATES) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+export function flockAvailable() {
+  return Boolean(flockBin());
+}
+
+// Everything here is synchronous — the callers are file readers and writers —
+// so waiting cannot be done with a timer.
+export function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// Take the lock, or return undefined. `waitSeconds` 0 asks the kernel for it
+// without waiting, which is what the "is anyone already doing this?" callers
+// want; anything higher waits that long for the holder to finish.
+export function holdFlock(path, { waitSeconds = 0 } = {}) {
+  const bin = flockBin();
+  if (!bin) return undefined;
+  const ready = `${path}.${process.pid}.${randomUUID()}.ready`;
+  let child;
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    child = spawn(
+      "sh",
+      [
+        "-c",
+        'exec 9>"$1" || { echo no > "$0"; exit 3; }; ' +
+          `"$2" ${waitSeconds > 0 ? `-w ${waitSeconds}` : "-n"} 9 || { echo no > "$0"; exit 3; }; ` +
+          'echo "$$" > "$0"; read ignored',
+        ready,
+        path,
+        bin,
+      ],
+      { stdio: ["pipe", "ignore", "ignore"] }
+    );
+    // Neither the child nor the pipe may keep this process alive: the pipe
+    // closing is exactly how the lock is released when we go.
+    child.unref();
+    child.stdin.unref?.();
+  } catch {
+    return undefined;
+  }
+
+  // The child writes its pid on success and `no` on failure, either way within
+  // waitSeconds. Past that something is wrong with the child rather than with
+  // the lock, and giving up is the same answer as being refused.
+  const deadline = Date.now() + waitSeconds * 1000 + LOCK_START_GRACE_MS;
+  for (;;) {
+    let marker;
+    try {
+      marker = readFileSync(ready, "utf8").trim();
+    } catch {}
+    if (marker) {
+      try {
+        unlinkSync(ready);
+      } catch {}
+      if (marker === "no") {
+        try {
+          child.kill("SIGKILL");
+        } catch {}
+        return undefined;
+      }
+      const release = () => {
+        try {
+          child.stdin.end();
+        } catch {}
+        try {
+          child.kill("SIGKILL");
+        } catch {}
+      };
+      release.pid = Number.parseInt(marker, 10);
+      return release;
+    }
+    if (Date.now() > deadline) {
+      try {
+        child.kill("SIGKILL");
+      } catch {}
+      try {
+        unlinkSync(ready);
+      } catch {}
+      console.error(`herdr-telegram-notify: gave up waiting for the lock on ${path}`);
+      return undefined;
+    }
+    sleepSync(2);
+  }
+}
+
+// Is someone holding it right now? Asked by `doctor`, and by the hook waiting
+// for a background process it just started to take its own lock.
+export function flockHeld(path) {
+  const bin = flockBin();
+  if (!bin || !existsSync(path)) return false;
+  const res = spawnSync(bin, ["-n", path, "true"], { timeout: 4000 });
+  return res.status !== 0;
+}
+
+// Thrown rather than swallowed: a caller that cannot get the lock must not
+// carry on and write anyway, and it is the caller that knows what to do with
+// the news.
+export class LockUnavailable extends Error {
+  constructor(path) {
+    super(
+      flockAvailable()
+        ? `could not lock ${path}`
+        : `no flock(1) found, so ${path} cannot be locked — this plugin needs util-linux's flock`
+    );
+    this.path = path;
+  }
+}
+
+// Short critical sections: read a file, change it, write it back. Held for
+// microseconds, so waiting for one is waiting for another process's few
+// syscalls.
+export function withFileLock(path, fn, { waitSeconds = LOCK_WAIT_SECONDS } = {}) {
+  const release = holdFlock(path, { waitSeconds });
+  if (!release) throw new LockUnavailable(path);
+  try {
+    return fn();
+  } finally {
+    release();
+  }
+}
+
+export function readLines(path) {
+  let text;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch {
+    return [];
+  }
+  const entries = [];
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      entries.push(JSON.parse(line));
+    } catch {}
+  }
+  return entries;
+}
+
+export function writeLines(path, entries) {
+  mkdirSync(dirname(path), { recursive: true });
+  if (!entries.length) {
+    try {
+      unlinkSync(path);
+    } catch {}
+    return;
+  }
+  writeFileSync(path, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+}
+
 // ------------------------------------------------------ replies from the chat
 
 // How many notifications stay answerable, and for how long. A reply to something
@@ -475,46 +759,65 @@ function messageMapPath(stateDir) {
   return stateDir ? join(stateDir, "messages.jsonl") : undefined;
 }
 
-// Which pane each sent notification was about, so a reply to one knows where to
-// go. Written by the notifier, read by the poller.
-export function rememberMessage(stateDir, messageId, paneId) {
+// The agent session a notification was about, as one comparable string. Herdr
+// reports it as a transcript path or a session id, and the two never mean the
+// same thing, so the kind is part of the key.
+export function sessionKey(session) {
+  return session?.value ? `${session.kind ?? "?"}:${session.value}` : undefined;
+}
+
+// Which pane each sent notification was about — and which agent session was in
+// it, since the pane alone is a moving target. Written by the notifier, read by
+// the poller.
+export function rememberMessage(stateDir, messageId, paneId, session) {
   const path = messageMapPath(stateDir);
   if (!path || !messageId || !paneId) return;
-  const kept = [...readMessageMap(stateDir), { id: messageId, paneId, at: Date.now() }].slice(-MESSAGE_MAP_MAX);
+  const entry = { id: messageId, paneId, session: sessionKey(session), at: Date.now() };
+  // Read, add, write: a hook sending live and a sweeper draining a queue can
+  // land here at the same moment, and whoever wrote second would drop the
+  // other's message from the map — a notification in the chat that nobody can
+  // answer. Under the lock that cannot happen; without one this is not done at
+  // all, because a half-written map is worse than a missing entry.
   try {
-    mkdirSync(stateDir, { recursive: true });
-    writeFileSync(path, `${kept.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
-  } catch {}
+    withFileLock(join(stateDir, "messages.lock"), () => {
+      writeLines(path, [...readMessageMap(stateDir), entry].slice(-MESSAGE_MAP_MAX));
+    });
+  } catch (err) {
+    console.error(
+      `herdr-telegram-notify: message ${messageId} was sent but not recorded, so a reply to it cannot be routed: ${err.message}`
+    );
+  }
 }
 
 export function readMessageMap(stateDir) {
   const path = messageMapPath(stateDir);
   if (!path) return [];
   const cutoff = Date.now() - MESSAGE_MAP_TTL;
-  const entries = [];
-  try {
-    for (const line of readFileSync(path, "utf8").split("\n")) {
-      if (!line.trim()) continue;
-      try {
-        const entry = JSON.parse(line);
-        if (entry?.id && entry.paneId && entry.at > cutoff) entries.push(entry);
-      } catch {}
-    }
-  } catch {}
-  return entries;
+  return readLines(path).filter((entry) => entry?.id && entry.paneId && entry.at > cutoff);
 }
 
-export function paneForMessage(stateDir, messageId) {
-  return readMessageMap(stateDir).findLast((entry) => entry.id === messageId)?.paneId;
+// The pane a reply belongs to, with the session that was in it when the
+// notification went out — the caller checks the second against what is running
+// there now.
+export function targetForMessage(stateDir, messageId) {
+  return readMessageMap(stateDir).findLast((entry) => entry.id === messageId);
 }
 
-// Which updates are this plugin's to act on. The chat id is the whole security
+// Which updates are this plugin's to act on. The chat id is the first security
 // boundary here: a bot's username is public, anyone can write to it, and what
 // arrives goes to an agent's terminal. Only a reply counts, so text can only
 // ever reach the pane whose notification it answers — never one of its choosing.
-export function usableReply(update, chatId) {
+//
+// In a group everyone in it is behind that boundary, so an optional allowlist of
+// Telegram user ids narrows it to named people. With one set, a sender that
+// cannot be named is refused: an anonymous admin or a channel post arrives as
+// sender_chat, with either no `from` at all or Telegram's shared
+// GroupAnonymousBot id, so there is no one to check against the list.
+export function usableReply(update, chatId, allowedUserIds) {
   const message = update?.message;
   if (!message || String(message.chat?.id ?? "") !== String(chatId)) return undefined;
+  const allowed = listMatches(allowedUserIds, message.from?.id);
+  if (allowed === false || (allowed !== undefined && message.sender_chat)) return undefined;
   const text = String(message.text ?? "").trim();
   if (!text) return undefined;
   return { text, messageId: message.message_id, replyTo: message.reply_to_message?.message_id };

@@ -26,7 +26,8 @@ import {
   listMatches,
   loadEnvFile,
   promptText,
-  paneForMessage,
+  sessionKey,
+  targetForMessage,
   readTurn,
   rememberMessage,
   replyCommands,
@@ -104,6 +105,11 @@ test("isOn, toInt and firstDefined treat empty as unset", () => {
   assert.equal(toInt("12", 5), 12);
   assert.equal(toInt("", 5), 5);
   assert.equal(toInt("not a number", 5), 5);
+  // Not 12: a value with anything else in it is a typo, and the doctor reports
+  // exactly what this rejects.
+  assert.equal(toInt("12min", 5), 5);
+  assert.equal(toInt("-5", 5), 5);
+  assert.equal(toInt("0", 5), 5);
   assert.equal(firstDefined(undefined, "", null, "x", "y"), "x");
 });
 
@@ -457,6 +463,25 @@ test("usableReply accepts only this chat's text", () => {
   assert.equal(usableReply({ message: { ...message, reply_to_message: undefined } }, 42).replyTo, undefined);
 });
 
+test("an allowlist narrows a group chat to named senders", () => {
+  const message = { message_id: 9, chat: { id: 42 }, text: "carry on", from: { id: 7 } };
+  // Nothing set: anyone in the configured chat, as before.
+  assert.equal(usableReply({ message }, 42, "")?.text, "carry on");
+  assert.equal(usableReply({ message: { ...message, from: undefined } }, 42, undefined)?.text, "carry on");
+  // Set: only the ids on it.
+  assert.equal(usableReply({ message }, 42, "7, 8")?.text, "carry on");
+  assert.equal(usableReply({ message: { ...message, from: { id: 9 } } }, 42, "7,8"), undefined);
+  // Nobody to check against the list: an anonymous group admin or a channel
+  // post arrives as sender_chat, and the shared bot id names no one.
+  assert.equal(usableReply({ message: { ...message, from: undefined } }, 42, "7"), undefined);
+  assert.equal(
+    usableReply({ message: { ...message, sender_chat: { id: -100 }, from: { id: 7 } } }, 42, "7"),
+    undefined
+  );
+  // The chat boundary still comes first.
+  assert.equal(usableReply({ message: { ...message, chat: { id: 99 } } }, 42, "7"), undefined);
+});
+
 test("replyCommands types at a blocked agent and prompts anything else", () => {
   // `herdr agent prompt` refuses a blocked agent outright, and the prompt it is
   // sitting at wants a keystroke rather than a turn.
@@ -469,17 +494,36 @@ test("replyCommands types at a blocked agent and prompts anything else", () => {
   }
 });
 
-test("the message map remembers which pane a notification was about", () => {
+test("the message map remembers which pane and session a notification was about", () => {
   const dir = mkdtempSync(join(scratch, "map-"));
-  rememberMessage(dir, 11, "wA:p1");
-  rememberMessage(dir, 12, "wB:p2");
-  assert.equal(paneForMessage(dir, 11), "wA:p1");
-  assert.equal(paneForMessage(dir, 12), "wB:p2");
-  assert.equal(paneForMessage(dir, 99), undefined);
-  // A pane that sends twice: the reply belongs to the newer message.
-  rememberMessage(dir, 13, "wA:p1");
-  assert.equal(paneForMessage(dir, 13), "wA:p1");
+  const first = { kind: "id", value: "s-1" };
+  rememberMessage(dir, 11, "wA:p1", first);
+  rememberMessage(dir, 12, "wB:p2", { kind: "path", value: "/tmp/s-2.jsonl" });
+  assert.equal(targetForMessage(dir, 11)?.paneId, "wA:p1");
+  assert.equal(targetForMessage(dir, 11)?.session, "id:s-1");
+  assert.equal(targetForMessage(dir, 12)?.session, "path:/tmp/s-2.jsonl");
+  assert.equal(targetForMessage(dir, 99), undefined);
+  // A pane that sends twice: the reply belongs to the newer message — and to
+  // whichever session was in the pane by then.
+  rememberMessage(dir, 13, "wA:p1", { kind: "id", value: "s-9" });
+  assert.deepEqual(
+    { ...targetForMessage(dir, 13), at: undefined },
+    { id: 13, paneId: "wA:p1", session: "id:s-9", at: undefined }
+  );
+  // A notification remembered before sessions were recorded: the pane is there,
+  // the session is not, and the poller refuses rather than guesses.
+  rememberMessage(dir, 15, "wA:p1");
+  assert.equal(targetForMessage(dir, 15).session, undefined);
   // Nothing to write to, and nothing to read back.
-  rememberMessage(undefined, 14, "wC:p3");
-  assert.equal(paneForMessage(undefined, 14), undefined);
+  rememberMessage(undefined, 14, "wC:p3", first);
+  assert.equal(targetForMessage(undefined, 14), undefined);
+});
+
+test("sessionKey tells the two kinds of session apart", () => {
+  assert.equal(sessionKey({ kind: "id", value: "s-1" }), "id:s-1");
+  // A path and an id that read the same are not the same session.
+  assert.notEqual(sessionKey({ kind: "path", value: "s-1" }), sessionKey({ kind: "id", value: "s-1" }));
+  for (const missing of [undefined, {}, { kind: "id" }, { kind: "id", value: "" }]) {
+    assert.equal(sessionKey(missing), undefined);
+  }
 });
