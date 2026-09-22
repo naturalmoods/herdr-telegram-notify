@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.1
 
 - Fix blocked reminders being starved by panes that cannot be nudged. Panes
   closed while blocked, or in an ignored workspace, no longer use up the three
