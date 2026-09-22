@@ -5,56 +5,37 @@
 // was actually doing. See README.md for the env vars Herdr injects and for the
 // config keys that switch each part of the message on or off.
 
-import {
-  readFileSync,
-  writeFileSync,
-  mkdirSync,
-  readdirSync,
-  existsSync,
-  statSync,
-  openSync,
-  readSync,
-  fstatSync,
-  closeSync,
-  unlinkSync,
-} from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync, statSync, openSync, unlinkSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { homedir, hostname } from "node:os";
+import { hostname } from "node:os";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 import {
-  DEFAULTS,
-  EXPANDABLE_QUOTE_CHARS,
-  EXTRA_KEYS,
-  HEAD_LINE_CHARS,
+  PENDING_MAX,
+  PENDING_TTL,
   QUESTION_UNKNOWN,
-  TELEGRAM_LIMIT,
-  blocksToText,
   buildMessage,
-  clip,
   clockTime,
-  escapeHtml,
   firstDefined,
-  herdrBin,
+  flockAvailable,
+  flockHeld,
+  gitBin,
+  holdFlock,
   humanCost,
   humanDuration,
   humanTokens,
   inQuietHours,
-  inlineMarkdown,
-  isHumanPrompt,
   isOn,
   isRetryable,
   listMatches,
   loadConfig,
-  loadEnvFile,
   loadSnapshot,
   mutedUntil,
-  promptText,
   questionOnScreen,
+  readLines,
   readState,
-  readTail,
   readTurn,
   redact,
   rememberMessage,
@@ -62,22 +43,15 @@ import {
   sanitizeKey,
   screenTail,
   sleep,
+  sleepSync,
   statusEmoji,
-  stripEmphasis,
+  telegramCall,
   tilde,
   toInt,
   toolSummary,
   topicFor,
   transcriptPath,
   truncate,
-  usageOf,
-  warnIfWorldReadable,
-  warnUnknownKeys,
-  flockAvailable,
-  flockHeld,
-  holdFlock,
-  readLines,
-  sleepSync,
   withFileLock,
   writeLines,
   writeState,
@@ -104,12 +78,6 @@ const SEND_TIMEOUT = 8 * 1000;
 const SEND_ATTEMPTS = 3;
 const SEND_BACKOFF = 1000;
 
-// Messages the network was down for. Kept short and few on purpose: a queue that
-// grows without limit answers a wifi coming back with a wall of notifications,
-// and a `done` from this morning is history rather than news.
-const PENDING_TTL = 6 * 60 * 60 * 1000;
-const PENDING_MAX = 20;
-
 // One sweep at a time on this machine, whoever asked for it.
 const SWEEP_RUN_LOCK = "sweep-run.lock";
 
@@ -118,10 +86,6 @@ const DAEMON_START_MS = 5000;
 
 // A background process's log is rotated once past this; see ensureDaemon().
 const POLLER_LOG_MAX = 256 * 1024;
-
-// Where the sends go. Overridable so a test can point a real run at a local
-// stub; nothing in normal use sets it.
-const TELEGRAM_API = process.env.TELEGRAM_API_BASE ?? "https://api.telegram.org";
 
 // ---------------------------------------------------------------- utilities
 
@@ -196,16 +160,6 @@ function herdSummary(snap, paneId) {
 }
 
 // ------------------------------------------------------------------- extras
-
-// Herdr's server may not have the shell's PATH, the same way it does not have
-// node's — so `git` gets the same treatment.
-function gitBin() {
-  const candidates = [process.env.GIT_BIN_PATH, "/usr/bin/git", "/usr/local/bin/git", "/opt/homebrew/bin/git"];
-  for (const candidate of candidates) {
-    if (candidate && existsSync(candidate)) return candidate;
-  }
-  return "git";
-}
 
 function git(cwd, args) {
   const res = spawnSync(gitBin(), ["-C", cwd, ...args], {
@@ -321,7 +275,7 @@ function overdueBlocked(stateDir, afterMs) {
       due.push({ file: name, state });
     }
   } catch {}
-  return due.slice(0, MAX_REMINDERS);
+  return due;
 }
 
 // One nudge per blocked stretch, once the first message has gone long enough
@@ -333,7 +287,12 @@ async function remindBlocked(stateDir, cfg, { token, chatId, silent }) {
   if (!due.length) return;
 
   const snap = sessionSnapshot();
+  // Counted as sent, not as found: a pane closed while blocked keeps its state
+  // file for a week, and capping the candidates let a few of those take every
+  // slot from a pane that is really waiting.
+  let sent = 0;
   for (const { file, state } of due) {
+    if (sent >= MAX_REMINDERS) break;
     const paneId = state.paneId;
     const agent = (snap?.agents ?? []).find((a) => a.pane_id === paneId);
     // The state file can have been overtaken: the agent answered, or the pane is
@@ -380,6 +339,7 @@ async function remindBlocked(stateDir, cfg, { token, chatId, silent }) {
     // Marked first: a reminder that fails is not worth queueing — by the time it
     // could be delivered the wait it reports is no longer the wait there is.
     writeState(stateDir, file.replace(/^state-|\.json$/g, ""), { ...state, remindedAt: Date.now() });
+    sent += 1;
     try {
       const messageId = await sendTelegram(token, chatId, message, {
         silent,
@@ -395,27 +355,21 @@ async function remindBlocked(stateDir, cfg, { token, chatId, silent }) {
 // ------------------------------------------------------------------ message
 
 async function sendTelegram(token, chatId, message, { silent, topicId } = {}) {
-  const url = `${TELEGRAM_API}/bot${token}/sendMessage`;
   const post = async (payload) => {
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          chat_id: chatId,
-          disable_web_page_preview: true,
-          // Delivered, listed, unread — just without the sound.
-          ...(silent ? { disable_notification: true } : {}),
-          ...(topicId ? { message_thread_id: topicId } : {}),
-          ...payload,
-        }),
-        signal: AbortSignal.timeout(SEND_TIMEOUT),
-      });
-      return { ok: res.ok, status: res.status, body: await res.text().catch(() => "") };
-    } catch (err) {
-      // Refused, unresolvable, or past SEND_TIMEOUT: no response, so no status.
-      return { ok: false, status: 0, body: redact(err?.message ?? err, token) };
-    }
+    const res = await telegramCall(
+      token,
+      "sendMessage",
+      {
+        chat_id: chatId,
+        disable_web_page_preview: true,
+        // Delivered, listed, unread — just without the sound.
+        ...(silent ? { disable_notification: true } : {}),
+        ...(topicId ? { message_thread_id: topicId } : {}),
+        ...payload,
+      },
+      SEND_TIMEOUT
+    );
+    return { ok: res.status >= 200 && res.status < 300, status: res.status, body: res.text };
   };
 
   let payload = { text: message.html, parse_mode: "HTML" };
@@ -970,7 +924,7 @@ async function main() {
     bodyIsScreen = Boolean(body);
   }
   if (!body && isOn(cfg("SHOW_LAST_MESSAGE")) && turn.text) {
-    body = truncate(turn.text, toInt(cfg("LAST_MESSAGE_CHARS"), 600));
+    body = truncate(turn.text, toInt(cfg("LAST_MESSAGE_CHARS"), 1200));
   }
 
   // The whole of what the agent said this turn, kept beside the notification so
@@ -984,16 +938,12 @@ async function main() {
   // Herdr can report one agent session on two panes — a resumed session, or the
   // same agent adopted by a second pane — and each pane raises its own status
   // change, so one turn arrives twice. The transcript's last record pins the
-  // turn, so the second pane's copy of it is recognisable; with no transcript to
-  // read, a short window stands in. Keyed on the session, and never against the
-  // pane that sent it, so a pane's own later turns are unaffected.
-  // Herdr can report one agent session on two panes — a resumed session, or the
-  // same agent adopted by a second pane — and each pane raises its own status
-  // change, so one turn arrives twice. The transcript's last record pins the
   // turn, so the second pane's copy of it is recognisable; with no transcript
-  // to read, a short window stands in. Read and written under one lock: both
-  // panes raise their change at the same moment, and a check followed by a
-  // separate write is exactly the race this guard exists to stop.
+  // to read, a short window stands in. Keyed on the session, and never against
+  // the pane that sent it, so a pane's own later turns are unaffected. Read and
+  // written under one lock: both panes raise their change at the same moment,
+  // and a check followed by a separate write is exactly the race this guard
+  // exists to stop.
   const guardKey = info.session?.value ? `send-${sanitizeKey(info.session.value)}` : undefined;
   if (guardKey && stateDir) {
     const claim = () => {

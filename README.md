@@ -164,6 +164,12 @@ A lock allows only one poller at a time. Check it with
 `herdr plugin action invoke doctor`; its log is `replies.log` in the state
 directory.
 
+Use a separate bot for each machine that has `REPLIES=1`. Telegram hands each
+update to only one reader of a bot, and each machine records only its own
+notifications, so with a shared bot a reply can reach the machine that did not
+send the notification and be refused. `replies.log` shows the conflict as a
+`409` from `getUpdates`. Machines that only send notifications can share a bot.
+
 ### Commands
 
 Commands require `REPLIES=1` and use the same chat and user allowlist as replies.
@@ -407,16 +413,17 @@ HERDR_PLUGIN_CONTEXT_JSON='{}' DRY_RUN=1 node notify.mjs
 Use a real `pane_id` from `herdr pane list` so the plugin can find its snapshot
 and transcript.
 
-`lib.mjs` contains formatting, config resolution and transcript reading. Run its
-tests with:
+Run the tests with:
 
 ```
-node --test test/lib.test.mjs
+node --test test/*.test.mjs
 ```
 
-`notify.mjs` handles the hook and can be exercised with the dry run above.
-CI runs both on Node 18, 20, 22 and 24, plus a run with no configuration to check
-that missing settings do not crash the plugin.
+`lib.test.mjs` covers formatting, config resolution and transcript reading. The
+other files run the real scripts against a fake `herdr` and a local stand-in for
+Telegram: sending and retries, the queue sweeper, the reply poller, locking and
+`doctor`. CI runs them on Node 18, 20, 22 and 24, plus a hook run with no
+configuration to check that missing settings do not crash the plugin.
 
 ## Uninstall
 

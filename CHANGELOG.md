@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- Fix blocked reminders being starved by panes that cannot be nudged. Panes
+  closed while blocked, or in an ignored workspace, no longer use up the three
+  reminders a pass may send.
+- Fall back to the documented 1200 characters when `LAST_MESSAGE_CHARS` is
+  invalid, instead of 600.
+- `doctor` checks the same `git` binary the notifier runs, and no longer
+  counts expired queue entries as waiting.
+- One Telegram client for the notifier, the reply poller and `doctor`, so
+  `doctor` also honours `TELEGRAM_API_BASE`.
+- The reply poller asks for its bot username again if Telegram did not answer
+  at startup, so addressed commands such as `/status@yourbot` start working
+  once the network is back.
+- A `409` from `getUpdates` is logged with its likely cause: another machine
+  or a webhook reading the same bot. The README now recommends one bot per
+  machine with `REPLIES=1`.
+
 ## 0.8.0
 
 - Add Telegram `/status` to list agents, workspaces and current states.

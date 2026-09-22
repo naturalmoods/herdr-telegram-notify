@@ -24,16 +24,15 @@ import {
   muteMinutes,
   questionOnScreen,
   readMessageMap,
-  redact,
   replyCommands,
   sanitizeKey,
   sessionKey,
   setMute,
   targetForMessage,
+  telegramCall,
   usableReply,
 } from "./lib.mjs";
 
-const TELEGRAM_API = process.env.TELEGRAM_API_BASE ?? "https://api.telegram.org";
 const POLL_SECONDS = 50; // how long Telegram holds the request open with nothing to say
 const IDLE_BACKOFF = 5000; // after a failed poll, before trying again
 const MAX_TEXT = 4000; // a prompt longer than this is a paste accident
@@ -74,27 +73,19 @@ if (!token || !chatId) {
 }
 
 async function telegram(method, payload, timeoutMs) {
-  // A document is multipart, and fetch writes that header itself — it carries a
-  // boundary only it knows. Everything else is JSON.
-  const form = payload instanceof FormData;
-  try {
-    const res = await fetch(`${TELEGRAM_API}/bot${token}/${method}`, {
-      method: "POST",
-      ...(form ? {} : { headers: { "content-type": "application/json" } }),
-      body: form ? payload : JSON.stringify(payload),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    return await res.json().catch(() => ({}));
-  } catch (err) {
-    return { ok: false, description: redact(err?.message ?? err, token) };
-  }
+  return (await telegramCall(token, method, payload, timeoutMs)).json;
 }
 
 // Which name this bot answers to. In a group with more than one bot, clients
 // address a command to one of them — /status@thisbot is ours to answer and
-// /status@anotherbot is not. Asked once at startup; if Telegram does not say,
-// only the bare command is recognised.
-const botUsername = (await telegram("getMe", {}, 10_000))?.result?.username;
+// /status@anotherbot is not. Asked at startup, and again whenever a poll brings
+// something back while it is still unknown: a poller started with the network
+// down would otherwise ignore every addressed command for as long as it runs.
+let botUsername;
+async function learnUsername() {
+  botUsername ??= (await telegram("getMe", {}, 10_000))?.result?.username;
+}
+await learnUsername();
 
 // Answering in the thread the message came from, so it reads as a conversation:
 // the same chat, the same forum topic when the group has them, and hung under
@@ -381,7 +372,14 @@ for (;;) {
     (POLL_SECONDS + 10) * 1000
   );
   if (!updates?.ok) {
-    console.error(`herdr-telegram-notify: getUpdates failed: ${updates?.description ?? "no answer"}`);
+    // 409: something else is taking this bot's updates — a poller on another
+    // machine with the same token, or a webhook. Telegram hands each update to
+    // one of them, and the message map that routes a reply is per machine.
+    const conflict =
+      updates?.error_code === 409
+        ? " — another machine or a webhook is reading this bot's updates; one bot per machine (see README)"
+        : "";
+    console.error(`herdr-telegram-notify: getUpdates failed: ${updates?.description ?? "no answer"}${conflict}`);
     await new Promise((resolve) => setTimeout(resolve, IDLE_BACKOFF));
     continue;
   }
@@ -394,6 +392,7 @@ for (;;) {
   cfg = loadConfig();
   chatId = cfg("TELEGRAM_CHAT_ID");
   const stopping = !isOn(cfg("REPLIES"));
+  if (!stopping && updates.result?.length) await learnUsername();
 
   for (const update of updates.result ?? []) {
     // Counted as seen even when nothing is done with it: off means not

@@ -165,7 +165,9 @@ test("a live holder that is slow keeps its lock however long it takes", async ()
   await holder.held;
 
   try {
-    const until = Date.now() + 33_000;
+    // Past the longest a lock ever waits (LOCK_WAIT_SECONDS plus the start
+    // grace): a timeout that handed the lock over would have to fire by then.
+    const until = Date.now() + 16_000;
     while (Date.now() < until) {
       assert.equal(holdFlock(path), undefined, "took a live holder's lock");
       await new Promise((resolve) => setTimeout(resolve, 500));

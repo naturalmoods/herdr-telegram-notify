@@ -203,3 +203,25 @@ test("SWEEP_MINUTES=0 stops the sweeper", async () => {
     tg.close();
   }
 });
+
+test("panes that cannot be nudged do not use up the reminders of one that can", async () => {
+  const tg = await fakeTelegram();
+  const fx = fixture({ sweepMinutes: 1 });
+  try {
+    // Closed while blocked: their state files say so for a week, and none of
+    // them is in the herd any more. More of them than one pass may nudge, and
+    // named to be listed before p1.
+    for (const n of [1, 2, 3, 4]) {
+      writeFileSync(join(fx.stateDir, `state-w0_p${n}.json`), blocked(`w0:p${n}`, 30));
+    }
+    writeFileSync(join(fx.stateDir, "state-wA_p1.json"), blocked("wA:p1", 30));
+
+    await runSweeper(fx, tg.base, { until: () => tg.sent.length >= 1 && recorded(fx).length >= 1, timeoutMs: 8000 });
+
+    assert.equal(tg.sent.length, 1);
+    assert.match(tg.sent[0].text, /still blocked/);
+    assert.match(tg.sent[0].text, /wA:p1/);
+  } finally {
+    tg.close();
+  }
+});
