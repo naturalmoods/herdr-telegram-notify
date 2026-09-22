@@ -29,15 +29,14 @@ import {
   EXPANDABLE_QUOTE_CHARS,
   EXTRA_KEYS,
   HEAD_LINE_CHARS,
+  QUESTION_UNKNOWN,
   TELEGRAM_LIMIT,
   blocksToText,
   buildMessage,
   clip,
   clockTime,
-  cropScreen,
   escapeHtml,
   firstDefined,
-  herdr,
   herdrBin,
   humanCost,
   humanDuration,
@@ -50,13 +49,20 @@ import {
   listMatches,
   loadConfig,
   loadEnvFile,
+  loadSnapshot,
+  mutedUntil,
   promptText,
+  questionOnScreen,
+  readState,
   readTail,
   readTurn,
   redact,
   rememberMessage,
   retryAfterMs,
+  sanitizeKey,
+  screenTail,
   sleep,
+  statusEmoji,
   stripEmphasis,
   tilde,
   toInt,
@@ -74,6 +80,7 @@ import {
   sleepSync,
   withFileLock,
   writeLines,
+  writeState,
 } from "./lib.mjs";
 
 // Longest working→stop gap still believable as one turn; see main().
@@ -141,16 +148,6 @@ function sessionSnapshot() {
     snapshotLoaded = true;
   }
   return snapshotCache;
-}
-
-function loadSnapshot() {
-  const out = herdr(["api", "snapshot"]);
-  if (!out) return undefined;
-  try {
-    return JSON.parse(out).result?.snapshot;
-  } catch {
-    return undefined;
-  }
 }
 
 // Workspace label, tab label, cwd and agent session for the pane the event is
@@ -270,49 +267,10 @@ function gitBranch(cwd) {
   return undefined;
 }
 
-// A blocked agent's question lives on screen, not in the transcript.
-function screenTail(paneId, maxLines) {
-  // More rows than will be shown: finding the column boundary is a question
-  // about the shape of the whole screen, and a handful of rows cannot answer it.
-  const rows = Math.max(maxLines * 2, 24);
-  const out = herdr(["pane", "read", paneId, "--lines", String(rows), "--format", "text"]);
-  if (!out) return undefined;
-
-  // Escapes and box drawing go first and column positions are kept: a vertical
-  // rule between two columns has to read as blank space before the gutter it
-  // sits in can be seen at all.
-  const screen = out
-    .split("\n")
-    .map((line) => line.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, "").replace(/[─-╿▀-▟]/g, " ").replace(/\s+$/, ""));
-
-  const lines = cropScreen(screen)
-    // Only now: with one column in hand, the runs of spaces left in a row are
-    // its own alignment rather than the wall between it and the next column.
-    .map((line) => line.replace(/\s+/g, " ").trim())
-    // Drop separators and the agent's own chrome: the empty input prompt and
-    // the shortcut hint line under it carry nothing worth a notification.
-    .filter((line) => line && !/^[·•\-–—_=.]+$/.test(line) && !/^[❯>]$/.test(line) && !/^⏵/.test(line));
-  const tail = lines.slice(-maxLines).join("\n");
-  return tail || undefined;
-}
-
 // -------------------------------------------------------------------- state
-
-function sanitizeKey(raw) {
-  return String(raw).replace(/[^a-zA-Z0-9_-]/g, "_");
-}
 
 function stateKey(event, context) {
   return sanitizeKey(firstDefined(event.data?.pane_id, context.focused_pane_id, "default"));
-}
-
-function readState(stateDir, key) {
-  if (!stateDir) return {};
-  try {
-    return JSON.parse(readFileSync(join(stateDir, `state-${key}.json`), "utf8"));
-  } catch {
-    return {};
-  }
 }
 
 // A closed pane never comes back to clean up after itself, and an upgrade leaves
@@ -337,27 +295,6 @@ function sweepState(stateDir) {
         if (obsolete || now - statSync(path).mtimeMs > ttl) unlinkSync(path);
       } catch {}
     }
-  } catch {}
-}
-
-// Written by mute.mjs, the plugin's `mute` action. Muting drops the messages it
-// covers rather than queueing them: you asked not to be told, not to be told all
-// at once in an hour.
-function mutedUntil(stateDir) {
-  if (!stateDir) return 0;
-  try {
-    const until = JSON.parse(readFileSync(join(stateDir, "mute.json"), "utf8"))?.until;
-    return Number.isFinite(until) && until > Date.now() ? until : 0;
-  } catch {
-    return 0;
-  }
-}
-
-function writeState(stateDir, key, state) {
-  if (!stateDir) return;
-  try {
-    mkdirSync(stateDir, { recursive: true });
-    writeFileSync(join(stateDir, `state-${key}.json`), JSON.stringify(state));
   } catch {}
 }
 
@@ -435,6 +372,11 @@ async function remindBlocked(stateDir, cfg, { token, chatId, silent }) {
       bodyIsScreen: true,
     });
 
+    // What it is waiting on, as of now: the reminder is answerable, so it carries
+    // the question the same way the first notification did — and says it is about
+    // one even when the question itself could not be read.
+    const question = questionOnScreen(stateDir, paneId) ?? QUESTION_UNKNOWN;
+
     // Marked first: a reminder that fails is not worth queueing — by the time it
     // could be delivered the wait it reports is no longer the wait there is.
     writeState(stateDir, file.replace(/^state-|\.json$/g, ""), { ...state, remindedAt: Date.now() });
@@ -443,7 +385,7 @@ async function remindBlocked(stateDir, cfg, { token, chatId, silent }) {
         silent,
         topicId: topicFor(cfg, info.workspaceLabel, workspaceId),
       });
-      rememberMessage(stateDir, messageId, paneId, info.session);
+      rememberMessage(stateDir, messageId, paneId, info.session, question);
     } catch (err) {
       console.error(`herdr-telegram-notify: reminder for ${paneId} failed: ${redact(err.message, token)}`);
     }
@@ -451,8 +393,6 @@ async function remindBlocked(stateDir, cfg, { token, chatId, silent }) {
 }
 
 // ------------------------------------------------------------------ message
-
-const STATUS_EMOJI = { done: "✅", blocked: "⚠️", working: "⏳", idle: "💤" };
 
 async function sendTelegram(token, chatId, message, { silent, topicId } = {}) {
   const url = `${TELEGRAM_API}/bot${token}/sendMessage`;
@@ -600,7 +540,7 @@ function readPending(stateDir) {
     .slice(-PENDING_MAX);
 }
 
-function queuePending(stateDir, parts, topicId, paneId, session) {
+function queuePending(stateDir, parts, topicId, paneId, session, question, full) {
   const path = pendingPath(stateDir);
   if (!path) {
     console.error("herdr-telegram-notify: no state directory, so the message could not be kept for later");
@@ -611,7 +551,10 @@ function queuePending(stateDir, parts, topicId, paneId, session) {
       // The parts, not the rendered message: a late delivery carries an extra
       // line, and rendering it then is what keeps the result inside Telegram's
       // limit.
-      const entries = [...readPending(stateDir), { id: randomUUID(), at: Date.now(), parts, topicId, paneId, session }];
+      const entries = [
+        ...readPending(stateDir),
+        { id: randomUUID(), at: Date.now(), parts, topicId, paneId, session, question, full },
+      ];
       writeLines(path, entries.slice(-PENDING_MAX));
       return entries.length;
     });
@@ -659,7 +602,7 @@ async function flushPending(stateDir, token, chatId, silent) {
         silent,
         topicId: entry.topicId,
       });
-      rememberMessage(stateDir, messageId, entry.paneId, entry.session);
+      rememberMessage(stateDir, messageId, entry.paneId, entry.session, entry.question, entry.full);
     } catch (err) {
       console.error(
         `herdr-telegram-notify: ${waiting.length} message(s) still waiting: ${redact(err.message, token)}`
@@ -915,7 +858,7 @@ async function main() {
 
   const agent = String(firstDefined(data.display_agent, data.agent, context.focused_pane_agent, "agent"));
   const statusLabel = String(firstDefined(data.state_labels?.[status], status));
-  const emoji = STATUS_EMOJI[status] ?? "🔔";
+  const emoji = statusEmoji(status);
 
   // Claude and pi keep the session's own summary in the pane title; the leading
   // glyph is the spinner/status marker Herdr prepends to the raw title.
@@ -1008,6 +951,16 @@ async function main() {
 
   const herd = isOn(cfg("SHOW_HERD")) ? herdSummary(snap, paneId) : undefined;
 
+  // Which question this is, when it is one. An answer to a blocked agent is
+  // keystrokes into whatever prompt is on its screen, so the notification records
+  // which prompt that was and the poller refuses to type at any other. Read on
+  // its own rather than taken from the body below, which SHOW_SCREEN_ON_BLOCKED
+  // and SCREEN_LINES both change the shape of — and which a queued message
+  // carries from the moment it was written, as this does.
+  // An unreadable question is still recorded as one: a reply to it is refused
+  // rather than delivered as a new turn once the agent walks on.
+  const question = status === "blocked" ? (questionOnScreen(stateDir, paneId) ?? QUESTION_UNKNOWN) : undefined;
+
   // What the agent said, or — when it is waiting on an answer that never
   // reaches the transcript — what its screen is showing.
   let body;
@@ -1019,6 +972,14 @@ async function main() {
   if (!body && isOn(cfg("SHOW_LAST_MESSAGE")) && turn.text) {
     body = truncate(turn.text, toInt(cfg("LAST_MESSAGE_CHARS"), 600));
   }
+
+  // The whole of what the agent said this turn, kept beside the notification so
+  // /full can hand it back — taken here, before LAST_MESSAGE_CHARS cuts it down
+  // and before the agent takes another turn, because by the time someone asks
+  // the transcript has moved on. A screen body is not kept: it is a picture of a
+  // pane rather than something an agent said, and the turn text behind it
+  // belongs to whatever it was doing before the question.
+  const full = bodyIsScreen ? undefined : turn.text;
 
   // Herdr can report one agent session on two panes — a resumed session, or the
   // same agent adopted by a second pane — and each pane raises its own status
@@ -1077,22 +1038,23 @@ async function main() {
     // The queue flush just proved the network is down; no point spending another
     // round of attempts on the same connection.
     console.error("herdr-telegram-notify: still offline, not retrying this one now");
-    queuePending(stateDir, parts, topicId, paneId, info.session);
+    queuePending(stateDir, parts, topicId, paneId, info.session, question, full);
     process.exitCode = 1;
     return;
   }
 
   try {
     const messageId = await sendTelegram(token, chatId, message, { silent, topicId });
-    // Which pane this message was about and which agent was in it, so a reply to
-    // it lands in the right one — and nowhere else once that agent is gone.
-    rememberMessage(stateDir, messageId, paneId, info.session);
+    // Which pane this message was about, which agent was in it and what it was
+    // waiting on, so a reply to it lands in the right one — and nowhere else once
+    // that agent, or its question, is gone.
+    rememberMessage(stateDir, messageId, paneId, info.session, question, full);
   } catch (err) {
     console.error(`herdr-telegram-notify: ${redact(err.message, token)}`);
     // A refused connection or a Telegram that is down will look different in a
     // minute; a rejected token or chat id will not, and queueing it would only
     // pile up messages that can never be sent.
-    if (isRetryable(err.status)) queuePending(stateDir, parts, topicId, paneId, info.session);
+    if (isRetryable(err.status)) queuePending(stateDir, parts, topicId, paneId, info.session, question, full);
     process.exitCode = 1;
   }
 }

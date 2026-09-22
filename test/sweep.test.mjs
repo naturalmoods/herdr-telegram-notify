@@ -7,7 +7,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, chmodSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -71,6 +71,15 @@ function fixture({ sweepMinutes } = {}) {
   return { root, stateDir, configDir, herdr: fakeHerdr(root) };
 }
 
+// What the sweeper wrote down about the messages it sent, so a reply to one can
+// be routed. Written just after the send, so it is what a pass waits for.
+const recorded = (fx) => {
+  const path = join(fx.stateDir, "messages.jsonl");
+  return existsSync(path)
+    ? readFileSync(path, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l))
+    : [];
+};
+
 const blocked = (paneId, minutesAgo) =>
   JSON.stringify({ status: "blocked", updatedAt: Date.now() - minutesAgo * 60 * 1000, paneId });
 
@@ -101,7 +110,7 @@ function runSweeper(fx, base, { until, timeoutMs = 15000 }) {
   });
 }
 
-test("the sweeper flushes the queue and nudges, with no status event at all", async () => {
+test("the sweeper flushes the queue, keeping what each message was about, and nudges", async () => {
   const tg = await fakeTelegram();
   const fx = fixture({ sweepMinutes: 1 });
   try {
@@ -109,7 +118,19 @@ test("the sweeper flushes the queue and nudges, with no status event at all", as
     writeFileSync(
       join(fx.stateDir, "pending.jsonl"),
       [
-        JSON.stringify({ at: Date.now() - 60_000, parts: { emoji: "✅", agent: "claude", statusLabel: "done" } }),
+        JSON.stringify({
+          at: Date.now() - 60_000,
+          parts: { emoji: "⚠️", agent: "claude", statusLabel: "blocked" },
+          paneId: "wA:p1",
+          session: { kind: "id", value: "s1" },
+          // Read when the message was written, not when it finally goes out: by
+          // now the agent may be waiting on something else entirely, and this is
+          // what tells the poller so.
+          question: "0123456789abcdef",
+          // Likewise what /full hands back: the turn as it was when the message
+          // was written, however long it then sat in the queue.
+          full: "the whole of what it said, from before the network went",
+        }),
         JSON.stringify({ at: Date.now() - 9 * 60 * 60 * 1000, parts: { emoji: "✅", agent: "claude", statusLabel: "stale" } }),
       ].join("\n") + "\n"
     );
@@ -117,11 +138,22 @@ test("the sweeper flushes the queue and nudges, with no status event at all", as
     writeFileSync(join(fx.stateDir, "state-wA_p1.json"), blocked("wA:p1", 30));
     writeFileSync(join(fx.stateDir, "state-wA_p2.json"), blocked("wA:p2", 30));
 
-    await runSweeper(fx, tg.base, { until: () => tg.sent.length >= 2 });
+    await runSweeper(fx, tg.base, { until: () => tg.sent.length >= 2 && recorded(fx).length >= 2 });
 
     const texts = tg.sent.map((m) => m.text);
     assert.equal(texts.length, 2, `expected the queued message and one nudge, got:\n${texts.join("\n---\n")}`);
     assert.match(texts[0], /delayed/); // the queue goes first, marked late
+    // Answerable, and only as an answer to the question it was queued for.
+    const written = recorded(fx);
+    assert.equal(written[0].paneId, "wA:p1");
+    assert.equal(written[0].session, "id:s1");
+    assert.equal(written[0].question, "0123456789abcdef");
+    assert.equal(written[0].full, "the whole of what it said, from before the network went");
+    // The nudge is answerable too, and says it is about a question even though
+    // this herdr shows no screen to fingerprint one from — so a reply to it is
+    // refused rather than typed at whatever the pane is showing by then.
+    assert.equal(written[1].paneId, "wA:p1");
+    assert.equal(written[1].question, "blocked:unknown");
     assert.match(texts[1], /still blocked/);
     assert.match(texts[1], /wA:p1/);
     // The one that answered is not nagged, and a six-hour-old `done` is history.

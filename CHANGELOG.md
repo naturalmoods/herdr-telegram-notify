@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.8.0
+
+- Add Telegram `/status` to list agents, workspaces and current states.
+- Add `/mute [minutes]` and `/unmute`, using the same mute state as the Herdr
+  action. Commands use the configured chat and user allowlist.
+- Add `/full` as a reply to a notification to download its saved agent response
+  as a UTF-8 text file. Queued notifications retain their original response.
+- Reload reply permissions after each long poll. Disabling `REPLIES` during a
+  poll prevents the returned messages from being dispatched.
+- Bind blocked replies to the recorded waiting episode and screen. Refuse
+  replies when the question has changed, ended or could not be recorded.
+  Checking and typing are still separate operations; simultaneous terminal
+  input can race with delivery.
+- Keep command responses in the requesting Telegram topic. Reject unexpected
+  command arguments and ignore supported commands addressed to another bot.
+- Restrict saved notification and queue files to owner-only access.
+
 ## 0.7.0
 
 One agent, one conversation — and enough locking to mean it.

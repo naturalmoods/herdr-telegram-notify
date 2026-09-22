@@ -5,7 +5,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, chmodSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, chmodSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -16,6 +16,7 @@ import {
   cropScreen,
   escapeHtml,
   firstDefined,
+  herdStatusText,
   humanCost,
   humanDuration,
   humanTokens,
@@ -23,9 +24,15 @@ import {
   inlineMarkdown,
   isOn,
   isRetryable,
+  botCommand,
+  muteMinutes,
+  mutedUntil,
+  setMute,
+  MUTE_MAX_MINUTES,
   listMatches,
   loadEnvFile,
   promptText,
+  blockedEpisode,
   sessionKey,
   targetForMessage,
   readTurn,
@@ -39,6 +46,7 @@ import {
   topicFor,
   truncate,
   usableReply,
+  writeLines,
 } from "../lib.mjs";
 
 const scratch = mkdtempSync(join(tmpdir(), "herdr-telegram-notify-test-"));
@@ -451,8 +459,11 @@ test("cropScreen will not guess a column out of a handful of rows", () => {
 
 test("usableReply accepts only this chat's text", () => {
   const message = { message_id: 9, chat: { id: 42 }, text: "  folytasd  ", reply_to_message: { message_id: 7 } };
-  assert.deepEqual(usableReply({ message }, 42), { text: "folytasd", messageId: 9, replyTo: 7 });
-  assert.deepEqual(usableReply({ message }, "42"), { text: "folytasd", messageId: 9, replyTo: 7 });
+  const usable = { text: "folytasd", messageId: 9, replyTo: 7, threadId: undefined };
+  assert.deepEqual(usableReply({ message }, 42), usable);
+  assert.deepEqual(usableReply({ message }, "42"), usable);
+  // A forum topic is carried, so the answer goes back to the thread it was asked in.
+  assert.equal(usableReply({ message: { ...message, message_thread_id: 5 } }, 42).threadId, 5);
   // The whole security boundary: a bot's username is public and what arrives
   // here goes to a terminal.
   assert.equal(usableReply({ message: { ...message, chat: { id: 99 } } }, 42), undefined);
@@ -494,7 +505,7 @@ test("replyCommands types at a blocked agent and prompts anything else", () => {
   }
 });
 
-test("the message map remembers which pane and session a notification was about", () => {
+test("the message map remembers which pane, session and question a notification was about", () => {
   const dir = mkdtempSync(join(scratch, "map-"));
   const first = { kind: "id", value: "s-1" };
   rememberMessage(dir, 11, "wA:p1", first);
@@ -510,13 +521,49 @@ test("the message map remembers which pane and session a notification was about"
     { ...targetForMessage(dir, 13), at: undefined },
     { id: 13, paneId: "wA:p1", session: "id:s-9", at: undefined }
   );
+  // A question is remembered with it when the notification was about one, and a
+  // later message about the same pane does not stand in for it.
+  rememberMessage(dir, 16, "wA:p1", first, "a1b2c3");
+  assert.equal(targetForMessage(dir, 16)?.question, "a1b2c3");
+  assert.equal(targetForMessage(dir, 13)?.question, undefined);
   // A notification remembered before sessions were recorded: the pane is there,
   // the session is not, and the poller refuses rather than guesses.
   rememberMessage(dir, 15, "wA:p1");
   assert.equal(targetForMessage(dir, 15).session, undefined);
+  // The whole of what the agent said rides along for /full — the whole of it,
+  // not a prefix of it — and is absent when there was none.
+  rememberMessage(dir, 17, "wA:p1", first, undefined, "x".repeat(50_000));
+  assert.equal(targetForMessage(dir, 17).full.length, 50_000);
+  assert.equal(targetForMessage(dir, 13).full, undefined);
+  // What it holds is this user's to read, and so is a map an older version left.
+  assert.equal(statSync(join(dir, "messages.jsonl")).mode & 0o077, 0);
   // Nothing to write to, and nothing to read back.
   rememberMessage(undefined, 14, "wC:p3", first);
   assert.equal(targetForMessage(undefined, 14), undefined);
+});
+
+test("a map an older version left world-readable is narrowed before anything goes into it", () => {
+  const dir = mkdtempSync(join(scratch, "modes-"));
+  const path = join(dir, "messages.jsonl");
+  // What an older version left behind keeps the mode it was made with, and
+  // writeFileSync's own mode only applies to a file it creates. So the narrowing
+  // happens first — the content is what is worth hiding, and it is not written
+  // into a readable file and hidden afterwards.
+  writeFileSync(path, "{}\n", { mode: 0o644 });
+  writeLines(path, [{ full: "what the agent said" }]);
+  assert.equal(statSync(path).mode & 0o077, 0);
+  assert.match(readFileSync(path, "utf8"), /what the agent said/);
+
+  // A file that is not there yet is not a failure to narrow: it is created
+  // private in the same call.
+  const fresh = join(dir, "pending.jsonl");
+  writeLines(fresh, [{ full: "and this" }]);
+  assert.equal(statSync(fresh).mode & 0o077, 0);
+
+  // ponytail: the other half — a chmod that fails throwing rather than writing
+  // on past it — is left to the code. Every way of making chmod fail that a test
+  // can arrange without a second user blocks the write as well, so a test of it
+  // would pass either way.
 });
 
 test("sessionKey tells the two kinds of session apart", () => {
@@ -526,4 +573,101 @@ test("sessionKey tells the two kinds of session apart", () => {
   for (const missing of [undefined, {}, { kind: "id" }, { kind: "id", value: "" }]) {
     assert.equal(sessionKey(missing), undefined);
   }
+});
+
+// ---------------------------------------------------------------- /status
+
+test("botCommand answers for this bot and no other", () => {
+  for (const text of ["/status", "/STATUS", "  /status  ", "/status@herdbot", "/status@HerdBot"]) {
+    assert.deepEqual(botCommand(text, "herdbot"), { command: "/status", args: [], mine: true }, text);
+  }
+  assert.deepEqual(botCommand("/status please", "herdbot"), { command: "/status", args: ["please"], mine: true });
+  assert.deepEqual(botCommand("/mute 30", "herdbot"), { command: "/mute", args: ["30"], mine: true });
+  assert.deepEqual(botCommand("/unmute", "herdbot"), { command: "/unmute", args: [], mine: true });
+  assert.deepEqual(botCommand("/full", "herdbot"), { command: "/full", args: [], mine: true });
+  // Nothing off the list is a command here, however much it looks like one: it
+  // falls through to the reply path as the text it is.
+  for (const text of ["/statuses", "status", "/start", "/rm -rf /", "", "@herdbot /status"]) {
+    assert.equal(botCommand(text, "herdbot"), undefined, text);
+  }
+  // A command on the list but addressed elsewhere — or at a suffix that names no
+  // bot at all — is still a command, and one this bot does not answer. Not ours
+  // and not an agent's: `mine` says which, and nothing reaches a pane either way.
+  for (const text of ["/status@otherbot", "/mute@otherbot 5", "/status@", "/status@herdbot@otherbot", "/full@HERDBOTX"]) {
+    assert.equal(botCommand(text, "herdbot")?.mine, false, text);
+  }
+  // Without a name to check against, only the unaddressed command is ours.
+  assert.deepEqual(botCommand("/status", undefined), { command: "/status", args: [], mine: true });
+  assert.equal(botCommand("/status@herdbot", undefined).mine, false);
+});
+
+test("muteMinutes takes a whole number of minutes and nothing else", () => {
+  assert.equal(muteMinutes(["30"], "45"), 30);
+  assert.equal(muteMinutes([], "45"), 45); // the configured default
+  assert.equal(muteMinutes([], undefined), 60); // ...and the default's default
+  assert.equal(muteMinutes([], "nonsense"), 60);
+  assert.equal(muteMinutes([String(MUTE_MAX_MINUTES)], undefined), MUTE_MAX_MINUTES);
+  // Every way of saying something that is not a count of minutes.
+  for (const arg of ["0", "-5", "30min", "1.5", "1e9", "NaN", "Infinity", " ", String(MUTE_MAX_MINUTES + 1), "99999999999999999999"]) {
+    assert.equal(muteMinutes([arg], undefined), undefined, arg);
+  }
+  assert.equal(muteMinutes(["30", "minutes"], undefined), undefined); // a sentence, not a command
+});
+
+test("a mute is set and cleared, and reads as off once it has run out", () => {
+  const dir = join(scratch, "mute-state");
+  assert.equal(mutedUntil(dir), 0); // nothing written yet
+  const until = Date.now() + 60_000;
+  setMute(dir, until);
+  assert.equal(mutedUntil(dir), until);
+  setMute(dir, Date.now() - 1);
+  assert.equal(mutedUntil(dir), 0); // in the past is not muted
+  setMute(dir, until);
+  setMute(dir, 0);
+  assert.equal(mutedUntil(dir), 0);
+  setMute(dir, 0); // clearing what is already clear is not an error
+  assert.equal(mutedUntil(undefined), 0);
+});
+
+test("herdStatusText lists the herd, blocked first and bounded", () => {
+  const snap = {
+    workspaces: [{ workspace_id: "wA", label: "storefront" }],
+    agents: [
+      { pane_id: "wA:p1", workspace_id: "wA", agent: "claude", agent_status: "idle" },
+      { pane_id: "wB:p1", workspace_id: "wB", agent: "pi", agent_status: "blocked" },
+      { pane_id: "wA:p2", workspace_id: "wA", agent: "claude", agent_status: "working" },
+      { workspace_id: "wA", agent: "claude", agent_status: "done" }, // no pane to name
+    ],
+  };
+  assert.deepEqual(herdStatusText(snap).split("\n"), [
+    "\u26a0\ufe0f pi \u00b7 wB \u00b7 blocked \u00b7 wB:p1", // an unlabelled workspace answers to its id
+    "\u23f3 claude \u00b7 storefront \u00b7 working \u00b7 wA:p2",
+    "\ud83d\udca4 claude \u00b7 storefront \u00b7 idle \u00b7 wA:p1",
+  ]);
+
+  // A herd too big for a phone is cut short, and says by how much.
+  const many = { agents: Array.from({ length: 25 }, (_, i) => ({ pane_id: `wA:p${i}`, agent_status: "idle" })) };
+  const lines = herdStatusText(many).split("\n");
+  assert.equal(lines.length, 21);
+  assert.equal(lines.at(-1), "\u2026 and 5 more");
+
+  // Nothing to say, and no snapshot to say it from.
+  assert.equal(herdStatusText({ agents: [] }), "No agents are running.");
+  assert.equal(herdStatusText(undefined), "I cannot reach herdr right now.");
+});
+
+test("blockedEpisode names the stretch a pane is blocked in, and only that", () => {
+  const dir = mkdtempSync(join(scratch, "episode-"));
+  const write = (state) => writeFileSync(join(dir, "state-wA_p1.json"), JSON.stringify(state));
+
+  write({ status: "blocked", updatedAt: 1000, paneId: "wA:p1" });
+  assert.equal(blockedEpisode(dir, "wA:p1"), 1000);
+  // Left and came back: the same pane at the same question is a new stretch.
+  write({ status: "blocked", updatedAt: 2000, paneId: "wA:p1" });
+  assert.equal(blockedEpisode(dir, "wA:p1"), 2000);
+  // Not blocked, never recorded, or nowhere to look: no stretch to belong to.
+  write({ status: "working", updatedAt: 3000, paneId: "wA:p1" });
+  assert.equal(blockedEpisode(dir, "wA:p1"), undefined);
+  assert.equal(blockedEpisode(dir, "wZ:p9"), undefined);
+  assert.equal(blockedEpisode(undefined, "wA:p1"), undefined);
 });

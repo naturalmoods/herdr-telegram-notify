@@ -19,6 +19,7 @@ import {
   herdrBin,
   isOn,
   loadConfig,
+  mutedUntil,
   redact,
   toInt,
 } from "./lib.mjs";
@@ -127,10 +128,8 @@ if (!stateDir) {
   } catch (err) {
     bad("state", `${stateDir} is not writable: ${err.message}`);
   }
-  try {
-    const until = JSON.parse(readFileSync(join(stateDir, "mute.json"), "utf8"))?.until ?? 0;
-    if (until > Date.now()) bad("muted", `nothing will be sent until ${new Date(until).toLocaleTimeString()}`);
-  } catch {}
+  const until = mutedUntil(stateDir);
+  if (until) bad("muted", `nothing will be sent until ${new Date(until).toLocaleTimeString()}`);
   try {
     const waiting = readFileSync(join(stateDir, "pending.jsonl"), "utf8").split("\n").filter((l) => l.trim()).length;
     if (waiting) bad("queued", `${waiting} message(s) waiting for the network to come back`);

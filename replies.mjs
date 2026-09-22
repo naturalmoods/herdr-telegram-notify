@@ -10,15 +10,25 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 
 import {
+  MUTE_MAX_MINUTES,
+  QUESTION_UNKNOWN,
+  botCommand,
+  clockTime,
   flockAvailable,
+  herdStatusText,
   herdrBin,
   holdFlock,
   isOn,
   loadConfig,
+  loadSnapshot,
+  muteMinutes,
+  questionOnScreen,
   readMessageMap,
   redact,
   replyCommands,
+  sanitizeKey,
   sessionKey,
+  setMute,
   targetForMessage,
   usableReply,
 } from "./lib.mjs";
@@ -55,20 +65,23 @@ if (!release) {
 
 // --------------------------------------------------------------- telegram
 
-const cfg = loadConfig();
+let cfg = loadConfig();
 const token = cfg("TELEGRAM_BOT_TOKEN");
-const chatId = cfg("TELEGRAM_CHAT_ID");
+let chatId = cfg("TELEGRAM_CHAT_ID");
 if (!token || !chatId) {
   console.error("herdr-telegram-notify: replies need TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID");
   process.exit(1);
 }
 
 async function telegram(method, payload, timeoutMs) {
+  // A document is multipart, and fetch writes that header itself — it carries a
+  // boundary only it knows. Everything else is JSON.
+  const form = payload instanceof FormData;
   try {
     const res = await fetch(`${TELEGRAM_API}/bot${token}/${method}`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(payload),
+      ...(form ? {} : { headers: { "content-type": "application/json" } }),
+      body: form ? payload : JSON.stringify(payload),
       signal: AbortSignal.timeout(timeoutMs),
     });
     return await res.json().catch(() => ({}));
@@ -77,9 +90,52 @@ async function telegram(method, payload, timeoutMs) {
   }
 }
 
-// Answering in the thread the reply came from, so it reads as a conversation.
-async function say(text, replyTo) {
-  await telegram("sendMessage", { chat_id: chatId, text, reply_to_message_id: replyTo, disable_notification: true }, 10_000);
+// Which name this bot answers to. In a group with more than one bot, clients
+// address a command to one of them — /status@thisbot is ours to answer and
+// /status@anotherbot is not. Asked once at startup; if Telegram does not say,
+// only the bare command is recognised.
+const botUsername = (await telegram("getMe", {}, 10_000))?.result?.username;
+
+// Answering in the thread the message came from, so it reads as a conversation:
+// the same chat, the same forum topic when the group has them, and hung under
+// the message it answers.
+async function say(text, to) {
+  await telegram(
+    "sendMessage",
+    {
+      chat_id: chatId,
+      text,
+      reply_to_message_id: to?.messageId,
+      ...(to?.threadId ? { message_thread_id: to.threadId } : {}),
+      disable_notification: true,
+    },
+    10_000
+  );
+}
+
+// A text file rather than a message: the point of /full is the part that did not
+// fit in one, and Telegram counts a document's size rather than its characters.
+// UTF-8, because an agent's answer is not ASCII and a file the phone renders as
+// mojibake is not the answer either.
+async function sendFull(target, to) {
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  form.append("reply_to_message_id", String(to.messageId));
+  if (to.threadId) form.append("message_thread_id", String(to.threadId));
+  form.append("disable_notification", "true");
+  form.append("caption", `The whole of it — ${target.full.length} characters from ${target.paneId}.`);
+  form.append(
+    "document",
+    new Blob([target.full], { type: "text/plain; charset=utf-8" }),
+    `${sanitizeKey(target.paneId)}-${target.id}.txt`
+  );
+
+  const res = await telegram("sendDocument", form, 30_000);
+  if (!res?.ok) {
+    console.error(`herdr-telegram-notify: /full for message ${target.id} failed: ${res?.description ?? "no answer"}`);
+    return say(`✗ could not send it: ${res?.description ?? "Telegram did not take the file"}`, to);
+  }
+  console.log(`herdr-telegram-notify: sent the full response for message ${target.id} (${target.full.length} chars)`);
 }
 
 // ------------------------------------------------------------------ herdr
@@ -116,6 +172,83 @@ function liveAgent(paneId) {
   }
 }
 
+// ---------------------------------------------------------------- commands
+
+// The messages that do something without being a reply, and the only text this
+// ever reads as an instruction: a fixed list in lib.mjs, past the same chat and
+// sender checks as everything else, and short of anything that touches a pane.
+// Nothing here runs what the message says — the command names the act, the
+// argument is at most a number.
+async function runCommand({ command, args }, reply) {
+  // Only /mute takes anything after the command. A word after one of the others
+  // is a sentence that happens to start with a slash, and acting on it would
+  // make an unmute out of "/unmute in an hour".
+  if (args.length && command !== "/mute") {
+    return say(`Usage: ${command} on its own, with nothing after it.`, reply);
+  }
+
+  if (command === "/status") {
+    console.log("herdr-telegram-notify: answered /status");
+    return say(herdStatusText(loadSnapshot()), reply);
+  }
+
+  // Set, not toggled, unlike the plugin's mute action: the person typing this is
+  // not looking at the herd, so `/mute 30` has to mean muted for thirty minutes
+  // whatever it was before, and only /unmute lifts it. Both go through the same
+  // file the action and the notifier use, so the two ways of muting are one
+  // mute. A mute silences notifications going out, not this conversation, so the
+  // confirmation still arrives.
+  if (command === "/unmute") {
+    try {
+      setMute(stateDir, 0);
+    } catch (err) {
+      console.error(`herdr-telegram-notify: could not unmute: ${err.message}`);
+      return say(`✗ could not unmute: ${err.message}`, reply);
+    }
+    console.log("herdr-telegram-notify: unmuted from the chat");
+    return say("🔔 Notifications are on.", reply);
+  }
+
+  // The whole of what the agent said, as the notification carried it. Answered
+  // from what was written down when that message went out and from nothing else:
+  // no transcript is read now, no path is taken from the message, and nothing
+  // here reaches a pane. A notification whose text was not kept — one sent
+  // before this existed, a reminder, or a blocked agent's screen — says so.
+  if (command === "/full") {
+    const target = reply.replyTo ? targetForMessage(stateDir, reply.replyTo) : undefined;
+    if (!target?.full) {
+      const known = readMessageMap(stateDir).length;
+      console.log(`herdr-telegram-notify: no kept response for message ${reply.replyTo ?? "(not a reply)"}`);
+      return say(
+        !reply.replyTo
+          ? "Reply to one of my notifications with /full and I will send you the whole of what that agent said."
+          : target
+            ? `I did not keep the full text of message ${reply.replyTo}. Notifications sent before this bot kept it, reminders, and ones showing a blocked agent's screen have nothing more than what you already see.`
+            : `I have no record of message ${reply.replyTo}. Only notifications sent while replies were running can be answered (${known} of them right now).`,
+        reply
+      );
+    }
+    return sendFull(target, reply);
+  }
+
+  const minutes = muteMinutes(args, cfg("MUTE_MINUTES"));
+  if (!minutes) {
+    return say(
+      `Usage: /mute [minutes] — a whole number from 1 to ${MUTE_MAX_MINUTES}, or nothing for the configured default.`,
+      reply
+    );
+  }
+  const until = Date.now() + minutes * 60 * 1000;
+  try {
+    setMute(stateDir, until);
+  } catch (err) {
+    console.error(`herdr-telegram-notify: could not mute: ${err.message}`);
+    return say(`✗ could not mute: ${err.message}`, reply);
+  }
+  console.log(`herdr-telegram-notify: muted from the chat for ${minutes} min`);
+  return say(`🔕 Muted for ${minutes} min, until ${clockTime(new Date(until))}. /unmute lifts it.`, reply);
+}
+
 // --------------------------------------------------------------- dispatch
 
 async function deliver(reply) {
@@ -136,7 +269,7 @@ async function deliver(reply) {
       reply.replyTo
         ? `I have no pane recorded for message ${reply.replyTo}. Only notifications sent while replies were running can be answered (${known} of them right now).`
         : "Reply to one of my notifications and I will pass it to that agent.",
-      reply.messageId
+      reply
     );
     return;
   }
@@ -156,8 +289,49 @@ async function deliver(reply) {
         ? `no agent is running in ${paneId} now`
         : `${paneId} is running a different agent session now`;
     console.log(`herdr-telegram-notify: refused a reply to ${paneId}: ${reason}`);
-    await say(`✗ not delivered — ${reason}. Reply to a newer notification from that agent.`, reply.messageId);
+    await say(`✗ not delivered — ${reason}. Reply to a newer notification from that agent.`, reply);
     return;
+  }
+
+  // A blocked agent is answered with keystrokes into whatever prompt is on its
+  // screen, so that prompt has to be the one the notification asked about. The
+  // session check above does not cover this: the same agent can have been
+  // answered in the terminal and be standing at the next question already, and
+  // an approval written for the first would be typed into the second. The
+  // question key — the blocked stretch it was asked in, and the screen it was
+  // asked on — is that question's identity.
+  //
+  // It is checked from both ends, because each catches what the other cannot. A
+  // notification about a question can only be delivered into that same question:
+  // if the agent has moved on, or the pane is no longer blocked at all, the
+  // answer is refused rather than quietly becoming a new turn — "yes" meant for
+  // an approval is not a prompt. A notification about anything else — a finished
+  // turn, most of them — is delivered as a new turn as before, unless the pane
+  // has since blocked, in which case there is a question in the way that nobody
+  // wrote that reply for.
+  //
+  // ponytail: the check and the keystrokes are two acts, not one. The agent can
+  // be answered at the keyboard in the moment between them and the text lands in
+  // whatever came next; nothing here can close that window, only narrow it.
+  // Closing it needs herdr to type conditionally.
+  if (target.question || live.status === "blocked") {
+    const asking = live.status === "blocked" ? questionOnScreen(stateDir, paneId) : undefined;
+    const reason = !target.question
+      ? `${paneId} is waiting on a question that notification was not about`
+      : live.status !== "blocked"
+        ? `${paneId} is not waiting on that question any more`
+        : target.question === QUESTION_UNKNOWN
+          ? `I did not record what ${paneId} was waiting on when that went out`
+          : !asking
+            ? `I cannot read what ${paneId} is waiting on now`
+            : asking !== target.question
+              ? `${paneId} is not waiting on that question any more`
+              : undefined;
+    if (reason) {
+      console.log(`herdr-telegram-notify: refused a reply to ${paneId}: ${reason}`);
+      await say(`✗ not delivered — ${reason}. Reply to the newest notification from that agent.`, reply);
+      return;
+    }
   }
 
   const text = reply.text.slice(0, MAX_TEXT);
@@ -166,12 +340,12 @@ async function deliver(reply) {
     const res = herdrRun(args);
     if (!res.ok) {
       console.error(`herdr-telegram-notify: ${args.join(" ")} failed: ${res.why}`);
-      await say(`✗ ${paneId}: ${res.why}`, reply.messageId);
+      await say(`✗ ${paneId}: ${res.why}`, reply);
       return;
     }
   }
   console.log(`herdr-telegram-notify: delivered a reply to ${paneId} (${status ?? "status unknown"})`);
-  await say(status === "blocked" ? `→ typed into ${paneId}` : `→ sent to ${paneId}`, reply.messageId);
+  await say(status === "blocked" ? `→ typed into ${paneId}` : `→ sent to ${paneId}`, reply);
 }
 
 // ------------------------------------------------------------------- loop
@@ -190,8 +364,13 @@ const saveOffset = () => {
 console.log(`herdr-telegram-notify: polling for replies (pid ${process.pid})`);
 for (;;) {
   // Re-read on every pass, so turning REPLIES off in the .env stops this without
-  // anyone having to find the process.
-  if (!isOn(loadConfig()("REPLIES"))) {
+  // anyone having to find the process — and so who may reply is read fresh too:
+  // a chat id or an allowlist edited here takes someone's access away at the
+  // next poll rather than at the next restart. An id removed from the file is
+  // read as removed, not as missing: nothing then matches, which is the way
+  // round this should fail.
+  cfg = loadConfig();
+  if (!isOn(cfg("REPLIES"))) {
     console.log("herdr-telegram-notify: REPLIES is off, stopping the poller");
     break;
   }
@@ -207,10 +386,35 @@ for (;;) {
     continue;
   }
 
+  // Again, now the poll is back: it can have been open for a minute, and what
+  // may be dispatched is decided on the config as it is when the batch arrives
+  // rather than as it was before the wait. An allowlist edited while this was
+  // holding the line is in force for what that line brings back, and so is the
+  // switch itself: replies turned off during the poll deliver nothing from it.
+  cfg = loadConfig();
+  chatId = cfg("TELEGRAM_CHAT_ID");
+  const stopping = !isOn(cfg("REPLIES"));
+
   for (const update of updates.result ?? []) {
+    // Counted as seen even when nothing is done with it: off means not
+    // delivered, not delivered at the next start.
     offset = Math.max(offset, update.update_id + 1);
+    if (stopping) continue;
     const reply = usableReply(update, chatId, cfg("REPLY_ALLOWED_USER_IDS"));
-    if (reply) await deliver(reply);
+    if (!reply) continue;
+    const command = botCommand(reply.text, botUsername);
+    if (command) {
+      // Addressed to another bot, or to no name this bot answers to: not ours to
+      // answer, and not text to hand an agent either.
+      if (command.mine) await runCommand(command, reply);
+      else console.log(`herdr-telegram-notify: ignored ${reply.text.split(/\s+/)[0]}, addressed elsewhere`);
+      continue;
+    }
+    await deliver(reply);
   }
   saveOffset();
+  if (stopping) {
+    console.log("herdr-telegram-notify: REPLIES is off, stopping the poller");
+    break;
+  }
 }

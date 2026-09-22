@@ -15,10 +15,12 @@ import {
   fstatSync,
   closeSync,
   unlinkSync,
+  rmSync,
+  chmodSync,
 } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 
 
@@ -262,7 +264,25 @@ export function herdr(args, timeout = 4000) {
   return res.stdout;
 }
 
+// Every workspace, pane and agent herdr knows about. The notifier reads one per
+// run and the poller one per /status, so it lives here rather than in either.
+export function loadSnapshot() {
+  const out = herdr(["api", "snapshot"]);
+  if (!out) return undefined;
+  try {
+    return JSON.parse(out).result?.snapshot;
+  } catch {
+    return undefined;
+  }
+}
+
 // ------------------------------------------------ formatting the message
+
+const STATUS_EMOJI = { done: "✅", blocked: "⚠️", working: "⏳", idle: "💤" };
+
+export function statusEmoji(status) {
+  return STATUS_EMOJI[status] ?? "🔔";
+}
 
 export const TELEGRAM_LIMIT = 4096;
 
@@ -553,6 +573,32 @@ export function cropScreen(rows) {
   return sliced(chosen);
 }
 
+// A blocked agent's question lives on screen, not in the transcript.
+export function screenTail(paneId, maxLines) {
+  // More rows than will be shown: finding the column boundary is a question
+  // about the shape of the whole screen, and a handful of rows cannot answer it.
+  const rows = Math.max(maxLines * 2, 24);
+  const out = herdr(["pane", "read", paneId, "--lines", String(rows), "--format", "text"]);
+  if (!out) return undefined;
+
+  // Escapes and box drawing go first and column positions are kept: a vertical
+  // rule between two columns has to read as blank space before the gutter it
+  // sits in can be seen at all.
+  const screen = out
+    .split("\n")
+    .map((line) => line.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, "").replace(/[─-╿▀-▟]/g, " ").replace(/\s+$/, ""));
+
+  const lines = cropScreen(screen)
+    // Only now: with one column in hand, the runs of spaces left in a row are
+    // its own alignment rather than the wall between it and the next column.
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    // Drop separators and the agent's own chrome: the empty input prompt and
+    // the shortcut hint line under it carry nothing worth a notification.
+    .filter((line) => line && !/^[·•\-–—_=.]+$/.test(line) && !/^[❯>]$/.test(line) && !/^⏵/.test(line));
+  const tail = lines.slice(-maxLines).join("\n");
+  return tail || undefined;
+}
+
 // ---------------------------------------------------------------- locking
 
 // Several copies of this plugin run at once by design: one hook process per
@@ -760,7 +806,97 @@ export function writeLines(path, entries) {
     } catch {}
     return;
   }
-  writeFileSync(path, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+  // These lines hold what an agent said and what was on its screen, so they are
+  // this user's to read. The mode is set on creation, and a file an older
+  // version left behind is narrowed first — before the content goes in, not
+  // after, and if that cannot be done it is not written at all.
+  try {
+    chmodSync(path, 0o600);
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+  }
+  writeFileSync(path, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`, { mode: 0o600 });
+}
+
+// ------------------------------------------------------- recorded status
+
+// One file per pane, written by the notifier on every status change. The poller
+// reads them too, so the naming lives here rather than in either.
+export function sanitizeKey(raw) {
+  return String(raw).replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
+export function readState(stateDir, key) {
+  if (!stateDir) return {};
+  try {
+    return JSON.parse(readFileSync(join(stateDir, `state-${key}.json`), "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+export function writeState(stateDir, key, state) {
+  if (!stateDir) return;
+  try {
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(join(stateDir, `state-${key}.json`), JSON.stringify(state));
+  } catch {}
+}
+
+// Which blocked stretch a pane is in: the moment it entered `blocked`, which is
+// a new one every time it leaves and comes back. The screen cannot tell two of
+// those apart — an agent that asks the same question twice draws the same
+// pixels — so this is what keeps a notification answerable only inside the
+// stretch it was sent from.
+export function blockedEpisode(stateDir, paneId) {
+  if (!paneId) return undefined;
+  const state = readState(stateDir, sanitizeKey(paneId));
+  return state?.status === "blocked" && state.updatedAt ? state.updatedAt : undefined;
+}
+
+// ------------------------------------------------------------------ mute
+
+// One file in the state dir holding the moment the silence ends. The plugin's
+// mute action writes it, the bot's /mute command writes it, the notifier and the
+// doctor read it — so it lives here rather than in whichever wrote it first.
+// Muted messages are dropped rather than queued: you asked not to be told, not
+// to be told all at once in an hour.
+export const MUTE_DEFAULT_MINUTES = 60;
+
+// Longest a mute may run. A week is already "I am on holiday"; past that it is a
+// typo, and a mute nobody remembers setting is worse than a missed message.
+export const MUTE_MAX_MINUTES = 7 * 24 * 60;
+
+export function mutedUntil(stateDir) {
+  if (!stateDir) return 0;
+  try {
+    const until = JSON.parse(readFileSync(join(stateDir, "mute.json"), "utf8"))?.until;
+    return Number.isFinite(until) && until > Date.now() ? until : 0;
+  } catch {
+    return 0;
+  }
+}
+
+// Set, not toggled: the caller says what it wants and gets it, so repeating a
+// command is not a coin flip. A falsy `until` clears the mute. Throws rather
+// than swallowing, because a mute you believe in but that was never written is
+// the bad way for this to fail.
+export function setMute(stateDir, until) {
+  const path = join(stateDir, "mute.json");
+  if (!until) return rmSync(path, { force: true });
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(path, JSON.stringify({ until }));
+}
+
+// How long `/mute [minutes]` asks for: the argument when there is one, the
+// configured default when there is not. A whole positive number of minutes
+// inside the ceiling, or nothing — `/mute 30min`, `/mute -5` and `/mute 1e9` are
+// typos, and taking a working number out of one would hide it behind a silence
+// nobody chose. Anything past the first argument is a sentence, not a command.
+export function muteMinutes(args, configured) {
+  if (args.length > 1) return undefined;
+  const minutes = args.length ? toInt(args[0], undefined) : toInt(configured, MUTE_DEFAULT_MINUTES);
+  return minutes && minutes <= MUTE_MAX_MINUTES ? minutes : undefined;
 }
 
 // ------------------------------------------------------ replies from the chat
@@ -781,13 +917,52 @@ export function sessionKey(session) {
   return session?.value ? `${session.kind ?? "?"}:${session.value}` : undefined;
 }
 
-// Which pane each sent notification was about — and which agent session was in
-// it, since the pane alone is a moving target. Written by the notifier, read by
-// the poller.
-export function rememberMessage(stateDir, messageId, paneId, session) {
+// The question a blocked agent is waiting on, as one comparable string: which
+// blocked stretch it is in, and what is on its screen, hashed. The notifier
+// records it with the notification, the poller checks it is still the question
+// being asked before typing an answer into it. Both halves are needed and
+// neither implies the other — a pane can walk on to a different question inside
+// one stretch, and it can come back to an identical question in a later one.
+// A fixed number of lines rather than SCREEN_LINES: the two ends have to crop
+// the same screen the same way, and the config can be edited in between.
+//
+// Nothing here is recorded without the episode, so a pane whose transitions
+// were never recorded is unanswerable rather than answerable by screen alone.
+//
+// ponytail: the whole screen tail is the question's identity, so a pane that
+// redraws anything in those lines refuses the reply it was waiting for. Refusing
+// is the safe half of the trade; narrow it to the prompt block if it fires in
+// practice.
+const QUESTION_LINES = 12;
+
+// Recorded in place of the key when a blocked notification's question cannot be
+// fingerprinted — an unrecorded transition, or a screen that does not read. It
+// matches no question, which is the point: without it the notification is
+// indistinguishable from one about a finished turn, and a reply to it would be
+// delivered as a new turn once the agent walked on.
+export const QUESTION_UNKNOWN = "blocked:unknown";
+
+export function questionOnScreen(stateDir, paneId) {
+  const episode = blockedEpisode(stateDir, paneId);
+  const screen = episode ? screenTail(paneId, QUESTION_LINES) : undefined;
+  return screen ? `${episode}:${createHash("sha256").update(screen).digest("hex").slice(0, 16)}` : undefined;
+}
+
+// Which pane each sent notification was about — which agent session was in it,
+// since the pane alone is a moving target, and which question it was waiting on
+// when it was one, since a session outlives the question too. Written by the
+// notifier, read by the poller.
+export function rememberMessage(stateDir, messageId, paneId, session, question, full) {
   const path = messageMapPath(stateDir);
   if (!path || !messageId || !paneId) return;
-  const entry = { id: messageId, paneId, session: sessionKey(session), at: Date.now() };
+  const entry = {
+    id: messageId,
+    paneId,
+    session: sessionKey(session),
+    question,
+    full: full ? String(full) : undefined,
+    at: Date.now(),
+  };
   // Read, add, write: a hook sending live and a sweeper draining a queue can
   // land here at the same moment, and whoever wrote second would drop the
   // other's message from the map — a notification in the chat that nobody can
@@ -835,7 +1010,14 @@ export function usableReply(update, chatId, allowedUserIds) {
   if (allowed === false || (allowed !== undefined && message.sender_chat)) return undefined;
   const text = String(message.text ?? "").trim();
   if (!text) return undefined;
-  return { text, messageId: message.message_id, replyTo: message.reply_to_message?.message_id };
+  // The topic is carried so the answer goes back to the thread the command was
+  // written in; in a group without topics there is none and Telegram wants none.
+  return {
+    text,
+    messageId: message.message_id,
+    replyTo: message.reply_to_message?.message_id,
+    threadId: message.message_thread_id,
+  };
 }
 
 // How the reply reaches the pane. A blocked agent is sitting at a prompt that
@@ -850,6 +1032,60 @@ export function replyCommands(paneId, status, text) {
     ];
   }
   return [["agent", "prompt", paneId, text]];
+}
+
+// The commands the bot takes: the only messages that do anything without being
+// a reply, and the only text that is ever read as an instruction rather than
+// handed to an agent. A fixed list, so a message that merely begins with a slash
+// runs nothing — what is not on it falls through to the reply path as text.
+// Telegram addresses a command to a named bot when several share a chat, and
+// then only that bot should answer; an unaddressed one is for whoever is
+// listening.
+const COMMANDS = ["/status", "/mute", "/unmute", "/full"];
+
+export function botCommand(text, botUsername) {
+  const [first = "", ...args] = String(text ?? "").trim().split(/\s+/);
+  const [command, addressed, ...extra] = first.toLowerCase().split("@");
+  if (!COMMANDS.includes(command)) return undefined;
+  // `mine` says whether to answer it, not whether it is one: a command with a
+  // suffix — another bot's name, this bot's misspelt, or no name at all — is
+  // addressed at a bot either way, and handing it to an agent as text is the one
+  // thing it must not do.
+  const mine = addressed === undefined || (!extra.length && Boolean(botUsername) && addressed === String(botUsername).toLowerCase());
+  return { command, args, mine };
+}
+
+// Most agents one answer names — past this it stops being something you read on
+// a phone, and the count says what was left out.
+const STATUS_AGENTS_MAX = 20;
+const STATUS_ORDER = ["blocked", "working", "done", "idle"];
+
+// The herd on demand: what each agent is, where it is, what it is doing and the
+// pane to reach it in. Blocked first, because the reason to ask is usually
+// whether anyone is waiting on you.
+export function herdStatusText(snap) {
+  if (!snap) return "I cannot reach herdr right now.";
+  const agents = (snap.agents ?? []).filter((a) => a.pane_id);
+  if (!agents.length) return "No agents are running.";
+
+  const labelOf = (a) =>
+    (snap.workspaces ?? []).find((w) => w.workspace_id === a.workspace_id)?.label ?? a.workspace_id ?? "?";
+  const rank = (a) => {
+    const i = STATUS_ORDER.indexOf(a.agent_status);
+    return i === -1 ? STATUS_ORDER.length : i;
+  };
+
+  const lines = [...agents]
+    .sort((a, b) => rank(a) - rank(b))
+    .slice(0, STATUS_AGENTS_MAX)
+    .map((a) => {
+      const status = String(firstDefined(a.agent_status, "unknown"));
+      const name = clip(String(firstDefined(a.display_agent, a.agent, "agent")), 24);
+      return `${statusEmoji(status)} ${name} · ${clip(String(labelOf(a)), 32)} · ${status} · ${a.pane_id}`;
+    });
+  const more = agents.length - lines.length;
+  if (more > 0) lines.push(`… and ${more} more`);
+  return lines.join("\n");
 }
 
 // -------------------------------------------------- reading a transcript

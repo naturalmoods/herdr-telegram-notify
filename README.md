@@ -4,9 +4,10 @@ A Herdr plugin that sends a Telegram message when an agent finishes (`done`)
 or needs input (`blocked`). Each message tells you which agent it was, what it
 worked on, and what it said.
 
-You can also reply from Telegram. The plugin sends your text back to the agent,
-so you can answer a prompt like `1. Yes` from your phone. Replies are off by
-default; see [Replying from the chat](#replying-from-the-chat).
+You can also reply from Telegram, check agent status with `/status`, mute
+notifications with `/mute`, and download a notification's saved response with
+`/full`. Set `REPLIES=1` to enable replies and commands; they are off by default.
+See [Replying from the chat](#replying-from-the-chat) and [Commands](#commands).
 
 Requires Herdr 0.8 or newer, Node 18+, and Linux. Herdr's server does not inherit
 your shell's PATH, so `run.sh` locates Node itself, including nvm, fnm, volta and
@@ -134,6 +135,14 @@ Reply routing has these restrictions:
 - The original agent session must still be running in that pane. The plugin
   refuses replies if the session has changed, the agent has left, or the
   notification predates session tracking.
+- Blocked replies must match the recorded waiting episode and screen. The
+  plugin refuses them if the question changes, the agent leaves that waiting
+  episode, or the screen could not be recorded. This also prevents an old
+  approval from becoming a new turn after the agent moves on. Screen redraws
+  can cause a refusal even if the question looks unchanged.
+
+  Checking and typing are separate operations. Answering at the keyboard
+  between those steps can still send the Telegram reply to the next prompt.
 - `REPLY_ALLOWED_USER_IDS` optionally limits replies to a comma-separated list
   of Telegram user ids. By default, anyone in the configured chat can reply.
   Set this in groups if only certain members should control agents.
@@ -146,13 +155,67 @@ Messages from the wrong chat or outside the allowlist get no answer.
 
 The reply poller runs in a separate process. It starts on the next status change
 after you enable `REPLIES` and stops on the next poll after you disable it.
+It rereads `REPLIES`, `TELEGRAM_CHAT_ID` and `REPLY_ALLOWED_USER_IDS` once
+before each poll and again when the poll returns, so removing someone from the
+allowlist takes their access away without a restart, even mid-poll. Turning
+`REPLIES` off during a poll drops what that poll returns rather than delivering
+it at the next start.
 A lock allows only one poller at a time. Check it with
 `herdr plugin action invoke doctor`; its log is `replies.log` in the state
 directory.
 
+### Commands
+
+Commands require `REPLIES=1` and use the same chat and user allowlist as replies.
+Responses return to the forum topic where you asked.
+
+| Command | Result |
+| --- | --- |
+| `/status` | List agents with their workspace, state and pane id. |
+| `/mute` | Mute notifications for `MUTE_MINUTES` (default 60). |
+| `/mute 30` | Mute notifications for 30 minutes. |
+| `/unmute` | Turn notifications back on. |
+| `/full` | Reply to a notification to download its saved response as a text file. |
+
+Only `/mute` accepts an argument. Extra arguments on the other commands produce
+a usage message without changing anything. In groups, you can address your bot
+with `/status@yourbot`; the same syntax works for the other commands. Supported
+commands addressed to another bot, or with a malformed suffix, are ignored.
+Other text follows the normal notification-reply rules.
+
+`/status` lists blocked agents first, followed by working agents and the rest:
+
+```
+⚠️ pi · api · blocked · wB:p2
+⏳ claude · storefront · working · wA:p1
+💤 claude · docs · idle · wA:p3
+```
+
+The list shows up to 20 agents and reports how many were omitted. It does not
+control any panes and reports an error if Herdr cannot be reached.
+
+`/full` sends the response saved before `LAST_MESSAGE_CHARS` and Telegram's
+message limit shortened it. It uses the text captured for that notification,
+including queued notifications, so later turns do not replace it. The command
+never reaches an agent or reads a live pane.
+
+Saved responses are available for up to 24 hours, within the last 300
+notifications. Older notifications, reminders and blocked-screen notifications
+may have no saved response; the bot explains when nothing is available.
+Notification and queue files are stored with owner-only permissions.
+
 ## Muting it
 
-The mute action toggles notifications, so one key handles both mute and unmute:
+From Telegram, use `/mute` for the configured duration or `/mute 30` for thirty
+minutes. Explicit durations must be whole numbers from 1 to 10080 (one week).
+Invalid values leave the current mute unchanged.
+
+Repeating `/mute 30` starts a fresh thirty-minute mute; it never toggles
+notifications back on. Use `/unmute` to end it early. Command confirmations and
+replies to agents still work while notifications are muted.
+
+At the keyboard, the mute action toggles notifications instead, so one key
+handles both mute and unmute:
 
 ```toml
 # ~/.config/herdr/config.toml
@@ -164,7 +227,9 @@ description = "mute/unmute Telegram notifications"
 ```
 
 You can also run `herdr plugin action invoke mute`. A Herdr notification confirms
-the change. `MUTE_MINUTES` sets the duration, one hour by default.
+the change. `MUTE_MINUTES` sets the duration, one hour by default. The action and
+the commands share one mute: `/unmute` lifts one set from the keyboard, and the
+action lifts one set from the chat.
 
 Muted notifications are dropped, not queued for later. The plugin still records
 status changes so it can calculate turn durations after the mute ends.
