@@ -107,8 +107,8 @@ export function loadEnvFile(dir) {
   }
 }
 
-// Keys the plugin reads that have no default: the two required ones, and the one
-// only the mute action looks at.
+// Keys the plugin reads that have no default: the two required ones, and the
+// mute length the mute action and a bare /mute use.
 export const EXTRA_KEYS = ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "MUTE_MINUTES"];
 
 // A .env key nobody reads is silent by nature: SHOW_TOKEN looks exactly like a
@@ -213,8 +213,6 @@ export function configProblems(cfg) {
   return problems;
 }
 
-// Undefined when the list is empty — "nothing said", which is not the same
-
 export function isOn(value) {
   return ["1", "true", "yes", "on"].includes(String(value ?? "").toLowerCase());
 }
@@ -252,6 +250,17 @@ export function herdrBin() {
     if (candidate && existsSync(candidate)) return candidate;
   }
   return "herdr";
+}
+
+// Herdr's server may not have the shell's PATH, the same way it does not have
+// node's — so `git` gets the same treatment. The notifier runs it and the
+// doctor checks it, so both ask here and cannot disagree about which git.
+export function gitBin() {
+  const candidates = [process.env.GIT_BIN_PATH, "/usr/bin/git", "/usr/local/bin/git", "/opt/homebrew/bin/git"];
+  for (const candidate of candidates) {
+    if (candidate && existsSync(candidate)) return candidate;
+  }
+  return "git";
 }
 
 export function herdr(args, timeout = 4000) {
@@ -293,6 +302,7 @@ export const HEAD_LINE_CHARS = 300;
 // Below it, collapsing costs a tap and saves nothing.
 export const EXPANDABLE_QUOTE_CHARS = 300;
 
+// Undefined when the list is empty — "nothing said", which is not the same
 // answer as "said no".
 export function listMatches(list, ...values) {
   const wanted = String(list ?? "")
@@ -483,6 +493,37 @@ export function buildMessage(parts) {
     message = render(body);
   }
   return message;
+}
+
+// Where every Telegram call goes. Overridable so a test can point a real run at
+// a local stub; nothing in normal use sets it.
+export const TELEGRAM_API = process.env.TELEGRAM_API_BASE ?? "https://api.telegram.org";
+
+// One Telegram Bot API call, for the notifier, the poller and the doctor alike.
+// Never throws: a request that never landed comes back as status 0 with the
+// reason, redacted, since the token is in the URL any fetch error quotes. The
+// raw text is kept beside the parsed body for the caller that logs it.
+export async function telegramCall(token, method, payload, timeoutMs) {
+  // A document is multipart, and fetch writes that header itself — it carries a
+  // boundary only it knows. Everything else is JSON.
+  const form = payload instanceof FormData;
+  try {
+    const res = await fetch(`${TELEGRAM_API}/bot${token}/${method}`, {
+      method: "POST",
+      ...(form ? {} : { headers: { "content-type": "application/json" } }),
+      body: form ? payload : JSON.stringify(payload ?? {}),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const text = await res.text().catch(() => "");
+    let json = {};
+    try {
+      json = JSON.parse(text) ?? {};
+    } catch {}
+    return { status: res.status, text, json };
+  } catch (err) {
+    const description = redact(err?.message ?? err, token);
+    return { status: 0, text: description, json: { ok: false, description } };
+  }
 }
 
 // Worth another go: a connection that never landed (status 0), a rate limit, or
@@ -853,6 +894,15 @@ export function blockedEpisode(stateDir, paneId) {
   const state = readState(stateDir, sanitizeKey(paneId));
   return state?.status === "blocked" && state.updatedAt ? state.updatedAt : undefined;
 }
+
+// ---------------------------------------------------------------- pending
+
+// Messages the network was down for. Kept short and few on purpose: a queue that
+// grows without limit answers a wifi coming back with a wall of notifications,
+// and a `done` from this morning is history rather than news. The notifier
+// keeps the queue and the doctor counts it, so both read the same limits.
+export const PENDING_TTL = 6 * 60 * 60 * 1000;
+export const PENDING_MAX = 20;
 
 // ------------------------------------------------------------------ mute
 

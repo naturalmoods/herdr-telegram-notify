@@ -4,7 +4,7 @@
 // report goes to stdout, which is where `herdr plugin log list` keeps it, with a
 // one-line verdict in a Herdr notification.
 
-import { existsSync, statSync, readFileSync, writeFileSync, unlinkSync, mkdirSync } from "node:fs";
+import { existsSync, statSync, writeFileSync, unlinkSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { hostname } from "node:os";
 import { spawnSync } from "node:child_process";
@@ -12,15 +12,18 @@ import { spawnSync } from "node:child_process";
 import {
   DEFAULTS,
   EXTRA_KEYS,
+  PENDING_TTL,
   configProblems,
   flockBin,
   flockHeld,
+  gitBin,
   herdr,
   herdrBin,
   isOn,
   loadConfig,
   mutedUntil,
-  redact,
+  readLines,
+  telegramCall,
   toInt,
 } from "./lib.mjs";
 
@@ -44,7 +47,7 @@ if (snapshot) {
   bad("herdr", `${herdrBin()} did not answer — the message loses its title, project and herd lines`);
 }
 
-const gitVersion = spawnSync("git", ["--version"], { encoding: "utf8", timeout: 3000 });
+const gitVersion = spawnSync(gitBin(), ["--version"], { encoding: "utf8", timeout: 3000 });
 if (!gitVersion.error && gitVersion.status === 0) ok("git", gitVersion.stdout.trim());
 else bad("git", "not runnable — the ✎ changed-files line will be missing");
 
@@ -130,10 +133,10 @@ if (!stateDir) {
   }
   const until = mutedUntil(stateDir);
   if (until) bad("muted", `nothing will be sent until ${new Date(until).toLocaleTimeString()}`);
-  try {
-    const waiting = readFileSync(join(stateDir, "pending.jsonl"), "utf8").split("\n").filter((l) => l.trim()).length;
-    if (waiting) bad("queued", `${waiting} message(s) waiting for the network to come back`);
-  } catch {}
+  // Counted the way the queue itself reads: what has aged out will never be
+  // sent, so it is not waiting on anything.
+  const waiting = readLines(join(stateDir, "pending.jsonl")).filter((e) => e?.parts && e.at > Date.now() - PENDING_TTL).length;
+  if (waiting) bad("queued", `${waiting} message(s) waiting for the network to come back`);
 
   // The poller is a separate process, so "configured" and "running" are two
   // different questions and the second is the one that matters.
@@ -163,17 +166,8 @@ if (!stateDir) {
 // ------------------------------------------------------------- and Telegram
 
 async function callTelegram(method, payload) {
-  try {
-    const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(payload ?? {}),
-      signal: AbortSignal.timeout(8000),
-    });
-    return { status: res.status, body: await res.json().catch(() => ({})) };
-  } catch (err) {
-    return { status: 0, body: { description: redact(err?.message ?? err, token) } };
-  }
+  const res = await telegramCall(token, method, payload, 8000);
+  return { status: res.status, body: res.json };
 }
 
 if (token && chatId) {
