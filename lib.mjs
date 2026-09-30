@@ -55,6 +55,8 @@ export const DEFAULTS = {
   REPLIES: "0",
   REPLY_ALLOWED_USER_IDS: "",
   MARK_RESOLVED: "1",
+  WHISPER_BIN: "",
+  WHISPER_MODEL: "small",
   BOARD: "0",
   DEBUG: "0",
   DRY_RUN: "0",
@@ -252,6 +254,25 @@ export function herdrBin() {
     if (candidate && existsSync(candidate)) return candidate;
   }
   return "herdr";
+}
+
+// The speech-to-text a voice message needs, when this machine has one: the
+// openai-whisper CLI or whisper-ctranslate2, which takes the same arguments.
+// Looked for on PATH and in ~/.local/bin, where pipx and uv put them — Herdr's
+// server may not have the shell's PATH. Nothing is installed for it: without
+// one a voice message is refused with a line saying so. WHISPER_BIN names it
+// outright, and one named but missing is missing, not a cue to look elsewhere.
+const WHISPER_NAMES = ["whisper-ctranslate2", "whisper"];
+
+export function whisperBin(named = process.env.WHISPER_BIN) {
+  if (named) return existsSync(named) ? named : undefined;
+  const dirs = [...String(process.env.PATH ?? "").split(":"), join(homedir(), ".local", "bin"), "/usr/local/bin", "/usr/bin"];
+  for (const name of WHISPER_NAMES) {
+    for (const dir of dirs) {
+      if (dir && existsSync(join(dir, name))) return join(dir, name);
+    }
+  }
+  return undefined;
 }
 
 // Herdr's server may not have the shell's PATH, the same way it does not have
@@ -1136,8 +1157,10 @@ export function usableReply(update, chatId, allowedUserIds) {
   if (!message || String(message.chat?.id ?? "") !== String(chatId)) return undefined;
   const allowed = listMatches(allowedUserIds, message.from?.id);
   if (allowed === false || (allowed !== undefined && message.sender_chat)) return undefined;
-  const text = String(message.text ?? "").trim();
-  if (!text) return undefined;
+  // A photo or a file carries its words as a caption, not as text.
+  const text = String(message.text ?? message.caption ?? "").trim();
+  const file = attachmentOf(message);
+  if (!text && !file) return undefined;
   // The topic is carried so the answer goes back to the thread the command was
   // written in; in a group without topics there is none and Telegram wants none.
   return {
@@ -1145,7 +1168,40 @@ export function usableReply(update, chatId, allowedUserIds) {
     messageId: message.message_id,
     replyTo: message.reply_to_message?.message_id,
     threadId: message.message_thread_id,
+    ...(file ? { file } : {}),
   };
+}
+
+// Files an agent can do something with: pictures it can look at, and documents
+// it can read. What is not on the list is refused by name rather than saved.
+export const ATTACHMENT_TYPES = ["jpg", "jpeg", "png", "gif", "webp", "md", "txt", "pdf", "docx"];
+
+// Telegram hands bots files up to this size and no larger.
+export const ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024;
+
+// A photo arrives in several sizes, smallest first, and without a name; a
+// document with the name it was sent under — which is the sender's to choose,
+// so only its letters, digits and dots survive, and never a directory.
+export function attachmentOf(message) {
+  // A voice note is not a file to pass on but words to transcribe; see replies.mjs.
+  const voice = message?.voice;
+  if (voice?.file_id) {
+    return { fileId: voice.file_id, name: `voice-${message.message_id}.ogg`, size: voice.file_size, voice: true };
+  }
+  const photo = message?.photo?.at(-1);
+  if (photo?.file_id) {
+    return { fileId: photo.file_id, name: `photo-${message.message_id}.jpg`, size: photo.file_size };
+  }
+  const doc = message?.document;
+  if (!doc?.file_id) return undefined;
+  const base = String(doc.file_name ?? "file").split(/[\\/]/).pop();
+  const safe = base.replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "").slice(-80) || "file";
+  return { fileId: doc.file_id, name: `${message.message_id}-${safe}`, size: doc.file_size };
+}
+
+export function attachmentAllowed(name) {
+  const ext = /\.([^.]+)$/.exec(name)?.[1]?.toLowerCase();
+  return Boolean(ext && ATTACHMENT_TYPES.includes(ext));
 }
 
 // How the reply reaches the pane. A blocked agent is sitting at a prompt that

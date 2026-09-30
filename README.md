@@ -132,6 +132,28 @@ marked as selected (`❯`, `›`, `>`); a numbered list in the agent's prose has
 marker and gets no buttons. Buttons need `SHOW_SCREEN_ON_BLOCKED`, since they
 are read from that screen, and disappear once the question is answered.
 
+A photo or a file sent as a reply goes to the agent as a new turn: the caption,
+then `Attached file: <path>`. Photos and `jpg`, `png`, `gif`, `webp`, `md`,
+`txt`, `pdf` and `docx` files are accepted, up to Telegram's 20 MB limit for
+bots. Anything else is refused before it is downloaded. Files are saved under
+`files/` in the state directory with owner-only permissions and deleted after a
+day. A blocked agent does not accept files, since the path would be typed into
+its prompt; answer the question first. The file is outside the agent's project,
+so the agent may ask for permission to read it.
+
+A voice message sent as a reply is transcribed and sent as a new turn, and the
+bot answers with what it heard: `🎙 “run the tests again” → sent to wA:p1`.
+This needs a local whisper CLI, either `openai-whisper`
+(`pipx install openai-whisper`) or `whisper-ctranslate2`, plus `ffmpeg`.
+For `whisper-ctranslate2`, pin PyAV below 19, which faster-whisper 1.2 cannot
+open files with: `uv tool install whisper-ctranslate2 --with 'av<19'`.
+Transcription always runs on the CPU. The
+plugin looks for one on PATH and in `~/.local/bin`; `WHISPER_BIN` names it
+directly. `WHISPER_MODEL` picks the model, `small` by default; the first voice
+message downloads it, which can take a while. Without a whisper CLI, voice
+messages are refused with a note saying so. `doctor` reports which one it
+found.
+
 Reply routing has these restrictions:
 
 - Messages must come from `TELEGRAM_CHAT_ID`. The plugin ignores other chats
