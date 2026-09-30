@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.9.0
 
 - Mark notifications the agent has moved past. A blocked notification becomes
   `✓ answered` or `✓ no longer waiting` and loses its screen; a finished turn
