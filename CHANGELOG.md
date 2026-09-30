@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.10.0
 
 - Reply with a photo or a file to send it to that agent. The caption and the
   saved file's path arrive as a new turn. Photos and `jpg`, `png`, `gif`,
