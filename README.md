@@ -1,23 +1,49 @@
 # herdr-telegram-notify
 
-A Herdr plugin that sends a Telegram message when an agent finishes (`done`)
-or needs input (`blocked`). Each message tells you which agent it was, what it
-worked on, and what it said.
+A Herdr plugin that messages you on Telegram when an agent finishes (`done`) or
+needs input (`blocked`), and lets you answer that agent from the chat.
 
-You can also reply from Telegram, check agent status with `/status`, mute
-notifications with `/mute`, and download a notification's saved response with
-`/full`. Set `REPLIES=1` to enable replies and commands; they are off by default.
-See [Replying from the chat](#replying-from-the-chat) and [Commands](#commands).
+## Features
 
-Requires Herdr 0.8 or newer, Node 18+, and Linux. Herdr's server does not inherit
-your shell's PATH, so `run.sh` locates Node itself, including nvm, fnm, volta and
+- [**Notifications**](#the-message) with the session title, the prompt the turn
+  started from, workspace, branch, uncommitted changes, duration, tokens and
+  cost, the agent's last message, and what the other agents are doing. A
+  blocked agent's notification shows its screen, where the question is.
+- [**Replies**](#replying-from-the-chat): reply to a notification and the text
+  reaches that agent, typed into its prompt if it is blocked or sent as a new
+  turn if not. Replies to a finished session or an old question are refused.
+- [**Buttons**](#buttons) for a blocked agent's menu, so `1. Yes` is one tap.
+- [**Files, photos**](#files-and-photos) and [**voice
+  messages**](#voice-messages) sent back to the agent. Voice is transcribed
+  with a local whisper CLI if you have one.
+- [**Commands**](#commands): `/status` for the herd, `/mute` and `/unmute`,
+  and `/full` for a response too long for one message.
+- [**Notifications that update themselves**](#keeping-the-chat-current): a
+  question answered at the keyboard becomes `✓ answered`, a finished turn you
+  looked at becomes `👀 seen at the desk`.
+- [**A pinned herd board**](#keeping-the-chat-current), edited in place on
+  every status change.
+- [**Less noise**](#behavior): quiet hours, a minimum turn length, workspace
+  filters, a mute on a key, and a forum topic per workspace.
+- [**Retries and reminders**](#failed-sends): a message the network was down
+  for is queued and sent later, and an agent left blocked can get one
+  reminder.
+- [**`doctor`**](#checking-the-setup) checks the setup and names config typos.
+
+Replies, buttons, files, voice and commands need `REPLIES=1`, which is off by
+default.
+
+## Requirements
+
+Herdr 0.8 or newer, Node 18+, and Linux. Herdr's server does not inherit your
+shell's PATH, so `run.sh` locates Node itself, including nvm, fnm, volta and
 mise installs.
 
 Linux is required for `flock(1)` from util-linux. Hook processes, the reply
 poller and the sweeper share a state directory and use kernel locks to protect
-it. These locks are released when a process dies. Without `flock`, notifications
-still send, but failed messages are not queued, replies cannot be routed, and
-neither background process starts. `doctor` checks for it.
+it. These locks are released when a process dies. Without `flock`,
+notifications still send, but failed messages are not queued, replies cannot be
+routed, and neither background process starts. `doctor` checks for it.
 
 ## Install
 
@@ -125,35 +151,6 @@ to that agent.
 For a blocked agent, the plugin types the reply and presses Enter, so `1` picks
 the first option. Other agents receive the reply as a new turn.
 
-When the blocked screen shows a menu, the notification carries one button per
-option. A tap sends that option's number exactly as a typed reply would, through
-the same checks below. A menu is numbered lines starting at `1.`, one of them
-marked as selected (`❯`, `›`, `>`); a numbered list in the agent's prose has no
-marker and gets no buttons. Buttons need `SHOW_SCREEN_ON_BLOCKED`, since they
-are read from that screen, and disappear once the question is answered.
-
-A photo or a file sent as a reply goes to the agent as a new turn: the caption,
-then `Attached file: <path>`. Photos and `jpg`, `png`, `gif`, `webp`, `md`,
-`txt`, `pdf` and `docx` files are accepted, up to Telegram's 20 MB limit for
-bots. Anything else is refused before it is downloaded. Files are saved under
-`files/` in the state directory with owner-only permissions and deleted after a
-day. A blocked agent does not accept files, since the path would be typed into
-its prompt; answer the question first. The file is outside the agent's project,
-so the agent may ask for permission to read it.
-
-A voice message sent as a reply is transcribed and sent as a new turn, and the
-bot answers with what it heard: `🎙 “run the tests again” → sent to wA:p1`.
-This needs a local whisper CLI, either `openai-whisper`
-(`pipx install openai-whisper`) or `whisper-ctranslate2`, plus `ffmpeg`.
-For `whisper-ctranslate2`, pin PyAV below 19, which faster-whisper 1.2 cannot
-open files with: `uv tool install whisper-ctranslate2 --with 'av<19'`.
-Transcription always runs on the CPU. The
-plugin looks for one on PATH and in `~/.local/bin`; `WHISPER_BIN` names it
-directly. `WHISPER_MODEL` picks the model, `small` by default; the first voice
-message downloads it, which can take a while. Without a whisper CLI, voice
-messages are refused with a note saying so. `doctor` reports which one it
-found.
-
 Reply routing has these restrictions:
 
 - Messages must come from `TELEGRAM_CHAT_ID`. The plugin ignores other chats
@@ -198,6 +195,55 @@ update to only one reader of a bot, and each machine records only its own
 notifications, so with a shared bot a reply can reach the machine that did not
 send the notification and be refused. `replies.log` shows the conflict as a
 `409` from `getUpdates`. Machines that only send notifications can share a bot.
+
+### Buttons
+
+When the blocked screen shows a menu, the notification carries one button per
+option. A tap sends that option's number exactly as a typed reply would,
+through the same checks. A menu is numbered lines starting at `1.`, one of them
+marked as selected (`❯`, `›`, `>`); a numbered list in the agent's prose has no
+marker and gets no buttons. Buttons are read from the screen, so they need
+`SHOW_SCREEN_ON_BLOCKED`. They disappear once the question is answered.
+
+### Files and photos
+
+A photo or a file sent as a reply goes to the agent as a new turn: the caption,
+then `Attached file: <path>`. Photos and `jpg`, `png`, `gif`, `webp`, `md`,
+`txt`, `pdf` and `docx` files are accepted, up to Telegram's 20 MB limit for
+bots. Anything else is refused before it is downloaded.
+
+Files are saved under `files/` in the state directory with owner-only
+permissions and deleted after a day. The file is outside the agent's project,
+so the agent may ask for permission to read it. A blocked agent does not accept
+files, since the path would be typed into its prompt; answer the question
+first.
+
+### Voice messages
+
+A voice message sent as a reply is transcribed and sent as a new turn. The bot
+answers with what it heard:
+
+```
+🎙 “run the tests again”
+→ sent to wA:p1
+```
+
+Transcription needs a local whisper CLI and `ffmpeg`. Either of these works:
+
+```
+pipx install openai-whisper
+uv tool install whisper-ctranslate2 --with 'av<19'
+```
+
+`whisper-ctranslate2` needs the `av<19` pin because faster-whisper 1.2 cannot
+open files with PyAV 19.
+
+The plugin looks for the CLI on PATH and in `~/.local/bin`, or uses
+`WHISPER_BIN` if set. `WHISPER_MODEL` picks the model, `small` by default. The
+first voice message downloads the model, which can take a while.
+Transcription always runs on the CPU. Without a whisper CLI, the bot refuses
+voice messages and says why; `doctor` reports which CLI it found. Like files,
+voice messages are not delivered to a blocked agent.
 
 ### Commands
 
@@ -430,7 +476,8 @@ herdr plugin action invoke doctor
 ```
 
 `doctor` checks Node, the `herdr`, `git` and `flock` binaries, config permissions,
-active settings, the state directory and bot credentials. It sends one silent
+active settings, the state directory and bot credentials. With `REPLIES=1` it
+also checks the reply poller and which whisper CLI it found. It sends one silent
 test message to verify the token and chat id together. The report appears in
 `herdr plugin log list`, with a verdict in a Herdr notification. You can bind it
 to a key like the mute action.
