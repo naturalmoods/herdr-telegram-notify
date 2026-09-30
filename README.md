@@ -125,6 +125,13 @@ to that agent.
 For a blocked agent, the plugin types the reply and presses Enter, so `1` picks
 the first option. Other agents receive the reply as a new turn.
 
+When the blocked screen shows a menu, the notification carries one button per
+option. A tap sends that option's number exactly as a typed reply would, through
+the same checks below. A menu is numbered lines starting at `1.`, one of them
+marked as selected (`❯`, `›`, `>`); a numbered list in the agent's prose has no
+marker and gets no buttons. Buttons need `SHOW_SCREEN_ON_BLOCKED`, since they
+are read from that screen, and disappear once the question is answered.
+
 Reply routing has these restrictions:
 
 - Messages must come from `TELEGRAM_CHAT_ID`. The plugin ignores other chats
@@ -192,10 +199,12 @@ Other text follows the normal notification-reply rules.
 `/status` lists blocked agents first, followed by working agents and the rest:
 
 ```
-⚠️ pi · api · blocked · wB:p2
-⏳ claude · storefront · working · wA:p1
+⚠️ pi · api · blocked since 14:20 · wB:p2
+⏳ claude · storefront · working since 14:31 · wA:p1
 💤 claude · docs · idle · wA:p3
 ```
+
+The time appears when the plugin recorded that agent's change of state.
 
 The list shows up to 20 agents and reports how many were omitted. It does not
 control any panes and reports an error if Herdr cannot be reached.
@@ -209,6 +218,40 @@ Saved responses are available for up to 24 hours, within the last 300
 notifications. Older notifications, reminders and blocked-screen notifications
 may have no saved response; the bot explains when nothing is available.
 Notification and queue files are stored with owner-only permissions.
+
+## Keeping the chat current
+
+With `MARK_RESOLVED=1` (the default), a notification is edited once the
+agent's next status change overtakes it, so what still looks like a
+notification in the chat is what is still waiting on you:
+
+| Notification | Next status | Marked |
+| --- | --- | --- |
+| Blocked, or its reminder | `working` | `✓ answered · 14:32` |
+| Blocked, or its reminder | anything else | `✓ no longer waiting · 14:32` |
+| Any other | `idle` (seen in the focused UI) | `👀 seen at the desk · 14:32` |
+| Any other | `working` | `↷ on to the next turn · 14:32` |
+
+The line goes above the header. A blocked notification also loses its screen
+and its buttons, because that question is no longer being asked. Replies to a
+marked notification follow the usual rules, so an answered question still
+refuses them. Each notification is edited at most once, and only while it is in
+the reply map (24 hours, the last 300).
+
+`BOARD=1` keeps one pinned message listing the herd, like `/status`, with the
+time each agent entered its state:
+
+```
+🐑 workbench · updated 14:32
+⚠️ pi · api · blocked since 14:20 · wB:p2
+⏳ claude · storefront · working since 14:31 · wA:p1
+```
+
+It is edited in place on every status change, so it never rings, and it goes
+to `TELEGRAM_TOPIC_ID`'s topic when set. If you delete it, the next change sends
+and pins a new one. In a group the bot needs admin rights to pin; without them
+the board still updates, unpinned. A closed pane raises no status change, so
+set `SWEEP_MINUTES` to refresh the board on a timer too. Off by default.
 
 ## Muting it
 

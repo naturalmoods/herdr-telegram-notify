@@ -54,6 +54,8 @@ export const DEFAULTS = {
   IGNORE_WORKSPACES: "",
   REPLIES: "0",
   REPLY_ALLOWED_USER_IDS: "",
+  MARK_RESOLVED: "1",
+  BOARD: "0",
   DEBUG: "0",
   DRY_RUN: "0",
 };
@@ -640,6 +642,30 @@ export function screenTail(paneId, maxLines) {
   return tail || undefined;
 }
 
+// A menu on a blocked agent's screen: numbered choices from 1 up, one of them
+// marked as the current selection. The marker is what tells a menu from a
+// numbered list in the agent's prose, which a button would turn into an answer
+// to a question nobody asked. The last menu on screen wins, since the question
+// is at the bottom.
+const OPTION_LINE = /^([❯›>▶→]\s*)?(\d{1,2})[.)]\s+(\S.*)$/;
+
+export function screenOptions(screen) {
+  let options = [];
+  let marked = false;
+  for (const line of String(screen ?? "").split("\n")) {
+    const match = OPTION_LINE.exec(line.trim());
+    if (!match) continue;
+    if (match[2] === "1") {
+      options = [];
+      marked = false;
+    }
+    if (Number(match[2]) !== options.length + 1) continue;
+    options.push({ n: match[2], label: match[3] });
+    marked ||= Boolean(match[1]);
+  }
+  return marked && options.length >= 2 ? options : [];
+}
+
 // ---------------------------------------------------------------- locking
 
 // Several copies of this plugin run at once by design: one hook process per
@@ -1002,7 +1028,7 @@ export function questionOnScreen(stateDir, paneId) {
 // since the pane alone is a moving target, and which question it was waiting on
 // when it was one, since a session outlives the question too. Written by the
 // notifier, read by the poller.
-export function rememberMessage(stateDir, messageId, paneId, session, question, full) {
+export function rememberMessage(stateDir, messageId, paneId, session, question, full, parts) {
   const path = messageMapPath(stateDir);
   if (!path || !messageId || !paneId) return;
   const entry = {
@@ -1011,6 +1037,9 @@ export function rememberMessage(stateDir, messageId, paneId, session, question, 
     session: sessionKey(session),
     question,
     full: full ? String(full) : undefined,
+    // What the message was built from, so it can be rebuilt with a line saying
+    // it has been overtaken — see closeMessages().
+    parts,
     at: Date.now(),
   };
   // Read, add, write: a hook sending live and a sweeper draining a queue can
@@ -1027,6 +1056,36 @@ export function rememberMessage(stateDir, messageId, paneId, session, question, 
       `herdr-telegram-notify: message ${messageId} was sent but not recorded, so a reply to it cannot be routed: ${err.message}`
     );
   }
+}
+
+// The notifications about a pane that its latest status change has overtaken:
+// the question it was waiting on is gone, or the turn it reported is over and
+// another has begun, or it was seen at the desk. Taken off the open list here,
+// under the lock, so two hooks never both claim one; the caller edits them.
+// At most once: an edit that fails leaves the message as it was, which is how
+// it looked before this existed.
+export function closeMessages(stateDir, paneId) {
+  const path = messageMapPath(stateDir);
+  if (!path || !paneId) return [];
+  let closed = [];
+  withFileLock(join(stateDir, "messages.lock"), () => {
+    const entries = readMessageMap(stateDir);
+    closed = entries.filter((e) => e.paneId === paneId && e.parts && !e.closed);
+    if (!closed.length) return;
+    for (const e of closed) e.closed = Date.now();
+    writeLines(path, entries);
+  });
+  return closed;
+}
+
+// What an overtaken notification says it became. The status is the pane's new
+// one; the notification is a question when it carried one.
+export function resolvedLine(entry, status, at = new Date()) {
+  const when = clockTime(at);
+  if (entry.question) return status === "working" ? `✓ answered · ${when}` : `✓ no longer waiting · ${when}`;
+  if (status === "idle") return `👀 seen at the desk · ${when}`;
+  if (status === "working") return `↷ on to the next turn · ${when}`;
+  return `↷ overtaken · ${when}`;
 }
 
 export function readMessageMap(stateDir) {
@@ -1054,6 +1113,25 @@ export function targetForMessage(stateDir, messageId) {
 // sender_chat, with either no `from` at all or Telegram's shared
 // GroupAnonymousBot id, so there is no one to check against the list.
 export function usableReply(update, chatId, allowedUserIds) {
+  // A button under a notification is a reply to it that the bot wrote the text
+  // of: the same chat and sender checks, and only a menu number gets through —
+  // callback data is whatever the client sends, not necessarily what the
+  // button said.
+  const query = update?.callback_query;
+  if (query) {
+    const message = query.message;
+    if (!message || String(message.chat?.id ?? "") !== String(chatId)) return undefined;
+    if (listMatches(allowedUserIds, query.from?.id) === false) return undefined;
+    const data = String(query.data ?? "");
+    if (!/^\d{1,2}$/.test(data)) return undefined;
+    return {
+      text: data,
+      messageId: message.message_id,
+      replyTo: message.message_id,
+      threadId: message.message_thread_id,
+      callbackId: query.id,
+    };
+  }
   const message = update?.message;
   if (!message || String(message.chat?.id ?? "") !== String(chatId)) return undefined;
   const allowed = listMatches(allowedUserIds, message.from?.id);
@@ -1112,8 +1190,10 @@ const STATUS_ORDER = ["blocked", "working", "done", "idle"];
 
 // The herd on demand: what each agent is, where it is, what it is doing and the
 // pane to reach it in. Blocked first, because the reason to ask is usually
-// whether anyone is waiting on you.
-export function herdStatusText(snap) {
+// whether anyone is waiting on you. With the state directory, each status says
+// when it began — as a clock time, so a pinned copy of this does not go stale
+// between edits the way "12m" would.
+export function herdStatusText(snap, stateDir) {
   if (!snap) return "I cannot reach herdr right now.";
   const agents = (snap.agents ?? []).filter((a) => a.pane_id);
   if (!agents.length) return "No agents are running.";
@@ -1131,7 +1211,11 @@ export function herdStatusText(snap) {
     .map((a) => {
       const status = String(firstDefined(a.agent_status, "unknown"));
       const name = clip(String(firstDefined(a.display_agent, a.agent, "agent")), 24);
-      return `${statusEmoji(status)} ${name} · ${clip(String(labelOf(a)), 32)} · ${status} · ${a.pane_id}`;
+      // Only when the recorded status is the one herdr reports: a transition
+      // this plugin never saw would otherwise lend its time to another.
+      const recorded = stateDir ? readState(stateDir, sanitizeKey(a.pane_id)) : {};
+      const since = recorded.status === status && recorded.updatedAt ? ` since ${clockTime(new Date(recorded.updatedAt))}` : "";
+      return `${statusEmoji(status)} ${name} · ${clip(String(labelOf(a)), 32)} · ${status}${since} · ${a.pane_id}`;
     });
   const more = agents.length - lines.length;
   if (more > 0) lines.push(`… and ${more} more`);

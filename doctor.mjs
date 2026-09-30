@@ -109,6 +109,7 @@ for (const [key, what] of [
   ["BLOCKED_REMINDER_MINUTES", "a blocked agent is nudged again after this"],
   ["SWEEP_MINUTES", "the queue and the reminders are swept this often"],
   ["REPLIES", "a reply in the chat is passed to that agent"],
+  ["BOARD", "a pinned message lists the herd"],
   ["TELEGRAM_TOPIC_ID", "default forum topic"],
   ["TELEGRAM_TOPICS", "per-workspace forum topics"],
 ]) {

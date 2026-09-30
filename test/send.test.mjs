@@ -17,11 +17,13 @@ const NOTIFY = join(HERE, "..", "notify.mjs");
 // Answers the scripted replies in order, then OK for anything after them.
 async function fakeTelegram(script = []) {
   const sent = [];
+  const methods = [];
   const server = createServer((req, res) => {
     let body = "";
     req.on("data", (chunk) => (body += chunk));
     req.on("end", () => {
       sent.push(JSON.parse(body || "{}"));
+      methods.push(req.url.split("/").pop());
       const next = script.shift() ?? { status: 200 };
       res.writeHead(next.status, { "content-type": "application/json" });
       res.end(
@@ -30,7 +32,7 @@ async function fakeTelegram(script = []) {
     });
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  return { sent, base: `http://127.0.0.1:${server.address().port}`, close: () => server.close() };
+  return { sent, methods, base: `http://127.0.0.1:${server.address().port}`, close: () => server.close() };
 }
 
 function fakeHerdr(dir, agents = [], readsScreen = true) {
@@ -42,7 +44,13 @@ function fakeHerdr(dir, agents = [], readsScreen = true) {
   writeFileSync(
     path,
     `#!/bin/sh
-[ "$1" = pane ] && { ${readsScreen ? 'echo "Do you want to create notes.md?"; echo " 1. Yes"; exit 0' : "exit 1"}; }
+[ "$1" = pane ] && { ${
+    typeof readsScreen === "string"
+      ? `cat <<'SCREEN'\n${readsScreen}\nSCREEN\nexit 0`
+      : readsScreen
+        ? 'echo "Do you want to create notes.md?"; echo " 1. Yes"; exit 0'
+        : "exit 1"
+  }; }
 [ "$1" = api ] || exit 1
 cat <<'JSON'
 ${JSON.stringify(snapshot)}
@@ -323,5 +331,123 @@ test("a blocked agent's screen is not kept as its response — it is a pane, not
     assert.ok(remembered(fx)[0]?.question, "a blocked notification still records its question");
   } finally {
     tg.close();
+  }
+});
+
+test("a question answered at the keyboard is marked so in the chat, once, and loses its screen", async () => {
+  const tg = await fakeTelegram();
+  const fx = fixture(["SHOW_SCREEN_ON_BLOCKED=1"]);
+  try {
+    await hook(fx, tg.base, "wA:p1", { status: "blocked" });
+    const { out } = await hook(fx, tg.base, "wA:p1", { status: "working" });
+    assert.deepEqual(tg.methods, ["sendMessage", "editMessageText"], out);
+    assert.equal(tg.sent[1].message_id, 1);
+    assert.match(tg.sent[1].text, /^✓ answered · \d\d:\d\d/);
+    assert.match(tg.sent[1].text, /claude · blocked/); // still says what it was
+    assert.ok(!/Do you want/.test(tg.sent[1].text), "the old question is still shown as if it were asked");
+    // Closed now: the next change has nothing of this pane's left to mark.
+    await hook(fx, tg.base, "wA:p1", { status: "done" });
+    assert.equal(tg.methods.filter((m) => m === "editMessageText").length, 1);
+  } finally {
+    tg.close();
+  }
+});
+
+test("a finished turn seen at the desk says so, and MARK_RESOLVED=0 leaves the chat alone", async () => {
+  const tg = await fakeTelegram();
+  const fx = fixture();
+  const offTg = await fakeTelegram();
+  const offFx = fixture(["MARK_RESOLVED=0"]);
+  try {
+    await hook(fx, tg.base, "wA:p1");
+    // Another pane's change marks nothing of this one.
+    await hook(fx, tg.base, "wA:p2", { status: "working" });
+    const { out } = await hook(fx, tg.base, "wA:p1", { status: "idle" });
+    assert.deepEqual(tg.methods, ["sendMessage", "editMessageText"], out);
+    assert.match(tg.sent[1].text, /^👀 seen at the desk/);
+
+    await hook(offFx, offTg.base, "wA:p1");
+    await hook(offFx, offTg.base, "wA:p1", { status: "idle" });
+    assert.deepEqual(offTg.methods, ["sendMessage"]);
+  } finally {
+    tg.close();
+    offTg.close();
+  }
+});
+
+test("the board is sent and pinned once, then edited in place, and replaced when it is gone", async () => {
+  const agents = [
+    { pane_id: "wA:p1", agent: "claude", agent_status: "done" },
+    { pane_id: "wA:p2", agent: "pi", agent_status: "blocked" },
+  ];
+  const tg = await fakeTelegram();
+  const fx = fixture(["BOARD=1", "MARK_RESOLVED=0"], agents);
+  try {
+    const first = await hook(fx, tg.base, "wA:p1");
+    assert.deepEqual(tg.methods, ["sendMessage", "pinChatMessage", "sendMessage"], first.out);
+    assert.equal(tg.sent[0].disable_notification, true); // the board never rings
+    assert.match(tg.sent[0].text, /⚠️ pi · \? · blocked · wA:p2/); // blocked first; no recorded change, no time
+    // p1's change was recorded before the board was drawn, so it carries a time.
+    assert.match(tg.sent[0].text, /done since \d\d:\d\d · wA:p1/);
+    assert.equal(tg.sent[1].message_id, 1);
+
+    await hook(fx, tg.base, "wA:p1", { status: "working" });
+    assert.equal(tg.methods[3], "editMessageText");
+    assert.equal(tg.sent[3].message_id, 1);
+    assert.equal(tg.methods.length, 4, "a working change sent something besides the board");
+  } finally {
+    tg.close();
+  }
+
+  // Deleted in the chat: the edit is refused, and a new board takes its place.
+  const gone = await fakeTelegram([{ status: 400, body: { ok: false, description: "Bad Request: message to edit not found" } }]);
+  try {
+    const { out } = await hook(fx, gone.base, "wA:p1", { status: "done" });
+    assert.deepEqual(gone.methods.slice(0, 3), ["editMessageText", "sendMessage", "pinChatMessage"], out);
+  } finally {
+    gone.close();
+  }
+});
+
+test("a blocked agent's menu comes as buttons when replies are on, and goes when it is answered", async () => {
+  const menu = "Do you want to create notes.md?\n❯ 1. Yes\n  2. Yes, and don't ask again\n  3. No, and tell Claude what to do differently";
+  const tg = await fakeTelegram();
+  const fx = fixture(["REPLIES=1"], [], menu);
+  const offTg = await fakeTelegram();
+  const offFx = fixture([], [], menu);
+  // REPLIES=1 starts the poller too, against the same fake; only the notifier's
+  // own calls are looked at.
+  const calls = (t, method) => t.sent.filter((_, i) => t.methods[i] === method);
+  try {
+    const { out } = await hook(fx, tg.base, "wA:p1", { status: "blocked" });
+    const keyboard = calls(tg, "sendMessage")[0]?.reply_markup?.inline_keyboard;
+    assert.deepEqual(
+      keyboard?.map(([b]) => b.callback_data),
+      ["1", "2", "3"],
+      out
+    );
+    assert.equal(keyboard[0][0].text, "1. Yes");
+    assert.ok(keyboard[2][0].text.length <= 48);
+    // Answered: the edit carries no keyboard, so the buttons go with the question.
+    await hook(fx, tg.base, "wA:p1", { status: "working" });
+    const edits = calls(tg, "editMessageText");
+    assert.equal(edits.length, 1);
+    assert.equal(edits[0].reply_markup, undefined);
+
+    // Nobody is listening for the tap without REPLIES.
+    await hook(offFx, offTg.base, "wA:p1", { status: "blocked" });
+    assert.equal(offTg.sent[0].reply_markup, undefined);
+  } finally {
+    let log = "";
+    try {
+      log = readFileSync(join(fx.stateDir, "replies.log"), "utf8");
+    } catch {}
+    for (const [, pid] of log.matchAll(/polling for replies \(pid (\d+)\)/g)) {
+      try {
+        process.kill(Number(pid), "SIGKILL");
+      } catch {}
+    }
+    tg.close();
+    offTg.close();
   }
 });

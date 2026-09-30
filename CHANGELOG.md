@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Mark notifications the agent has moved past. A blocked notification becomes
+  `✓ answered` or `✓ no longer waiting` and loses its screen; a finished turn
+  becomes `👀 seen at the desk` or `↷ on to the next turn`. On by default;
+  `MARK_RESOLVED=0` leaves the chat as sent.
+- Add `BOARD=1`: one pinned message listing the herd, edited in place on every
+  status change and on each sweep.
+- `/status` shows when each agent entered its state, where the plugin recorded it.
+- Blocked notifications carry one button per option when the screen shows a
+  menu and `REPLIES=1`. A tap goes through the same checks as a typed reply.
+  The reply poller must be restarted to receive taps.
+
 ## 0.8.1
 
 - Fix blocked reminders being starved by panes that cannot be nudged. Panes

@@ -180,7 +180,7 @@ async function runCommand({ command, args }, reply) {
 
   if (command === "/status") {
     console.log("herdr-telegram-notify: answered /status");
-    return say(herdStatusText(loadSnapshot()), reply);
+    return say(herdStatusText(loadSnapshot(), stateDir), reply);
   }
 
   // Set, not toggled, unlike the plugin's mute action: the person typing this is
@@ -368,7 +368,7 @@ for (;;) {
 
   const updates = await telegram(
     "getUpdates",
-    { offset, timeout: POLL_SECONDS, allowed_updates: ["message"] },
+    { offset, timeout: POLL_SECONDS, allowed_updates: ["message", "callback_query"] },
     (POLL_SECONDS + 10) * 1000
   );
   if (!updates?.ok) {
@@ -401,6 +401,13 @@ for (;;) {
     if (stopping) continue;
     const reply = usableReply(update, chatId, cfg("REPLY_ALLOWED_USER_IDS"));
     if (!reply) continue;
+    if (reply.callbackId) {
+      // Told first, so the button stops spinning; what happened to the answer
+      // comes as a reply to the notification, like a typed one.
+      await telegram("answerCallbackQuery", { callback_query_id: reply.callbackId }, 10_000);
+      await deliver(reply);
+      continue;
+    }
     const command = botCommand(reply.text, botUsername);
     if (command) {
       // Addressed to another bot, or to no name this bot answers to: not ours to

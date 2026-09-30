@@ -41,6 +41,7 @@ import {
   redact,
   retryAfterMs,
   screenColumns,
+  screenOptions,
   toInt,
   toolSummary,
   topicFor,
@@ -670,4 +671,41 @@ test("blockedEpisode names the stretch a pane is blocked in, and only that", () 
   assert.equal(blockedEpisode(dir, "wA:p1"), undefined);
   assert.equal(blockedEpisode(dir, "wZ:p9"), undefined);
   assert.equal(blockedEpisode(undefined, "wA:p1"), undefined);
+});
+
+test("screenOptions reads the marked menu at the bottom and nothing else", () => {
+  const menu = "Do you want to make this edit?\n❯ 1. Yes\n2. No, tell Claude what to do differently";
+  assert.deepEqual(screenOptions(menu), [
+    { n: "1", label: "Yes" },
+    { n: "2", label: "No, tell Claude what to do differently" },
+  ]);
+  // A numbered list in prose has no selection marker, so it is not a menu.
+  assert.deepEqual(screenOptions("Plan:\n1. Fix the test\n2. Ship it\nShall I go ahead?"), []);
+  // The prose list above a real menu does not leak into it.
+  assert.deepEqual(
+    screenOptions(`1. Fix the test\n2. Ship it\n3. Tidy up\n${menu}`).map((o) => o.label),
+    ["Yes", "No, tell Claude what to do differently"]
+  );
+  // One choice is not a choice; a gap in the numbers is not a menu line.
+  assert.deepEqual(screenOptions("❯ 1. Yes"), []);
+  assert.deepEqual(screenOptions("❯ 1. Yes\n3. Maybe\n2. No").map((o) => o.n), ["1", "2"]);
+  assert.deepEqual(screenOptions(undefined), []);
+});
+
+test("usableReply takes a button tap as a reply to the message it sits under", () => {
+  const tap = (over = {}) => ({
+    callback_query: { id: "q1", from: { id: 7 }, data: "2", message: { message_id: 100, chat: { id: 42 } }, ...over },
+  });
+  assert.deepEqual(usableReply(tap(), 42), {
+    text: "2",
+    messageId: 100,
+    replyTo: 100,
+    threadId: undefined,
+    callbackId: "q1",
+  });
+  assert.equal(usableReply(tap({ data: "2; rm -rf ~" }), 42), undefined);
+  assert.equal(usableReply(tap({ message: { message_id: 100, chat: { id: 99 } } }), 42), undefined);
+  assert.equal(usableReply(tap({ message: undefined }), 42), undefined);
+  assert.equal(usableReply(tap(), 42, "8"), undefined);
+  assert.equal(usableReply(tap(), 42, "7")?.text, "2");
 });
