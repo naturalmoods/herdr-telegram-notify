@@ -7,7 +7,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, rmSync, chmodSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, rmSync, chmodSync, existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -47,6 +47,7 @@ function parseMultipart(body, contentType) {
 async function fakeTelegram(batches, { onSend, onPoll, refuse } = {}) {
   const sent = [];
   const polls = [];
+  const files = [];
   const waiting = new Set();
   const server = createServer((req, res) => {
     // Collected as bytes and decoded once: a document is UTF-8, and a chunk
@@ -63,6 +64,15 @@ async function fakeTelegram(batches, { onSend, onPoll, refuse } = {}) {
         res.end(JSON.stringify(json));
       };
       if (req.url.endsWith("/getMe")) return answer({ ok: true, result: { username: BOT } });
+      // A file is asked for by id and then fetched from where Telegram says it is.
+      if (req.url.endsWith("/getFile")) {
+        files.push(payload.file_id);
+        return answer({ ok: true, result: { file_id: payload.file_id, file_path: `docs/${payload.file_id}` } });
+      }
+      if (req.url.includes("/file/bot")) {
+        res.writeHead(200);
+        return res.end(`bytes of ${req.url.split("/").pop()}`);
+      }
       if (req.url.endsWith("/getUpdates")) {
         polls.push(payload);
         onPoll?.(payload); // while the poll is open, before its batch is handed over
@@ -81,6 +91,7 @@ async function fakeTelegram(batches, { onSend, onPoll, refuse } = {}) {
   return {
     sent,
     polls,
+    files,
     base: `http://127.0.0.1:${server.address().port}`,
     close: () => {
       for (const res of waiting) res.destroy();
@@ -1090,5 +1101,163 @@ test("a button under a blocked notification is typed in like a reply, and only a
     assert.equal(tg.sent[1].reply_to_message_id, 100); // under the notification it was tapped on
   } finally {
     tg.close();
+  }
+});
+
+// ------------------------------------------------------------ attachments
+
+// A photo or a file sent as a reply, as Telegram delivers one.
+const withFile = (id, attachment, caption) => ({
+  update_id: id,
+  message: {
+    message_id: id * 10,
+    chat: { id: CHAT },
+    from: { id: 7 },
+    reply_to_message: { message_id: 100 },
+    ...(caption ? { caption } : {}),
+    ...attachment,
+  },
+});
+
+test("a photo or a document reaches the agent as a file it can open", async () => {
+  const tg = await fakeTelegram([
+    [
+      withFile(1, { photo: [{ file_id: "small" }, { file_id: "large", file_size: 900 }] }, "this is what I see"),
+      withFile(2, { document: { file_id: "doc", file_name: "../../Spec v2.docx", file_size: 5000 } }),
+    ],
+  ]);
+  const fx = fixture({
+    agents: { "wA:p1": { agent_status: "done", agent_session: { kind: "id", value: "s1" } } },
+    messages: [{ id: 100, paneId: "wA:p1", session: "id:s1" }],
+  });
+  try {
+    await runPoller(fx, tg.base, { until: () => tg.sent.length >= 2 });
+    assert.deepEqual(tg.files, ["large", "doc"]); // the biggest size of the photo
+    const photo = join(fx.stateDir, "files", "photo-10.jpg");
+    // The sender names a document, not where it goes.
+    const doc = join(fx.stateDir, "files", "20-Spec_v2.docx");
+    assert.equal(readFileSync(photo, "utf8"), "bytes of large");
+    assert.equal(statSync(doc).mode & 0o777, 0o600);
+    // Read raw: ran() drops the blank line between the caption and the path.
+    const ran = readFileSync(join(fx.root, "herdr.log"), "utf8");
+    assert.ok(ran.includes(`agent prompt wA:p1 this is what I see\n\nAttached file: ${photo}`), ran);
+    assert.ok(ran.includes(`agent prompt wA:p1 Attached file: ${doc}`), ran);
+    assert.deepEqual(answers(tg), ["→ sent to wA:p1", "→ sent to wA:p1"]);
+  } finally {
+    tg.close();
+  }
+});
+
+test("a file of the wrong kind, or one sent at a question, is refused before it is fetched", async () => {
+  const tg = await fakeTelegram([
+    [
+      withFile(1, { document: { file_id: "exe", file_name: "setup.sh" } }),
+      withFile(2, { document: { file_id: "huge", file_name: "scan.pdf", file_size: 30 * 1024 * 1024 } }),
+      withFile(3, { document: { file_id: "cap", file_name: "notes.md" } }, "/status"),
+    ],
+  ]);
+  const fx = fixture({
+    agents: { "wA:p1": { agent_status: "done", agent_session: { kind: "id", value: "s1" } } },
+    messages: [{ id: 100, paneId: "wA:p1", session: "id:s1" }],
+  });
+  const blockedTg = await fakeTelegram([[withFile(1, { photo: [{ file_id: "p" }] })]]);
+  const blockedFx = fixture({
+    agents: { "wA:p1": { agent_status: "blocked", agent_session: { kind: "id", value: "s1" } } },
+    screens: { "wA:p1": "Do you want to create notes.md?\n ❯ 1. Yes\n 2. No" },
+  });
+  blockedFx.remember({ id: 100, paneId: "wA:p1", session: "id:s1", question: questionFor(blockedFx, "wA:p1") });
+  try {
+    await runPoller(fx, tg.base, { until: () => tg.sent.length >= 3 });
+    const [kind, size, captioned] = answers(tg);
+    assert.match(kind, /^✗ not delivered — I only pass on jpg, .*docx files/);
+    assert.match(size, /20 MB/);
+    // A caption that looks like a command is still the file's caption.
+    assert.match(captioned, /^→ sent to wA:p1/);
+    assert.deepEqual(tg.files, ["cap"], "a refused file was fetched anyway");
+
+    await runPoller(blockedFx, blockedTg.base, { until: () => blockedTg.sent.length >= 1 });
+    assert.match(answers(blockedTg)[0], /waiting on a question; answer it first/);
+    assert.deepEqual(blockedTg.files, []);
+    assert.ok(!blockedFx.ran().some((c) => c.startsWith("pane send-text")), "a file path was typed at a question");
+  } finally {
+    tg.close();
+    blockedTg.close();
+  }
+});
+
+// ------------------------------------------------------------------ voice
+
+// whisper as the poller calls it — `<audio> --model M --device cpu
+// --output_format txt --output_dir D` — writing D/<name>.txt; or failing, loudly the way openai-
+// whisper does without ffmpeg, or quietly the way whisper-ctranslate2 does
+// when it cannot decode the file: a traceback, exit 0, and nothing written.
+function fakeWhisper(dir, { fails = false, swallows = false } = {}) {
+  const path = join(dir, swallows ? "whisper-quiet" : "whisper");
+  writeFileSync(
+    path,
+    swallows
+      ? `#!/bin/sh\necho "Traceback (most recent call last):" >&2\necho "TypeError: open() got an unexpected keyword argument 'metadata_errors'" >&2\nexit 0\n`
+      : fails
+      ? `#!/bin/sh\necho "RuntimeError: ffmpeg was not found" >&2\nexit 1\n`
+      : `#!/bin/sh\necho "$@" > "${join(dir, "whisper.args")}"\nname=$(basename "$1")\nprintf '  yes,\\n carry on  \\n' > "$9/\${name%.*}.txt"\n`
+  );
+  chmodSync(path, 0o755);
+  return path;
+}
+
+const voiceNote = (id) => withFile(id, { voice: { file_id: `v${id}`, duration: 3, file_size: 4000 } });
+
+test("a voice message is transcribed, sent as a new turn, and what was heard is said back", async () => {
+  const tg = await fakeTelegram([[voiceNote(1)]]);
+  const root = mkdtempSync(join(tmpdir(), "whisper-"));
+  const fx = fixture({
+    agents: { "wA:p1": { agent_status: "done", agent_session: { kind: "id", value: "s1" } } },
+    messages: [{ id: 100, paneId: "wA:p1", session: "id:s1" }],
+    env: [`WHISPER_BIN=${fakeWhisper(root)}`, "WHISPER_MODEL=tiny"],
+  });
+  try {
+    await runPoller(fx, tg.base, { until: () => tg.sent.some((m) => m.method === "sendMessage") });
+    const audio = join(fx.stateDir, "files", "voice-10.ogg");
+    assert.equal(
+      readFileSync(join(root, "whisper.args"), "utf8").trim(),
+      `${audio} --model tiny --device cpu --output_format txt --output_dir ${join(fx.stateDir, "files")}`
+    );
+    assert.deepEqual(fx.ran(), ["agent get wA:p1", "agent prompt wA:p1 yes, carry on"]);
+    assert.deepEqual(
+      tg.sent.map((m) => m.method),
+      ["sendChatAction", "sendMessage"]
+    );
+    assert.equal(tg.sent[1].text, "🎙 “yes, carry on”\n→ sent to wA:p1");
+  } finally {
+    tg.close();
+  }
+});
+
+test("without a whisper, or with one that fails, a voice message is refused and says why", async () => {
+  const agents = { "wA:p1": { agent_status: "done", agent_session: { kind: "id", value: "s1" } } };
+  const messages = [{ id: 100, paneId: "wA:p1", session: "id:s1" }];
+  const root = mkdtempSync(join(tmpdir(), "whisper-"));
+  const missingTg = await fakeTelegram([[voiceNote(1)]]);
+  const missing = fixture({ agents, messages, env: ["WHISPER_BIN=/nonexistent/whisper"] });
+  const failingTg = await fakeTelegram([[voiceNote(1)]]);
+  const failing = fixture({ agents, messages, env: [`WHISPER_BIN=${fakeWhisper(root, { fails: true })}`] });
+  const quietTg = await fakeTelegram([[voiceNote(1)]]);
+  const quiet = fixture({ agents, messages, env: [`WHISPER_BIN=${fakeWhisper(root, { swallows: true })}`] });
+  try {
+    await runPoller(missing, missingTg.base, { until: () => missingTg.sent.length >= 1 });
+    assert.match(answers(missingTg)[0], /no whisper CLI on this machine/);
+    assert.deepEqual(missingTg.files, [], "a voice message nothing can transcribe was fetched");
+
+    await runPoller(failing, failingTg.base, { until: () => failingTg.sent.some((m) => m.method === "sendMessage") });
+    assert.match(answers(failingTg).at(-1), /could not transcribe it: whisper exited with 1: RuntimeError: ffmpeg was not found/);
+    assert.ok(!failing.ran().some((c) => c.startsWith("agent prompt")), "a failed transcript reached the agent");
+
+    // Exit 0 is not success when nothing was written and a traceback was.
+    await runPoller(quiet, quietTg.base, { until: () => quietTg.sent.some((m) => m.method === "sendMessage") });
+    assert.match(answers(quietTg).at(-1), /could not transcribe it: whisper failed: TypeError: open\(\) got an unexpected keyword/);
+  } finally {
+    missingTg.close();
+    failingTg.close();
+    quietTg.close();
   }
 });

@@ -19,6 +19,7 @@ import {
   gitBin,
   herdr,
   herdrBin,
+  whisperBin,
   isOn,
   loadConfig,
   mutedUntil,
@@ -149,6 +150,11 @@ if (!stateDir) {
     } else {
       bad("replies", "REPLIES is on but no poller is running; the next status change starts one");
     }
+    // Optional, so its absence is not a fault — unless one was named and is not there.
+    const whisper = whisperBin(cfg("WHISPER_BIN"));
+    if (whisper) ok("voice", `${whisper} transcribes voice messages (model ${cfg("WHISPER_MODEL")})`);
+    else if (cfg("WHISPER_BIN")) bad("voice", `WHISPER_BIN is ${cfg("WHISPER_BIN")}, which does not exist; voice messages are refused`);
+    else ok("voice", "no whisper CLI found, so voice messages are refused — pipx install openai-whisper to take them");
   }
 
   // Same two questions for the timer that sweeps the queue and the reminders.

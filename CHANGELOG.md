@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Reply with a photo or a file to send it to that agent. The caption and the
+  saved file's path arrive as a new turn. Photos and `jpg`, `png`, `gif`,
+  `webp`, `md`, `txt`, `pdf` and `docx` files up to 20 MB are accepted; files
+  are kept for a day under `files/` in the state directory, owner-only. Blocked
+  agents do not accept files.
+- Reply with a voice message to send its words to that agent. It is
+  transcribed with a local `openai-whisper` or `whisper-ctranslate2` CLI when
+  one is installed (`WHISPER_BIN`, `WHISPER_MODEL`), and the bot says back what
+  it heard. Nothing new is installed; without a whisper CLI, voice messages are
+  refused with a note. `doctor` reports what it found.
+
 ## 0.9.0
 
 - Mark notifications the agent has moved past. A blocked notification becomes

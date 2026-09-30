@@ -5,14 +5,19 @@
 // see README.md. One instance at a time, held by an flock on a file in the
 // state dir — so a poller that crashes takes its lock with it.
 
-import { readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { basename, join } from "node:path";
 import { spawnSync } from "node:child_process";
 
 import {
+  ATTACHMENT_MAX_BYTES,
+  ATTACHMENT_TYPES,
   MUTE_MAX_MINUTES,
   QUESTION_UNKNOWN,
+  TELEGRAM_API,
+  attachmentAllowed,
   botCommand,
+  clip,
   clockTime,
   flockAvailable,
   herdStatusText,
@@ -24,6 +29,7 @@ import {
   muteMinutes,
   questionOnScreen,
   readMessageMap,
+  redact,
   replyCommands,
   sanitizeKey,
   sessionKey,
@@ -31,6 +37,7 @@ import {
   targetForMessage,
   telegramCall,
   usableReply,
+  whisperBin,
 } from "./lib.mjs";
 
 const POLL_SECONDS = 50; // how long Telegram holds the request open with nothing to say
@@ -127,6 +134,72 @@ async function sendFull(target, to) {
     return say(`✗ could not send it: ${res?.description ?? "Telegram did not take the file"}`, to);
   }
   console.log(`herdr-telegram-notify: sent the full response for message ${target.id} (${target.full.length} chars)`);
+}
+
+// Where a file sent to an agent is kept, and for how long: long enough for the
+// turn it starts, not so long that the state directory becomes an archive of
+// everything ever sent from the phone.
+const filesDir = join(stateDir, "files");
+const FILE_TTL = 24 * 60 * 60 * 1000;
+
+// Asked for by id, then fetched by the path Telegram answers with. The token is
+// in that URL too, so what goes wrong is reported redacted.
+async function download(file) {
+  const meta = await telegram("getFile", { file_id: file.fileId }, 10_000);
+  if (!meta?.ok || !meta.result?.file_path) throw new Error(meta?.description ?? "Telegram did not say where the file is");
+  let res;
+  try {
+    res = await fetch(`${TELEGRAM_API}/file/bot${token}/${meta.result.file_path}`, { signal: AbortSignal.timeout(60_000) });
+  } catch (err) {
+    throw new Error(redact(err?.message ?? err, token));
+  }
+  if (!res.ok) throw new Error(`download failed with ${res.status}`);
+  const bytes = Buffer.from(await res.arrayBuffer());
+
+  mkdirSync(filesDir, { recursive: true, mode: 0o700 });
+  const now = Date.now();
+  for (const name of readdirSync(filesDir)) {
+    try {
+      if (now - statSync(join(filesDir, name)).mtimeMs > FILE_TTL) unlinkSync(join(filesDir, name));
+    } catch {}
+  }
+  // What someone sent from their phone is theirs to read, not the machine's.
+  const path = join(filesDir, file.name);
+  writeFileSync(path, bytes, { mode: 0o600 });
+  return path;
+}
+
+// A voice note, as the words in it. whisper writes <name>.txt into the output
+// dir it is given; the model is downloaded on its first use, which is the slow
+// one. Nothing here reaches a shell: the path and the model are arguments, not
+// a command line.
+const TRANSCRIBE_TIMEOUT = 5 * 60 * 1000;
+
+// ponytail: always the CPU. Left to choose, whisper-ctranslate2 picks a GPU it
+// finds even without the CUDA libraries to drive it, and fails or hangs there;
+// a voice note is seconds long, which the CPU handles in about as many. A
+// WHISPER_DEVICE setting is the upgrade if someone's notes are long.
+
+function transcribe(bin, path) {
+  const res = spawnSync(
+    bin,
+    [path, "--model", String(cfg("WHISPER_MODEL")), "--device", "cpu", "--output_format", "txt", "--output_dir", filesDir],
+    { encoding: "utf8", timeout: TRANSCRIBE_TIMEOUT, maxBuffer: 16 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] }
+  );
+  if (res.error) throw new Error(res.error.code === "ETIMEDOUT" ? "whisper took longer than five minutes" : res.error.message);
+  const last = String(res.stderr || res.stdout).trim().split("\n").at(-1);
+  if (res.status !== 0) throw new Error(`whisper exited with ${res.status}${last ? `: ${clip(last, 200)}` : ""}`);
+  // whisper-ctranslate2 catches a file it cannot decode, prints the traceback
+  // and exits 0 without writing anything — so no transcript and a traceback is
+  // a failure, and no transcript without one is silence.
+  let text;
+  try {
+    text = readFileSync(join(filesDir, basename(path).replace(/\.[^.]+$/, ".txt")), "utf8");
+  } catch {
+    if (/Error|Exception/.test(res.stderr ?? "")) throw new Error(`whisper failed: ${clip(last, 200)}`);
+    return "";
+  }
+  return text.replace(/\s+/g, " ").trim();
 }
 
 // ------------------------------------------------------------------ herdr
@@ -325,7 +398,61 @@ async function deliver(reply) {
     }
   }
 
-  const text = reply.text.slice(0, MAX_TEXT);
+  // A file becomes a path in a new turn. Typed into a blocked prompt it would be
+  // a menu answer made of a file name, so a question is answered in words.
+  // A voice note becomes the words in it, as a new turn too: a transcript that
+  // misheard is a prompt to correct, not a keystroke into an approval.
+  let text = reply.text.slice(0, MAX_TEXT);
+  let heard;
+  if (reply.file) {
+    const voice = reply.file.voice;
+    const whisper = voice ? whisperBin(cfg("WHISPER_BIN")) : undefined;
+    const refusal =
+      live.status === "blocked"
+        ? `${paneId} is waiting on a question; answer it first, then send the ${voice ? "voice message" : "file"}`
+        : voice && !whisper
+          ? "there is no whisper CLI on this machine to transcribe voice messages (see the README)"
+          : !voice && !attachmentAllowed(reply.file.name)
+            ? `I only pass on ${ATTACHMENT_TYPES.join(", ")} files`
+            : reply.file.size > ATTACHMENT_MAX_BYTES
+              ? "Telegram lets a bot fetch files up to 20 MB"
+              : undefined;
+    if (refusal) {
+      console.log(`herdr-telegram-notify: refused a file for ${paneId}: ${refusal}`);
+      await say(`✗ not delivered — ${refusal}.`, reply);
+      return;
+    }
+    let path;
+    try {
+      path = await download(reply.file);
+    } catch (err) {
+      console.error(`herdr-telegram-notify: could not fetch a file for ${paneId}: ${err.message}`);
+      await say(`✗ not delivered — I could not fetch the file: ${err.message}`, reply);
+      return;
+    }
+    if (voice) {
+      // Shown as typing while whisper works, which can be a while.
+      await telegram(
+        "sendChatAction",
+        { chat_id: chatId, action: "typing", ...(reply.threadId ? { message_thread_id: reply.threadId } : {}) },
+        10_000
+      );
+      try {
+        heard = transcribe(whisper, path);
+      } catch (err) {
+        console.error(`herdr-telegram-notify: could not transcribe a voice message for ${paneId}: ${err.message}`);
+        await say(`✗ not delivered — I could not transcribe it: ${err.message}`, reply);
+        return;
+      }
+      if (!heard) {
+        await say("✗ not delivered — I heard no words in that voice message.", reply);
+        return;
+      }
+      text = heard.slice(0, MAX_TEXT);
+    } else {
+      text = text ? `${text}\n\nAttached file: ${path}` : `Attached file: ${path}`;
+    }
+  }
   const status = live.status;
   for (const args of replyCommands(paneId, status, text)) {
     const res = herdrRun(args);
@@ -336,7 +463,10 @@ async function deliver(reply) {
     }
   }
   console.log(`herdr-telegram-notify: delivered a reply to ${paneId} (${status ?? "status unknown"})`);
-  await say(status === "blocked" ? `→ typed into ${paneId}` : `→ sent to ${paneId}`, reply);
+  // What was understood, so a mishearing is caught on the phone rather than
+  // after the agent has acted on it.
+  const sent = status === "blocked" ? `→ typed into ${paneId}` : `→ sent to ${paneId}`;
+  await say(heard ? `🎙 “${clip(heard, 300)}”\n${sent}` : sent, reply);
 }
 
 // ------------------------------------------------------------------- loop
@@ -408,7 +538,8 @@ for (;;) {
       await deliver(reply);
       continue;
     }
-    const command = botCommand(reply.text, botUsername);
+    // A caption that starts with a slash is still a caption: the file is the point.
+    const command = reply.file ? undefined : botCommand(reply.text, botUsername);
     if (command) {
       // Addressed to another bot, or to no name this bot answers to: not ours to
       // answer, and not text to hand an agent either.

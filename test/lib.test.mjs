@@ -42,6 +42,8 @@ import {
   retryAfterMs,
   screenColumns,
   screenOptions,
+  attachmentAllowed,
+  whisperBin,
   toInt,
   toolSummary,
   topicFor,
@@ -708,4 +710,29 @@ test("usableReply takes a button tap as a reply to the message it sits under", (
   assert.equal(usableReply(tap({ message: undefined }), 42), undefined);
   assert.equal(usableReply(tap(), 42, "8"), undefined);
   assert.equal(usableReply(tap(), 42, "7")?.text, "2");
+});
+
+test("usableReply takes a photo or a document with its caption, and names it safely", () => {
+  const base = { message_id: 9, chat: { id: 42 }, reply_to_message: { message_id: 7 } };
+  const photo = usableReply({ message: { ...base, caption: " look ", photo: [{ file_id: "s" }, { file_id: "l", file_size: 3 }] } }, 42);
+  assert.equal(photo.text, "look");
+  assert.deepEqual(photo.file, { fileId: "l", name: "photo-9.jpg", size: 3 });
+  // No caption is fine when there is a file; the sender's name loses its path.
+  const doc = usableReply({ message: { ...base, document: { file_id: "d", file_name: "..\\x/.env ä.md" } } }, 42);
+  assert.equal(doc.text, "");
+  assert.equal(doc.file.name, "9-env__.md");
+  // Plain text carries no file key at all.
+  assert.equal("file" in usableReply({ message: { ...base, text: "hi" } }, 42), false);
+  assert.equal(usableReply({ message: { ...base, chat: { id: 99 }, photo: [{ file_id: "l" }] } }, 42), undefined);
+
+  assert.equal(attachmentAllowed("9-Spec.DOCX"), true);
+  assert.equal(attachmentAllowed("photo-9.jpg"), true);
+  assert.equal(attachmentAllowed("9-setup.sh"), false);
+  assert.equal(attachmentAllowed("9-file"), false);
+});
+
+test("a voice note is words to transcribe, and a named whisper that is missing is missing", () => {
+  const voice = usableReply({ message: { message_id: 9, chat: { id: 42 }, voice: { file_id: "v", file_size: 10 } } }, 42);
+  assert.deepEqual(voice.file, { fileId: "v", name: "voice-9.ogg", size: 10, voice: true });
+  assert.equal(whisperBin("/nonexistent/whisper"), undefined);
 });
