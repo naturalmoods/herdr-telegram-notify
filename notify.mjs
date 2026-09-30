@@ -17,7 +17,11 @@ import {
   PENDING_TTL,
   QUESTION_UNKNOWN,
   buildMessage,
+  clip,
   clockTime,
+  closeMessages,
+  escapeHtml,
+  herdStatusText,
   firstDefined,
   flockAvailable,
   flockHeld,
@@ -39,8 +43,10 @@ import {
   readTurn,
   redact,
   rememberMessage,
+  resolvedLine,
   retryAfterMs,
   sanitizeKey,
+  screenOptions,
   screenTail,
   sleep,
   sleepSync,
@@ -319,7 +325,7 @@ async function remindBlocked(stateDir, cfg, { token, chatId, silent }) {
       paneBits.push(`herdr agent focus ${paneId}`);
     }
 
-    const message = buildMessage({
+    const parts = {
       emoji: "⏰",
       agent: String(firstDefined(agent.agent, "agent")),
       statusLabel: "still blocked",
@@ -329,12 +335,14 @@ async function remindBlocked(stateDir, cfg, { token, chatId, silent }) {
       pane: paneBits.length ? `🖥 ${paneBits.join(" · ")}` : undefined,
       body: isOn(cfg("SHOW_SCREEN_ON_BLOCKED")) ? screenTail(paneId, toInt(cfg("SCREEN_LINES"), 12)) : undefined,
       bodyIsScreen: true,
-    });
+    };
+    const message = buildMessage(parts);
 
     // What it is waiting on, as of now: the reminder is answerable, so it carries
     // the question the same way the first notification did — and says it is about
     // one even when the question itself could not be read.
     const question = questionOnScreen(stateDir, paneId) ?? QUESTION_UNKNOWN;
+    parts.options = menuOptions(cfg, question, parts.body);
 
     // Marked first: a reminder that fails is not worth queueing — by the time it
     // could be delivered the wait it reports is no longer the wait there is.
@@ -344,8 +352,9 @@ async function remindBlocked(stateDir, cfg, { token, chatId, silent }) {
       const messageId = await sendTelegram(token, chatId, message, {
         silent,
         topicId: topicFor(cfg, info.workspaceLabel, workspaceId),
+        options: parts.options,
       });
-      rememberMessage(stateDir, messageId, paneId, info.session, question);
+      rememberMessage(stateDir, messageId, paneId, info.session, question, undefined, parts);
     } catch (err) {
       console.error(`herdr-telegram-notify: reminder for ${paneId} failed: ${redact(err.message, token)}`);
     }
@@ -354,7 +363,25 @@ async function remindBlocked(stateDir, cfg, { token, chatId, silent }) {
 
 // ------------------------------------------------------------------ message
 
-async function sendTelegram(token, chatId, message, { silent, topicId } = {}) {
+// The menu to offer as buttons: only with replies on, since nothing else would
+// hear the tap, and only for a question that was recorded — a reply to one that
+// was not is refused anyway.
+function menuOptions(cfg, question, screen) {
+  if (!isOn(cfg("REPLIES")) || !question || question === QUESTION_UNKNOWN) return undefined;
+  const options = screenOptions(screen);
+  return options.length ? options : undefined;
+}
+
+// A blocked agent's menu, as buttons under its notification. Each sends the
+// option's number back the way a typed reply would, through the same checks.
+function menuKeyboard(options) {
+  return options?.length
+    ? { inline_keyboard: options.map((o) => [{ text: clip(`${o.n}. ${o.label}`, 48), callback_data: o.n }]) }
+    : undefined;
+}
+
+async function sendTelegram(token, chatId, message, { silent, topicId, options } = {}) {
+  const keyboard = menuKeyboard(options);
   const post = async (payload) => {
     const res = await telegramCall(
       token,
@@ -365,6 +392,7 @@ async function sendTelegram(token, chatId, message, { silent, topicId } = {}) {
         // Delivered, listed, unread — just without the sound.
         ...(silent ? { disable_notification: true } : {}),
         ...(topicId ? { message_thread_id: topicId } : {}),
+        ...(keyboard ? { reply_markup: keyboard } : {}),
         ...payload,
       },
       SEND_TIMEOUT
@@ -406,6 +434,120 @@ async function sendTelegram(token, chatId, message, { silent, topicId } = {}) {
   const error = new Error(`Telegram API ${result.status || "unreachable"}: ${result.body}`);
   error.status = result.status;
   throw error;
+}
+
+// A message already in the chat, rewritten. One attempt: an edit is a courtesy
+// to the chat's history, not news, and not worth holding a hook open for.
+// Leaving reply_markup out takes a message's buttons away with it, which is
+// what an overtaken question wants.
+async function editTelegram(token, chatId, messageId, message) {
+  let payload = { text: message.html, parse_mode: "HTML" };
+  for (;;) {
+    const res = await telegramCall(
+      token,
+      "editMessageText",
+      { chat_id: chatId, message_id: messageId, disable_web_page_preview: true, ...payload },
+      SEND_TIMEOUT
+    );
+    const description = String(res.json?.description ?? res.text);
+    if (res.json?.ok || /not modified/i.test(description)) return true;
+    if (res.status === 400 && payload.parse_mode && /parse|entit|tag/i.test(description)) {
+      payload = { text: message.plain };
+      continue;
+    }
+    const error = new Error(`Telegram API ${res.status || "unreachable"}: ${description}`);
+    error.status = res.status;
+    throw error;
+  }
+}
+
+// The notifications this pane's status change has overtaken, marked as such in
+// place: a question answered at the keyboard, a finished turn that has since
+// been seen or followed by another. What is left looking like a notification
+// in the chat is what is still waiting on you. The old screen goes — it is the
+// question that is no longer being asked — and a finished turn's answer stays.
+async function markResolved(stateDir, token, chatId, paneId, status) {
+  let closed;
+  try {
+    closed = closeMessages(stateDir, paneId);
+  } catch (err) {
+    console.error(`herdr-telegram-notify: could not mark ${paneId}'s notifications as overtaken — ${err.message}`);
+    return;
+  }
+  for (const entry of closed) {
+    const { parts } = entry;
+    // The line above the header is where a late delivery says so, too; an
+    // overtaken message has something more current to say there.
+    const message = buildMessage({
+      ...parts,
+      late: resolvedLine(entry, status),
+      body: parts.bodyIsScreen ? undefined : parts.body,
+    });
+    try {
+      await editTelegram(token, chatId, entry.id, message);
+    } catch (err) {
+      console.error(`herdr-telegram-notify: could not mark message ${entry.id} as overtaken: ${redact(err.message, token)}`);
+    }
+  }
+}
+
+// ------------------------------------------------------------------- board
+
+// One message that is the herd, kept current: edited on every status change
+// rather than sent, so it costs no notification, and pinned so it is the first
+// thing the chat shows. /status is the same list on demand. Under a lock and
+// read inside it, so of two changes landing together the later edit is also
+// the later snapshot. A board that was deleted, or that sits in a chat or topic
+// the config no longer names, is replaced by a new one.
+async function updateBoard(stateDir, cfg, token, chatId) {
+  const release = holdFlock(join(stateDir, "board.lock"), { waitSeconds: 10 });
+  if (!release) return;
+  try {
+    const snap = loadSnapshot();
+    if (!snap) return; // a board saying "cannot reach herdr" helps nobody; the last one stands
+    const head = `🐑 ${hostname()} · updated ${clockTime(new Date())}`;
+    const list = herdStatusText(snap, stateDir);
+    const message = { html: `<b>${escapeHtml(head)}</b>\n${escapeHtml(list)}`, plain: `${head}\n${list}` };
+
+    const path = join(stateDir, "board.json");
+    const topicId = toInt(cfg("TELEGRAM_TOPIC_ID"), undefined);
+    let board = {};
+    try {
+      board = JSON.parse(readFileSync(path, "utf8"));
+    } catch {}
+
+    if (board.messageId && String(board.chatId) === String(chatId) && board.topicId === topicId) {
+      try {
+        await editTelegram(token, chatId, board.messageId, message);
+        return;
+      } catch (err) {
+        // 400 is Telegram saying there is no such message to edit any more;
+        // anything else is the network, and the board is still there.
+        if (err.status !== 400) {
+          console.error(`herdr-telegram-notify: the board was not updated: ${redact(err.message, token)}`);
+          return;
+        }
+      }
+    }
+
+    const messageId = await sendTelegram(token, chatId, message, { silent: true, topicId });
+    if (!messageId) return;
+    writeFileSync(path, JSON.stringify({ messageId, chatId, topicId }));
+    // A group only lets an admin pin; the board works unpinned all the same.
+    const pinned = await telegramCall(
+      token,
+      "pinChatMessage",
+      { chat_id: chatId, message_id: messageId, disable_notification: true },
+      SEND_TIMEOUT
+    );
+    if (!pinned.json?.ok) {
+      console.error(`herdr-telegram-notify: the board was sent but not pinned: ${pinned.json?.description ?? pinned.text}`);
+    }
+  } catch (err) {
+    console.error(`herdr-telegram-notify: the board was not updated: ${redact(err.message, token)}`);
+  } finally {
+    release();
+  }
 }
 
 // ---------------------------------------------------- background processes
@@ -555,8 +697,9 @@ async function flushPending(stateDir, token, chatId, silent) {
       const messageId = await sendTelegram(token, chatId, buildMessage({ ...entry.parts, late }), {
         silent,
         topicId: entry.topicId,
+        options: entry.parts.options,
       });
-      rememberMessage(stateDir, messageId, entry.paneId, entry.session, entry.question, entry.full);
+      rememberMessage(stateDir, messageId, entry.paneId, entry.session, entry.question, entry.full, entry.parts);
     } catch (err) {
       console.error(
         `herdr-telegram-notify: ${waiting.length} message(s) still waiting: ${redact(err.message, token)}`
@@ -655,7 +798,13 @@ async function sweepLoop() {
     snapshotCache = undefined;
     snapshotLoaded = false;
     sweepState(stateDir);
-    await sweep(stateDir, cfg);
+    const online = await sweep(stateDir, cfg);
+    // A pane that closes raises no status change, so the board would keep it
+    // until the next one did.
+    const [token, chatId] = [cfg("TELEGRAM_BOT_TOKEN"), cfg("TELEGRAM_CHAT_ID")];
+    if (online && token && chatId && !isOn(cfg("DRY_RUN")) && isOn(cfg("BOARD"))) {
+      await updateBoard(stateDir, cfg, token, chatId);
+    }
     await sleep(minutes * 60 * 1000);
   }
   release();
@@ -741,6 +890,16 @@ async function main() {
   // own turn is the more honest number.
   const paneElapsed = sinceWorking !== undefined && sinceWorking <= MAX_PANE_ELAPSED ? sinceWorking : undefined;
   writeState(stateDir, key, { status, workingSince, updatedAt: now, paneId: data.pane_id });
+
+  // Every transition, not only the ones that notify: `working` and `idle` are
+  // precisely the ones that say an earlier message has been dealt with. Not
+  // while offline — the entries stay open for the next change to mark.
+  if (!dryRun && online && token && chatId && isOn(cfg("MARK_RESOLVED")) && stateDir && data.pane_id) {
+    await markResolved(stateDir, token, chatId, data.pane_id, status);
+  }
+  if (!dryRun && online && token && chatId && isOn(cfg("BOARD")) && stateDir) {
+    await updateBoard(stateDir, cfg, token, chatId);
+  }
 
   const notifyStatuses = new Set(
     String(cfg("NOTIFY_STATUSES"))
@@ -974,7 +1133,8 @@ async function main() {
     }
   }
 
-  const parts = { emoji, agent, statusLabel, title, prompt, project, changes, tools, meta, pane, herd, body, bodyIsScreen };
+  const options = bodyIsScreen ? menuOptions(cfg, question, body) : undefined;
+  const parts = { emoji, agent, statusLabel, title, prompt, project, changes, tools, meta, pane, herd, body, bodyIsScreen, options };
   const message = buildMessage(parts);
 
   if (dryRun) {
@@ -994,11 +1154,11 @@ async function main() {
   }
 
   try {
-    const messageId = await sendTelegram(token, chatId, message, { silent, topicId });
+    const messageId = await sendTelegram(token, chatId, message, { silent, topicId, options });
     // Which pane this message was about, which agent was in it and what it was
     // waiting on, so a reply to it lands in the right one — and nowhere else once
     // that agent, or its question, is gone.
-    rememberMessage(stateDir, messageId, paneId, info.session, question, full);
+    rememberMessage(stateDir, messageId, paneId, info.session, question, full, parts);
   } catch (err) {
     console.error(`herdr-telegram-notify: ${redact(err.message, token)}`);
     // A refused connection or a Telegram that is down will look different in a

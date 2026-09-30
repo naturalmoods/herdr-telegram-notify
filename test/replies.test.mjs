@@ -693,8 +693,12 @@ test("/status lists the herd, and touches no pane doing it", async () => {
   try {
     await runPoller(fx, tg.base, { until: () => tg.sent.length >= 3 });
     const [bare, addressed, fellThrough] = answers(tg);
-    // Blocked first: the reason to ask is whether anyone is waiting on you.
-    assert.equal(bare, "\u26a0\ufe0f pi \u00b7 api \u00b7 blocked \u00b7 wB:p2\n\u23f3 claude \u00b7 storefront \u00b7 working \u00b7 wA:p1");
+    // Blocked first: the reason to ask is whether anyone is waiting on you. Each
+    // status the plugin recorded says when it began.
+    assert.match(
+      bare,
+      /^\u26a0\ufe0f pi \u00b7 api \u00b7 blocked since \d\d:\d\d \u00b7 wB:p2\n\u23f3 claude \u00b7 storefront \u00b7 working since \d\d:\d\d \u00b7 wA:p1$/
+    );
     assert.equal(addressed, bare);
     // The two addressed at a bot that is not this one are answered by nobody
     // here and handed to no agent; the one that is not a command at all still
@@ -1056,6 +1060,34 @@ test("only the allowed get a /full, and only this bot's is answered", async () =
     // The one addressed to the other bot is neither answered nor typed at an
     // agent — a reply carrying a command still goes nowhere near a pane.
     assert.deepEqual(fx.ran(), []);
+  } finally {
+    tg.close();
+  }
+});
+
+test("a button under a blocked notification is typed in like a reply, and only a menu number is", async () => {
+  const tap = (id, data) => ({
+    update_id: id,
+    callback_query: { id: `q${id}`, from: { id: 7 }, data, message: { message_id: 100, chat: { id: CHAT } } },
+  });
+  // A client can send any callback data it likes; only the number is an answer.
+  const tg = await fakeTelegram([[tap(1, "rm -rf ~"), tap(2, "2")]]);
+  const fx = fixture({
+    agents: { "wA:p1": { agent_status: "blocked", agent_session: { kind: "id", value: "s1" } } },
+    screens: { "wA:p1": "Do you want to create notes.md?\n ❯ 1. Yes\n 2. No" },
+  });
+  fx.remember({ id: 100, paneId: "wA:p1", session: "id:s1", question: questionFor(fx, "wA:p1") });
+  try {
+    await runPoller(fx, tg.base, { until: () => tg.sent.length >= 2 });
+    assert.deepEqual(tg.polls[0].allowed_updates, ["message", "callback_query"]);
+    assert.deepEqual(
+      tg.sent.map((m) => m.method),
+      ["answerCallbackQuery", "sendMessage"]
+    );
+    assert.equal(tg.sent[0].callback_query_id, "q2");
+    assert.deepEqual(fx.ran().slice(-2), ["pane send-text wA:p1 2", "pane send-keys wA:p1 Enter"]);
+    assert.equal(tg.sent[1].text, "→ typed into wA:p1");
+    assert.equal(tg.sent[1].reply_to_message_id, 100); // under the notification it was tapped on
   } finally {
     tg.close();
   }
