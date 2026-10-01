@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.10.1
 
 - Add `WHISPER_LANGUAGE` to name the language voice messages are spoken in.
   Without it whisper guesses per message, and short notes can be transcribed
