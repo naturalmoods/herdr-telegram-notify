@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Add `WHISPER_LANGUAGE` to name the language voice messages are spoken in.
+  Without it whisper guesses per message, and short notes can be transcribed
+  as the wrong language.
+
 ## 0.10.0
 
 - Reply with a photo or a file to send it to that agent. The caption and the

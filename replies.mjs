@@ -180,10 +180,24 @@ const TRANSCRIBE_TIMEOUT = 5 * 60 * 1000;
 // a voice note is seconds long, which the CPU handles in about as many. A
 // WHISPER_DEVICE setting is the upgrade if someone's notes are long.
 
+// Detection guesses from the first seconds, and a short note in Hungarian can
+// come back as Turkish; naming the language skips the guess.
 function transcribe(bin, path) {
+  const language = String(cfg("WHISPER_LANGUAGE") ?? "").trim();
   const res = spawnSync(
     bin,
-    [path, "--model", String(cfg("WHISPER_MODEL")), "--device", "cpu", "--output_format", "txt", "--output_dir", filesDir],
+    [
+      path,
+      "--model",
+      String(cfg("WHISPER_MODEL")),
+      "--device",
+      "cpu",
+      "--output_format",
+      "txt",
+      "--output_dir",
+      filesDir,
+      ...(language ? ["--language", language] : []),
+    ],
     { encoding: "utf8", timeout: TRANSCRIBE_TIMEOUT, maxBuffer: 16 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] }
   );
   if (res.error) throw new Error(res.error.code === "ETIMEDOUT" ? "whisper took longer than five minutes" : res.error.message);

@@ -239,7 +239,10 @@ uv tool install whisper-ctranslate2 --with 'av<19'
 open files with PyAV 19.
 
 The plugin looks for the CLI on PATH and in `~/.local/bin`, or uses
-`WHISPER_BIN` if set. `WHISPER_MODEL` picks the model, `small` by default. The
+`WHISPER_BIN` if set. `WHISPER_MODEL` picks the model, `small` by default.
+`WHISPER_LANGUAGE` names the language you speak (`hu`, `en`, `de`); without
+it, whisper guesses per message, and a short Hungarian note can come back
+transcribed as Turkish. The
 first voice message downloads the model, which can take a while.
 Transcription always runs on the CPU. Without a whisper CLI, the bot refuses
 voice messages and says why; `doctor` reports which CLI it found. Like files,
