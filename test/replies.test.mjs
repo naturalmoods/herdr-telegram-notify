@@ -1213,14 +1213,14 @@ test("a voice message is transcribed, sent as a new turn, and what was heard is 
   const fx = fixture({
     agents: { "wA:p1": { agent_status: "done", agent_session: { kind: "id", value: "s1" } } },
     messages: [{ id: 100, paneId: "wA:p1", session: "id:s1" }],
-    env: [`WHISPER_BIN=${fakeWhisper(root)}`, "WHISPER_MODEL=tiny"],
+    env: [`WHISPER_BIN=${fakeWhisper(root)}`, "WHISPER_MODEL=tiny", "WHISPER_LANGUAGE=hu"],
   });
   try {
     await runPoller(fx, tg.base, { until: () => tg.sent.some((m) => m.method === "sendMessage") });
     const audio = join(fx.stateDir, "files", "voice-10.ogg");
     assert.equal(
       readFileSync(join(root, "whisper.args"), "utf8").trim(),
-      `${audio} --model tiny --device cpu --output_format txt --output_dir ${join(fx.stateDir, "files")}`
+      `${audio} --model tiny --device cpu --output_format txt --output_dir ${join(fx.stateDir, "files")} --language hu`
     );
     assert.deepEqual(fx.ran(), ["agent get wA:p1", "agent prompt wA:p1 yes, carry on"]);
     assert.deepEqual(

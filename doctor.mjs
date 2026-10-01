@@ -152,7 +152,10 @@ if (!stateDir) {
     }
     // Optional, so its absence is not a fault — unless one was named and is not there.
     const whisper = whisperBin(cfg("WHISPER_BIN"));
-    if (whisper) ok("voice", `${whisper} transcribes voice messages (model ${cfg("WHISPER_MODEL")})`);
+    if (whisper) {
+      const language = cfg("WHISPER_LANGUAGE") || "detected per message";
+      ok("voice", `${whisper} transcribes voice messages (model ${cfg("WHISPER_MODEL")}, language ${language})`);
+    }
     else if (cfg("WHISPER_BIN")) bad("voice", `WHISPER_BIN is ${cfg("WHISPER_BIN")}, which does not exist; voice messages are refused`);
     else ok("voice", "no whisper CLI found, so voice messages are refused — pipx install openai-whisper to take them");
   }

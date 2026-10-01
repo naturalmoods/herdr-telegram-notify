@@ -57,6 +57,7 @@ export const DEFAULTS = {
   MARK_RESOLVED: "1",
   WHISPER_BIN: "",
   WHISPER_MODEL: "small",
+  WHISPER_LANGUAGE: "",
   BOARD: "0",
   DEBUG: "0",
   DRY_RUN: "0",
