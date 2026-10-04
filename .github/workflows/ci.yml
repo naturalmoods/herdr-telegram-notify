@@ -6,6 +6,18 @@ on:
   pull_request:
 
 jobs:
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install kernel locking utility
+        run: brew install util-linux
+      - name: Tests
+        run: node --test test/*.test.mjs
+
   test:
     runs-on: ubuntu-latest
     strategy:

@@ -10,8 +10,9 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, chmodSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 
-const HERE = new URL(".", import.meta.url).pathname;
+const HERE = fileURLToPath(new URL(".", import.meta.url));
 const NOTIFY = join(HERE, "..", "notify.mjs");
 
 // Collects every sendMessage the sweeper makes, and answers as Telegram does.

@@ -54,13 +54,13 @@ else bad("git", "not runnable — the ✎ changed-files line will be missing");
 
 // Everything several runs of this plugin share is written under an flock, so
 // that a hook, the sweeper and the poller cannot overwrite each other's queue
-// or start two of each other. It comes from util-linux, so this is Linux only.
+// or start two of each other. Homebrew supplies it on macOS; it is not built in.
 if (flockBin()) {
   ok("flock", `${flockBin()} — the queue, the message map and the background processes are locked with it`);
 } else {
   bad(
     "flock",
-    "not found (util-linux, Linux only) — notifications still send, but nothing is queued or recorded and neither background process starts"
+    `not found (${process.platform === "darwin" ? "brew install util-linux" : "util-linux"}) — notifications still send, but nothing is queued or recorded and neither background process starts`
   );
 }
 
@@ -101,12 +101,16 @@ for (const { key, detail } of configProblems(cfg)) {
   bad(key, detail);
 }
 
+if (!broken.has("MASK_SECRETS")) {
+  ok("MASK_SECRETS", isOn(cfg("MASK_SECRETS")) ? "on — best-effort secret masking before sending" : "off — agent text may contain secrets");
+}
 if (!broken.has("NOTIFY_STATUSES")) ok("statuses", `notifying on ${cfg("NOTIFY_STATUSES")}`);
 for (const [key, what] of [
   ["NOTIFY_WORKSPACES", "only these workspaces send"],
   ["IGNORE_WORKSPACES", "these workspaces never send"],
   ["QUIET_HOURS", "delivered without a sound in this window"],
   ["MIN_DURATION_SECONDS", "turns shorter than this are dropped"],
+  ["BLOCKED_DELAY_SECONDS", "blocked notifications wait this many seconds"],
   ["BLOCKED_REMINDER_MINUTES", "a blocked agent is nudged again after this"],
   ["SWEEP_MINUTES", "the queue and the reminders are swept this often"],
   ["REPLIES", "a reply in the chat is passed to that agent"],

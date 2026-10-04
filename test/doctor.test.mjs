@@ -17,7 +17,7 @@ const scratch = mkdtempSync(join(tmpdir(), "herdr-telegram-notify-doctor-"));
 // chat id beside it nothing is sent either.
 const TOKEN = "123456789:AAFakeTokenForTestsOnly_notReal";
 
-function runDoctor(env) {
+function runDoctor(env, { platform, missingFlock = false } = {}) {
   const dir = mkdtempSync(join(scratch, "cfg-"));
   writeFileSync(
     join(dir, ".env"),
@@ -26,24 +26,51 @@ function runDoctor(env) {
       .join("\n")
   );
   chmodSync(join(dir, ".env"), 0o600);
-  const res = spawnSync(process.execPath, [doctor], {
+  // A missing override falls back to installed Herdr binaries, so use a real
+  // fake executable to keep the offline doctor away from the live session.
+  const herdr = join(dir, "herdr");
+  writeFileSync(herdr, `#!${process.execPath}\nprocess.exit(1);\n`, { mode: 0o755 });
+  const args = platform ? ["--input-type=module", "-e", `
+    Object.defineProperty(process, "platform", { value: ${JSON.stringify(platform)} });
+    await import(${JSON.stringify(new URL("../doctor.mjs", import.meta.url).href)});
+  `] : [doctor];
+  const res = spawnSync(process.execPath, args, {
     encoding: "utf8",
     timeout: 30_000,
     env: {
       ...process.env,
       HERDR_PLUGIN_CONFIG_DIR: dir,
       HERDR_PLUGIN_STATE_DIR: mkdtempSync(join(scratch, "state-")),
-      HERDR_BIN_PATH: join(dir, "no-such-herdr"),
+      HERDR_BIN_PATH: herdr,
+      ...(missingFlock ? { FLOCK_BIN_PATH: join(dir, "missing-flock") } : {}),
     },
   });
   return { status: res.status, out: res.stdout ?? "" };
 }
 
+test("a missing flock names the platform-specific installation command", () => {
+  // This checks the diagnostic branch, not macOS syscalls; CI runs those on a Mac.
+  for (const platform of ["linux", "darwin"]) {
+    const { status, out } = runDoctor({}, { platform, missingFlock: true });
+    assert.equal(status, 1, out);
+    assert.match(out, /✗ flock: not found/);
+    assert.match(out, /nothing is queued or recorded and neither background process starts/);
+    if (platform === "darwin") assert.match(out, /brew install util-linux/);
+    else {
+      assert.match(out, /util-linux/);
+      assert.doesNotMatch(out, /brew install/);
+    }
+    assert.doesNotMatch(out, /Linux only/);
+  }
+});
+
 test("a valid config is not reported as a config problem", () => {
   const { status, out } = runDoctor({
     NOTIFY_STATUSES: "done,blocked,working",
+    MASK_SECRETS: "yes",
     QUIET_HOURS: "23:00-07:00",
     MIN_DURATION_SECONDS: "0",
+    BLOCKED_DELAY_SECONDS: "15",
     SWEEP_MINUTES: "5",
     BLOCKED_REMINDER_MINUTES: "15",
     PROMPT_CHARS: "200",
@@ -53,7 +80,9 @@ test("a valid config is not reported as a config problem", () => {
   });
   assert.equal(out.includes(TOKEN), false);
   assert.match(out, /✓ statuses: notifying on done,blocked,working/);
+  assert.match(out, /✓ MASK_SECRETS: on — best-effort secret masking/);
   assert.match(out, /✓ QUIET_HOURS: 23:00-07:00/);
+  assert.match(out, /✓ BLOCKED_DELAY_SECONDS: 15/);
   assert.match(out, /✓ TELEGRAM_TOPICS: storefront:12,wB:15/);
   // Missing chat id and no herdr on this machine still fail; 2 is reserved for
   // a config the plugin cannot parse.
@@ -66,8 +95,10 @@ test("a valid config is not reported as a config problem", () => {
 test("every mistyped value is named, and nothing about it is reported OK", () => {
   const { status, out } = runDoctor({
     NOTIFY_STATUSES: "done,blocke",
+    MASK_SECRETS: "sometimes",
     QUIET_HOURS: "23:00 to 07:00",
     MIN_DURATION_SECONDS: "-5",
+    BLOCKED_DELAY_SECONDS: "1s",
     SWEEP_MINUTES: "5min",
     BLOCKED_REMINDER_MINUTES: "quarter",
     PROMPT_CHARS: "0",
@@ -82,8 +113,10 @@ test("every mistyped value is named, and nothing about it is reported OK", () =>
   assert.equal(status, 2, out);
   for (const key of [
     "NOTIFY_STATUSES",
+    "MASK_SECRETS",
     "QUIET_HOURS",
     "MIN_DURATION_SECONDS",
+    "BLOCKED_DELAY_SECONDS",
     "SWEEP_MINUTES",
     "BLOCKED_REMINDER_MINUTES",
     "PROMPT_CHARS",
@@ -101,6 +134,21 @@ test("every mistyped value is named, and nothing about it is reported OK", () =>
   // Both bad pairs are named, not just the first one.
   assert.match(out, /storefront-12/);
   assert.match(out, /wB:x/);
+});
+
+test("blocked delays accept zero through 120 and report invalid or capped values", () => {
+  for (const value of ["0", "1", "120", "-1", "1.5", "121"]) {
+    const { status, out } = runDoctor({ BLOCKED_DELAY_SECONDS: value });
+    if (["0", "1", "120"].includes(value)) {
+      assert.notEqual(status, 2, out);
+      assert.doesNotMatch(out, /✗ BLOCKED_DELAY_SECONDS:/);
+    } else {
+      assert.equal(status, 2, out);
+      assert.match(out, /✗ BLOCKED_DELAY_SECONDS:/);
+      assert.doesNotMatch(out, /✓ BLOCKED_DELAY_SECONDS:/);
+      if (value === "121") assert.match(out, /exceeds 120 — the value is capped at 120/);
+    }
+  }
 });
 
 // `NOTIFY_STATUSES=` is the default, not a mistake — an empty value falls back.

@@ -6,6 +6,8 @@
 
 dir=$(dirname "$0")
 script="$dir/${1:-notify.mjs}"
+# Keep the remaining arguments so hooks can select a mode such as --startup.
+if [ "$#" -gt 0 ]; then shift; fi
 
 # /usr/bin/node on an old distribution can be far behind what this needs, and the
 # failure it produces is a syntax error rather than anything that names a
@@ -16,7 +18,7 @@ usable() {
 }
 
 if command -v node >/dev/null 2>&1 && usable "$(command -v node)"; then
-  exec node "$script"
+  exec node "$script" "$@"
 fi
 
 for candidate in \
@@ -25,12 +27,13 @@ for candidate in \
   "$HOME"/.local/share/mise/installs/node/*/bin/node \
   "$HOME"/.volta/bin/node \
   "$HOME"/.local/share/fnm/node-versions/*/installation/bin/node \
+  "$HOME/Library/Application Support/fnm"/node-versions/*/installation/bin/node \
   /opt/homebrew/bin/node \
   /usr/local/bin/node \
   /usr/bin/node
 do
   if usable "$candidate"; then
-    exec "$candidate" "$script"
+    exec "$candidate" "$script" "$@"
   fi
 done
 

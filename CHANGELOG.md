@@ -1,5 +1,48 @@
 # Changelog
 
+## Unreleased
+
+More you can do from the phone, and less of it ringing for nothing.
+
+- Reply to a notification with `/stop` to send Esc to its agent while it is
+  working or blocked, without quitting it. The recorded session must still
+  match.
+- Reply with `/screen` to read the same agent session's current screen without
+  sending input. Keeps the bottom of up to 40 cropped lines in one message.
+- Reply with `/diff` to download the same agent session's uncommitted changes
+  as a `.diff` file, with untracked names in the caption. External diff
+  drivers and textconv never run. Diffs over 5 MB get a size and summary
+  instead.
+- Add `/new <workspace> <kind> [prompt]` to start an agent in a new background
+  tab of an existing, unfiltered workspace. Multiline prompts are kept, a
+  failed start closes the tab it opened, and the confirmation can be answered
+  like a notification once the agent's session is known.
+- The bot's commands appear in Telegram's `/` menu once the reply poller
+  starts; nothing needs registering in BotFather. A failure is logged, not
+  fatal.
+- Add `BLOCKED_DELAY_SECONDS` to wait before notifying about a blocked agent,
+  and drop the message if the question was answered at the desk meanwhile.
+  Off (`0`) by default, capped at 120 seconds; the screen and buttons are read
+  after the wait.
+- Mask common secrets (API keys, tokens, Bearer headers, JWTs, private keys,
+  `*_TOKEN=` style assignments) in everything captured for Telegram: last
+  messages, prompts, titles, blocked screens, buttons, `/full`, `/screen` and
+  `/diff`. On by default; `MASK_SECRETS=0` turns this best-effort matching off.
+- Start the configured reply poller and sweeper when Herdr starts, so replies
+  and `/status` no longer wait for an agent status change after a reboot.
+- Handle pane closures: open notifications are marked `✕ pane closed`, the
+  pane's recorded state is forgotten and the board refreshes, without waiting
+  for another event or the sweeper.
+- Read Codex transcripts: the last message, the real prompt (not injected
+  context), task duration, tokens and tools, found by session id under
+  `CODEX_HOME`. Codex records no cost, so none is shown.
+- macOS support with `brew install util-linux` (or `brew install flock`). The
+  plugin finds Homebrew's flock without PATH changes, and CI now runs the tests
+  on macOS too.
+- Upgrading: a reply poller that is already running keeps the old code and
+  does not know the new commands. Stop it once (`pkill -f replies.mjs`); the
+  next status change or Herdr start brings up the new one.
+
 ## 0.10.1
 
 - Add `WHISPER_LANGUAGE` to name the language voice messages are spoken in.

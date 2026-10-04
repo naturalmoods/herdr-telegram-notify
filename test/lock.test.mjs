@@ -6,16 +6,17 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, chmodSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 
 import { flockAvailable, flockHeld, holdFlock, readLines } from "../lib.mjs";
 
-const HERE = new URL(".", import.meta.url).pathname;
+const HERE = fileURLToPath(new URL(".", import.meta.url));
 const NOTIFY = join(HERE, "..", "notify.mjs");
-const LIB = join(HERE, "..", "lib.mjs");
+const LIB = new URL("../lib.mjs", import.meta.url).href;
 
 // A Telegram that answers, and remembers everything it was told.
 async function fakeTelegram() {
@@ -109,6 +110,87 @@ const lines = (path) =>
     : [];
 
 // ------------------------------------------------------------- the primitive
+
+test("flock lookup covers both Homebrew layouts without PATH and keeps Linux precedence", () => {
+  // An isolated filesystem view exercises paths absent on this Linux host,
+  // without creating binaries in system directories or changing parent imports.
+  const res = spawnSync(process.execPath, ["--input-type=module", "-e", `
+    import assert from "node:assert/strict";
+    import fs from "node:fs";
+    import { syncBuiltinESMExports } from "node:module";
+    const { flockBin, whisperBin } = await import(${JSON.stringify(LIB)});
+    let present = new Set();
+    fs.existsSync = (path) => present.has(path);
+    syncBuiltinESMExports();
+    delete process.env.FLOCK_BIN_PATH;
+    delete process.env.WHISPER_BIN;
+    process.env.PATH = "";
+    const candidates = ["/usr/bin/flock", "/bin/flock", "/usr/local/bin/flock",
+      "/opt/homebrew/opt/util-linux/bin/flock", "/usr/local/opt/util-linux/bin/flock", "/opt/homebrew/bin/flock"];
+    for (const candidate of candidates) {
+      present = new Set([candidate]);
+      assert.equal(flockBin(), candidate);
+    }
+    present = new Set(candidates);
+    assert.equal(flockBin(), "/usr/bin/flock");
+    present.delete("/usr/bin/flock");
+    assert.equal(flockBin(), "/bin/flock");
+    process.env.FLOCK_BIN_PATH = "/example-flock";
+    assert.equal(flockBin(), undefined);
+    present.add("/example-flock");
+    assert.equal(flockBin(), "/example-flock");
+    present = new Set(["/opt/homebrew/bin/whisper"]);
+    assert.equal(whisperBin(), "/opt/homebrew/bin/whisper");
+  `], { encoding: "utf8", timeout: 10_000 });
+  assert.equal(res.status, 0, res.stderr);
+});
+
+test("the launcher finds fnm's macOS directory with spaces when Node is absent from PATH", () => {
+  const root = mkdtempSync(join(tmpdir(), "launcher-platform-"));
+  const home = join(root, "example home");
+  const bin = join(root, "bin");
+  const nodeDir = join(home, "Library", "Application Support", "fnm", "node-versions", "v22.0.0", "installation", "bin");
+  mkdirSync(bin);
+  mkdirSync(nodeDir, { recursive: true });
+  const calls = join(root, "node-calls.jsonl");
+  writeFileSync(join(bin, "dirname"), `#!${process.execPath}\nconsole.log(require("node:path").dirname(process.argv[2]));\n`, { mode: 0o755 });
+  writeFileSync(join(nodeDir, "node"), `#!${process.execPath}
+const args = process.argv.slice(2);
+require("node:fs").appendFileSync(${JSON.stringify(calls)}, JSON.stringify(args) + "\\n");
+if (args[0] === "-e") process.exit(0);
+console.log(JSON.stringify(args));
+`, { mode: 0o755 });
+  const launcher = join(root, "run.sh");
+  writeFileSync(launcher, readFileSync(join(HERE, "..", "run.sh")));
+  const res = spawnSync("/bin/sh", [launcher, "example.mjs", "--example"], {
+    encoding: "utf8", timeout: 10_000, env: { ...process.env, HOME: home, PATH: bin },
+  });
+  assert.equal(res.status, 0, res.stderr);
+  const invoked = lines(calls);
+  assert.equal(invoked.length, 2, "the fnm binary was not checked and selected");
+  assert.equal(invoked[0][0], "-e");
+  assert.deepEqual(invoked[1], [join(root, "example.mjs"), "--example"]);
+});
+
+test("locking and lock probes work without a shell PATH", () => {
+  const dir = mkdtempSync(join(tmpdir(), "lock-no-path-"));
+  const path = join(dir, "thing.lock");
+  const savedPath = process.env.PATH;
+  let release;
+  try {
+    process.env.PATH = "";
+    release = holdFlock(path);
+    assert.ok(release, "the lock needed a shell PATH");
+    assert.equal(flockHeld(path), true);
+    release();
+    release = undefined;
+    assert.equal(flockHeld(path), false, "a free lock was mistaken for a holder");
+  } finally {
+    release?.();
+    if (savedPath === undefined) delete process.env.PATH;
+    else process.env.PATH = savedPath;
+  }
+});
 
 // A process that takes the lock and then sits on it, for as long as it is told.
 function slowHolder(path, holdMs) {
@@ -348,14 +430,14 @@ test("two panes reporting one session send one message", async () => {
 
 // ------------------------------------------------------------ without flock
 
-// flock(1) is util-linux, so a machine without it has no way to keep these
+// A machine without flock(1) has no way to keep these
 // processes off each other's files. The rule then is that nothing shared is
 // written at all — not that it is written unlocked.
 test("with no flock the notification still goes and nothing shared is written", async () => {
   const tg = await fakeTelegram();
   const fx = fixture(["SWEEP_MINUTES=1", "REPLIES=1"]);
   try {
-    const out = await hook(fx, tg.base, "wF:p1", { env: { FLOCK_BIN_PATH: "/nonexistent/flock" } });
+    const out = await hook(fx, tg.base, "wF:p1", { env: { FLOCK_BIN_PATH: join(fx.root, "missing-flock") } });
 
     assert.equal(tg.sent.length, 1, `the notification itself was lost:\n${out}`);
     assert.ok(!existsSync(join(fx.stateDir, "messages.jsonl")), "the message map was written without a lock");
@@ -369,7 +451,7 @@ test("with no flock the notification still goes and nothing shared is written", 
 
 test("with no flock a message that cannot be sent is reported, not half-written", async () => {
   const fx = fixture();
-  const out = await hook(fx, "http://127.0.0.1:1", "wF:p2", { env: { FLOCK_BIN_PATH: "/nonexistent/flock" } });
+  const out = await hook(fx, "http://127.0.0.1:1", "wF:p2", { env: { FLOCK_BIN_PATH: join(fx.root, "missing-flock") } });
   assert.ok(!existsSync(join(fx.stateDir, "pending.jsonl")), "the queue was written without a lock");
   assert.match(out, /could not be kept for later/);
 });

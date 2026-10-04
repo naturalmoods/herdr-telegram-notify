@@ -6,14 +6,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, rmSync, chmodSync, existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 
-import { QUESTION_UNKNOWN, questionOnScreen, rememberMessage } from "../lib.mjs";
+import { COMMANDS, QUESTION_UNKNOWN, botCommand, flockHeld, gitBin, questionOnScreen, rememberMessage } from "../lib.mjs";
 
-const HERE = new URL(".", import.meta.url).pathname;
+const HERE = fileURLToPath(new URL(".", import.meta.url));
 const REPLIES = join(HERE, "..", "replies.mjs");
 const CHAT = 42;
 const BOT = "herdbot";
@@ -47,6 +48,7 @@ function parseMultipart(body, contentType) {
 async function fakeTelegram(batches, { onSend, onPoll, refuse } = {}) {
   const sent = [];
   const polls = [];
+  const registrations = [];
   const files = [];
   const waiting = new Set();
   const server = createServer((req, res) => {
@@ -63,6 +65,12 @@ async function fakeTelegram(batches, { onSend, onPoll, refuse } = {}) {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify(json));
       };
+      if (method === "setMyCommands") {
+        registrations.push(payload);
+        return answer(refuse === method
+          ? { ok: false, description: "Command registration is unavailable" }
+          : { ok: true, result: true });
+      }
       if (req.url.endsWith("/getMe")) return answer({ ok: true, result: { username: BOT } });
       // A file is asked for by id and then fetched from where Telegram says it is.
       if (req.url.endsWith("/getFile")) {
@@ -91,6 +99,7 @@ async function fakeTelegram(batches, { onSend, onPoll, refuse } = {}) {
   return {
     sent,
     polls,
+    registrations,
     files,
     base: `http://127.0.0.1:${server.address().port}`,
     close: () => {
@@ -104,48 +113,67 @@ async function fakeTelegram(batches, { onSend, onPoll, refuse } = {}) {
 // screen map; every call is logged, so what reached a pane can be read back as
 // the command line it arrived on. A pane with no screen fails the read, which is
 // how herdr answers for a pane it cannot see.
-function fakeHerdr(dir, agents, screens = {}, workspaces = []) {
-  const cases = Object.entries(agents)
-    .map(([paneId, agent]) => `    ${paneId}) cat <<'JSON'\n${JSON.stringify({ result: { agent } })}\nJSON\n    ;;`)
-    .join("\n");
-  const screenCases = Object.entries(screens)
-    .map(([paneId, text]) => `    ${paneId}) cat <<'SCREEN'\n${text}\nSCREEN\n    ;;`)
-    .join("\n");
-  const snapshot = JSON.stringify({
-    result: {
-      snapshot: { agents: Object.entries(agents).map(([pane_id, a]) => ({ pane_id, ...a })), workspaces },
-    },
-  });
+function fakeHerdr(dir, agents, screens = {}, workspaces = [], creation = {}) {
   const path = join(dir, "herdr");
-  writeFileSync(
-    path,
-    `#!/bin/sh
-echo "$@" >> "${join(dir, "herdr.log")}"
-if [ "$1" = agent ] && [ "$2" = get ]; then
-  case "$3" in
-${cases}
-    *) echo '{"error":{"message":"agent target '"$3"' not found"}}'; exit 1 ;;
-  esac
-fi
-if [ "$1" = api ] && [ "$2" = snapshot ]; then
-  cat <<'SNAPSHOT'
-${snapshot}
-SNAPSHOT
-fi
-if [ "$1" = pane ] && [ "$2" = read ]; then
-  case "$3" in
-${screenCases}
-    *) exit 1 ;;
-  esac
-fi
-exit 0
-`
-  );
+  // JSON argv keeps a multiline prompt distinguishable from extra arguments;
+  // the text log remains available to the existing delivery checks.
+  writeFileSync(path, `#!${process.execPath}
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(join(dir, "herdr.log"))}, args.join(" ") + "\\n");
+fs.appendFileSync(${JSON.stringify(join(dir, "herdr-argv.jsonl"))}, JSON.stringify(args) + "\\n");
+const agents = ${JSON.stringify(agents)};
+const screens = ${JSON.stringify(screens)};
+const workspaces = ${JSON.stringify(workspaces)};
+const creation = ${JSON.stringify(creation)};
+const startedPath = ${JSON.stringify(join(dir, "started.json"))};
+const tabPath = ${JSON.stringify(join(dir, "created-tab.json"))};
+const tabId = "wZ:t9";
+const paneId = "wZ:p9";
+const started = fs.existsSync(startedPath) ? JSON.parse(fs.readFileSync(startedPath, "utf8")) : {};
+const live = { ...started, ...agents };
+const ok = (result = {}) => console.log(JSON.stringify({ result }));
+const fail = (message) => { console.error(JSON.stringify({ error: { message } })); process.exit(1); };
+if (args[0] === "api" && args[1] === "snapshot") {
+  ok({ snapshot: { agents: Object.entries(live).map(([pane_id, a]) => ({ pane_id, ...a })), workspaces } });
+} else if (args[0] === "tab" && args[1] === "create") {
+  if (creation.createError) fail(creation.createError);
+  fs.writeFileSync(tabPath, JSON.stringify({ workspaceId: args[3] }));
+  ok({ tab: { tab_id: tabId }, ...(creation.missingPane ? {} : { root_pane: { pane_id: paneId } }) });
+} else if (args[0] === "tab" && args[1] === "close") {
+  if (creation.closeError) fail(creation.closeError);
+  ok();
+} else if (args[0] === "agent" && args[1] === "start") {
+  if (creation.startError) fail(creation.startError);
+  const ready = () => {
+    const agent = { name: args[2], agent: args[4], agent_status: "idle",
+      workspace_id: JSON.parse(fs.readFileSync(tabPath, "utf8")).workspaceId,
+      agent_session: Object.hasOwn(creation, "session") ? creation.session : { kind: "id", value: "example-started-session" } };
+    fs.writeFileSync(startedPath, JSON.stringify({ ...started, [paneId]: agent }));
+    ok({ agent });
+  };
+  if (creation.startDelayMs) setTimeout(ready, creation.startDelayMs);
+  else ready();
+} else if (args[0] === "agent" && args[1] === "get") {
+  if (!live[args[2]]) fail("agent target " + args[2] + " not found");
+  ok({ agent: live[args[2]] });
+} else if (args[0] === "agent" && args[1] === "prompt") {
+  if (creation.promptError) fail(creation.promptError);
+  if (started[args[2]]) {
+    started[args[2]].agent_status = "working";
+    fs.writeFileSync(startedPath, JSON.stringify(started));
+  }
+  ok();
+} else if (args[0] === "pane" && args[1] === "read") {
+  if (!Object.hasOwn(screens, args[2])) process.exit(1);
+  console.log(screens[args[2]]);
+} else ok();
+`);
   chmodSync(path, 0o755);
   return path;
 }
 
-function fixture({ agents = {}, screens = {}, workspaces = [], messages = [], env = [], offset } = {}) {
+function fixture({ agents = {}, screens = {}, workspaces = [], messages = [], env = [], offset, creation = {} } = {}) {
   const root = mkdtempSync(join(tmpdir(), "replies-test-"));
   const stateDir = join(root, "state");
   const configDir = join(root, "config");
@@ -181,16 +209,18 @@ function fixture({ agents = {}, screens = {}, workspaces = [], messages = [], en
     root,
     stateDir,
     configDir,
-    herdr: fakeHerdr(root, agents, screens, workspaces),
+    herdr: fakeHerdr(root, agents, screens, workspaces, creation),
     // The pane redraws: the same agents, a different question on screen.
-    showing: (next) => fakeHerdr(root, agents, next, workspaces),
+    showing: (next) => fakeHerdr(root, agents, next, workspaces, creation),
     // The turn ends, or a new one starts: the same panes, a different state.
-    running: (next) => fakeHerdr(root, next, screens, workspaces),
+    running: (next) => fakeHerdr(root, next, screens, workspaces, creation),
     // A notification recorded after the fixture is up, which is what recording
     // the question it was about needs — the screen is only there to read once
     // the fake herdr is.
     remember: (entry) =>
       appendFileSync(join(stateDir, "messages.jsonl"), JSON.stringify({ at: Date.now(), ...entry }) + "\n"),
+    argv: () => existsSync(join(root, "herdr-argv.jsonl"))
+      ? readFileSync(join(root, "herdr-argv.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line)) : [],
     ran: () =>
       existsSync(join(root, "herdr.log"))
         ? readFileSync(join(root, "herdr.log"), "utf8").split("\n").filter(Boolean)
@@ -259,6 +289,258 @@ const waitFor = (cond, timeoutMs = 15000) =>
     const bomb = setTimeout(() => (clearInterval(poll), reject(new Error("timed out waiting"))), timeoutMs);
   });
 
+test("/new creates a background tab and a uniquely named agent, preserving the prompt and routing confirmation replies", async () => {
+  for (const entry of [
+    { workspace: "STOREfront", kind: "claude", startDelayMs: 10_100 },
+    { workspace: "wZ", kind: "codex", long: true },
+    { workspace: "wY", kind: "a" + "x".repeat(31), empty: true },
+  ]) {
+    const oldName = `${entry.kind.slice(0, 27)}-xxxx`;
+    const fx = fixture({
+      workspaces: [{ workspace_id: "wZ", label: "storefront" }, { workspace_id: "wY", label: "design notes" }],
+      agents: { "wX:p1": { name: oldName, agent_status: "idle", agent_session: { kind: "id", value: "example-old-session" } } },
+      messages: [{ id: 800, paneId: "wX:p1", session: "id:example-old-session" }],
+      screens: { "wZ:p9": "Example live output" },
+      creation: { startDelayMs: entry.startDelayMs },
+    });
+    const marker = join(fx.root, "shell-marker");
+    const prompt = entry.empty ? "" : entry.long ? "x".repeat(4100)
+      : `Review notes.md.\nKeep  two  spaces and $(touch ${marker}) literal.\n--help is text, not an option.\n`;
+    const command = update(1, { text: `  /NeW@${BOT.toUpperCase()} ${entry.workspace} ${entry.kind} ${prompt}`, replyTo: entry.workspace === "STOREfront" ? 800 : undefined });
+    const followups = [
+      update(2, { replyTo: 1001, text: "Continue with the example." }),
+      update(3, { replyTo: 1001, text: "/stop" }),
+      update(4, { replyTo: 1001, text: "/screen" }),
+      update(5, { replyTo: 1001, text: "/diff" }),
+    ];
+    for (const u of [command, ...followups]) u.message.message_thread_id = 77;
+    const tg = await fakeTelegram([[command], followups]);
+    try {
+      const out = await runPoller(fx, tg.base, { until: () => tg.polls.length >= 3, timeoutMs: 30_000 });
+      assert.equal(tg.sent.length, 5, out);
+      const argv = fx.argv();
+      const start = argv.find((a) => a[0] === "agent" && a[1] === "start");
+      assert.match(start[2], /^[a-z][a-z0-9_-]{0,31}$/);
+      assert.match(start[2], new RegExp(`^${entry.kind.slice(0, 27)}-[a-z0-9]{4}$`));
+      assert.notEqual(start[2], oldName);
+      const workspaceId = entry.workspace === "wY" ? "wY" : "wZ";
+      const beforeConfirmation = [
+        ["api", "snapshot"],
+        ["tab", "create", "--workspace", workspaceId, "--label", entry.kind, "--no-focus"],
+        ["agent", "start", start[2], "--kind", entry.kind, "--pane", "wZ:p9"],
+        ...(prompt ? [["agent", "prompt", "wZ:p9", prompt.slice(0, 4000)]] : []),
+        ["agent", "get", "wZ:p9"],
+      ];
+      assert.deepEqual(argv.slice(0, beforeConfirmation.length), beforeConfirmation);
+      assert.ok(argv.every((a) => !a.includes("--") && !a.includes("--wait")), "native agent arguments or a prompt wait were passed");
+      assert.equal(existsSync(marker), false, "the prompt was interpreted by a shell");
+      const label = entry.workspace === "wY" ? "design notes" : "storefront";
+      assert.equal(tg.sent[0].text, `▶ started ${entry.kind} in ${label} · wZ:p9`);
+      assert.equal(tg.sent[0].reply_to_message_id, command.message.message_id);
+      assert.ok(tg.sent.every((m) => m.message_thread_id === 77 && m.chat_id === String(CHAT)));
+      assert.ok(argv.some((a) => JSON.stringify(a) === JSON.stringify(["agent", "prompt", "wZ:p9", "Continue with the example."])));
+      assert.ok(argv.some((a) => JSON.stringify(a) === JSON.stringify(["agent", "send-keys", "wZ:p9", "esc"])));
+      assert.match(tg.sent[3].text, /Example live output/);
+      assert.match(tg.sent[4].text, /no working directory reported for wZ:p9/);
+      const recorded = readFileSync(join(fx.stateDir, "messages.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      assert.equal(recorded.find((m) => m.id === 1001)?.paneId, "wZ:p9");
+      assert.equal(recorded.find((m) => m.id === 1001)?.session, "id:example-started-session");
+      assert.equal(argv.some((a) => a[0] === "agent" && a[2] === "wX:p1"), false, "the command's reply target was used");
+    } finally {
+      tg.close();
+    }
+  }
+});
+
+test("/new refuses missing selectors, unknown or ambiguous workspaces, filtered workspaces and flag-like kinds without mutations", async () => {
+  const texts = ["/new", "/new storefront", "/new absent claude", "/new quiet claude", "/new other claude",
+    "/new storefront --help", "/new storefront CLAUDE", `/new storefront ${"a".repeat(33)}`, "/new shared claude"];
+  const tg = await fakeTelegram([texts.map((text, i) => update(i + 1, { text }))]);
+  const fx = fixture({
+    workspaces: [
+      { workspace_id: "wZ", label: "storefront" }, { workspace_id: "wY", label: "quiet" },
+      { workspace_id: "wX", label: "other" }, { workspace_id: "wU", label: "shared" }, { workspace_id: "wV", label: "shared" },
+    ],
+    env: ["NOTIFY_WORKSPACES=storefront,quiet", "IGNORE_WORKSPACES=QUIET"],
+  });
+  try {
+    const out = await runPoller(fx, tg.base, { until: () => tg.polls.length >= 2 });
+    assert.equal(tg.sent.length, texts.length, out);
+    assert.ok(fx.argv().every((a) => JSON.stringify(a) === JSON.stringify(["api", "snapshot"])));
+    for (const i of [0, 1, 2, 5, 6, 7, 8]) {
+      assert.match(tg.sent[i].text, /Usage: \/new <workspace> <kind> \[prompt\]/);
+      assert.match(tg.sent[i].text, /Known workspaces: storefront \(wZ\), quiet \(wY\)/);
+    }
+    assert.match(tg.sent[2].text, /Unknown workspace/);
+    assert.match(tg.sent[3].text, /IGNORE_WORKSPACES; you would not hear back/);
+    assert.match(tg.sent[4].text, /NOTIFY_WORKSPACES; you would not hear back/);
+    assert.match(tg.sent[5].text, /Invalid kind/);
+    assert.match(tg.sent[8].text, /ambiguous; use its id/);
+  } finally {
+    tg.close();
+  }
+});
+
+test("/new reports lifecycle failures, closes only its failed tab, and explains a missing session", async () => {
+  for (const creation of [
+    { createError: "Workspace is unavailable" },
+    { startError: "Unsupported agent kind: inventedkind" },
+    { startError: "Agent did not become ready", closeError: "Tab is busy" },
+    { missingPane: true },
+    { promptError: "Agent is blocked" },
+    { nulPrompt: true },
+    { session: null },
+  ]) {
+    const text = `/new storefront inventedkind ${creation.nulPrompt ? "Review\u0000notes.md." : "Review notes.md."}`;
+    const tg = await fakeTelegram([[update(1, { text })]]);
+    const fx = fixture({ workspaces: [{ workspace_id: "wZ", label: "storefront" }], creation });
+    try {
+      const out = await runPoller(fx, tg.base, { until: () => tg.polls.length >= 2 });
+      assert.equal(tg.sent.length, 1, out);
+      const argv = fx.argv();
+      const closed = argv.filter((a) => a[0] === "tab" && a[1] === "close");
+      assert.deepEqual(closed, creation.startError || creation.missingPane ? [["tab", "close", "wZ:t9"]] : []);
+      if (creation.createError) {
+        assert.deepEqual(argv.map((a) => a.slice(0, 2)), [["api", "snapshot"], ["tab", "create"]]);
+        assert.match(tg.sent[0].text, /Workspace is unavailable/);
+      } else if (creation.startError) {
+        assert.deepEqual(argv.map((a) => a.slice(0, 2)), [["api", "snapshot"], ["tab", "create"], ["agent", "start"], ["tab", "close"]]);
+        assert.ok(tg.sent[0].text.includes(creation.startError));
+        if (creation.closeError) assert.match(tg.sent[0].text, /Could not close wZ:t9: Tab is busy/);
+      } else if (creation.missingPane) {
+        assert.match(tg.sent[0].text, /did not return the new tab and pane ids/);
+        assert.equal(argv.some((a) => a[0] === "agent"), false);
+      } else if (creation.promptError || creation.nulPrompt) {
+        assert.match(tg.sent[0].text, /▶ started/);
+        assert.match(tg.sent[0].text, /prompt not delivered:/);
+        assert.ok(tg.sent[0].text.includes(creation.promptError || "null bytes"));
+        assert.ok(existsSync(join(fx.stateDir, "messages.jsonl")), "a successfully started session was not recorded");
+      } else {
+        assert.match(tg.sent[0].text, /Replies will work from its first notification/);
+        assert.equal(existsSync(join(fx.stateDir, "messages.jsonl")), false, "a missing session was recorded as answerable");
+      }
+    } finally {
+      tg.close();
+    }
+  }
+});
+
+test("/new applies the chat, sender and bot-address checks before any Herdr calls", async () => {
+  const text = "/new storefront claude Review notes.md.";
+  const anonymous = update(1, { text });
+  delete anonymous.message.from;
+  const tg = await fakeTelegram([[
+    anonymous,
+    update(2, { text, chat: 999 }), update(3, { text, from: 8 }),
+    update(4, { text, sender_chat: { id: 555 } }),
+    update(5, { text: "/new@otherbot storefront claude" }),
+    update(6, { text: "/new@ storefront claude" }),
+  ]]);
+  const fx = fixture({ env: ["REPLY_ALLOWED_USER_IDS=7"], workspaces: [{ workspace_id: "wZ", label: "storefront" }] });
+  try {
+    await runPoller(fx, tg.base, { until: () => tg.polls.length >= 2 });
+    assert.deepEqual(fx.argv(), []);
+    assert.equal(tg.sent.length, 0);
+  } finally {
+    tg.close();
+  }
+});
+
+test("the poller registers every described command once per enabled start, even if Telegram refuses", async () => {
+  assert.ok(COMMANDS.length > 0);
+  assert.equal(new Set(COMMANDS.map((entry) => entry.command)).size, COMMANDS.length);
+  for (const { command, description } of COMMANDS) {
+    assert.match(command, /^[a-z0-9_]{1,32}$/);
+    assert.equal(typeof description, "string", `${command} needs a description`);
+    assert.ok(description.trim().length > 0 && description.length <= 256, `${command} needs a short description`);
+    assert.equal(botCommand(`/${command}`, BOT)?.command, `/${command}`);
+  }
+  for (const refuse of [undefined, "setMyCommands"]) {
+    const tg = await fakeTelegram([[], []], { refuse });
+    const fx = fixture();
+    try {
+      // Several polls prove both that a refused menu is not fatal and that it
+      // is not registered again on every pass through the loop.
+      const out = await runPoller(fx, tg.base, { until: () => tg.polls.length >= 3 });
+      assert.deepEqual(tg.registrations, [{ commands: COMMANDS }]);
+      assert.equal((out.match(/setMyCommands failed/g) ?? []).length, refuse ? 1 : 0);
+      if (refuse) assert.match(out, /Command registration is unavailable/);
+
+      // Only a new start tries again, after the old poller's lock is released.
+      await waitFor(() => !flockHeld(join(fx.stateDir, "replies.lock")));
+      const restarted = await runPoller(fx, tg.base, { until: () => tg.polls.length >= 4 });
+      assert.deepEqual(tg.registrations, [{ commands: COMMANDS }, { commands: COMMANDS }]);
+      assert.equal((restarted.match(/setMyCommands failed/g) ?? []).length, refuse ? 1 : 0);
+    } finally {
+      tg.close();
+    }
+  }
+});
+
+// Startup has no event JSON, but can still carry the focused pane's context.
+// Neither that context nor saved notifications should be handled by this hook.
+test("startup leaves the reply poller running without recording or sending a status change", async () => {
+  for (const [bin, args] of [
+    [process.execPath, [join(HERE, "..", "notify.mjs"), "--startup"]],
+    ["/bin/sh", [join(HERE, "..", "run.sh"), "notify.mjs", "--startup"]],
+  ]) {
+    const tg = await fakeTelegram([]);
+    const fx = fixture({ env: ["SWEEP_MINUTES=0"], offset: 17 });
+    fx.state("wA:p1", "working");
+    const statePath = join(fx.stateDir, "state-wA_p1.json");
+    const state = readFileSync(statePath, "utf8");
+    const obsoletePath = join(fx.stateDir, "last-status-example.txt");
+    writeFileSync(obsoletePath, "done");
+    const pendingPath = join(fx.stateDir, "pending.jsonl");
+    const pending = JSON.stringify({
+      at: Date.now(),
+      parts: { emoji: "✅", agent: "claude", statusLabel: "queued example" },
+    }) + "\n";
+    writeFileSync(pendingPath, pending);
+    const logPath = join(fx.stateDir, "replies.log");
+    const env = {
+      ...process.env,
+      HERDR_PLUGIN_EVENT: "startup",
+      HERDR_PLUGIN_CONTEXT_JSON: JSON.stringify({ focused_pane_id: "wA:p1", focused_pane_status: "done" }),
+      HERDR_PLUGIN_STATE_DIR: fx.stateDir,
+      HERDR_PLUGIN_CONFIG_DIR: fx.configDir,
+      HERDR_BIN_PATH: fx.herdr,
+      TELEGRAM_API_BASE: tg.base,
+    };
+    delete env.HERDR_PLUGIN_EVENT_JSON;
+    try {
+      const child = spawn(bin, args, { env });
+      let out = "";
+      child.stdout.on("data", (d) => (out += d));
+      child.stderr.on("data", (d) => (out += d));
+      const code = await new Promise((resolve) => child.on("exit", resolve));
+
+      assert.equal(code, 0, out);
+      assert.match(out, /started the reply poller/);
+      await waitFor(() => tg.polls.length > 0);
+      assert.equal(flockHeld(join(fx.stateDir, "replies.lock")), true, "the poller did not keep its lock");
+      assert.equal(flockHeld(join(fx.stateDir, "sweep.lock")), false, "the disabled sweeper was started");
+      assert.equal(tg.sent.length, 0, "startup sent a notification");
+      assert.equal(readFileSync(statePath, "utf8"), state, "startup recorded a status change");
+      assert.equal(readFileSync(obsoletePath, "utf8"), "done", "startup cleaned up state");
+      assert.equal(readFileSync(pendingPath, "utf8"), pending, "startup changed the queue");
+      assert.equal(JSON.parse(readFileSync(join(fx.stateDir, "replies.json"), "utf8")).offset, 17);
+      assert.deepEqual(fx.ran(), [], "startup called Herdr instead of only starting the poller");
+    } finally {
+      // The detached poller outlives the hook, so stop only the pid this fixture
+      // logged rather than looking for any other poller on the machine.
+      if (existsSync(logPath)) {
+        for (const [, pid] of readFileSync(logPath, "utf8").matchAll(/polling for replies \(pid (\d+)\)/g)) {
+          try {
+            process.kill(Number(pid), "SIGKILL");
+          } catch {}
+        }
+      }
+      tg.close();
+    }
+  }
+});
+
 // --------------------------------------------------------------- delivery
 
 test("a reply reaches the pane whose notification it answers", async () => {
@@ -281,7 +563,7 @@ test("a blocked agent is typed at, not prompted", async () => {
   const tg = await fakeTelegram([[update(1, { replyTo: 100, text: "2" })]]);
   const fx = fixture({
     agents: { "wA:p1": { agent_status: "blocked", agent_session: { kind: "path", value: "/t/a.jsonl" } } },
-    screens: { "wA:p1": "Do you want to create notes.md?\n 1. Yes\n 2. No, tell me what to do" },
+    screens: { "wA:p1": `Use ghp_${"x".repeat(36)} to create notes.md?\n 1. Yes\n 2. No, tell me what to do` },
   });
   // Still waiting on the question it was asked about, so the keystrokes go in.
   fx.remember({ id: 100, paneId: "wA:p1", session: "path:/t/a.jsonl", question: questionFor(fx, "wA:p1") });
@@ -512,7 +794,7 @@ test("an answer about a message nobody remembers still comes back to the asker",
 });
 
 test("a herdr that refuses the reply says so in the chat rather than dropping it", async () => {
-  const tg = await fakeTelegram([[update(1, { replyTo: 100 })]]);
+  const tg = await fakeTelegram([[update(1, { replyTo: 100 }), update(2, { replyTo: 100, text: "/stop" })]]);
   const fx = fixture({
     agents: { "wA:p1": { agent_status: "working", agent_session: { kind: "id", value: "s1" } } },
     messages: [{ id: 100, paneId: "wA:p1", session: "id:s1" }],
@@ -529,8 +811,15 @@ echo '${JSON.stringify({ result: { agent: { agent_status: "working", agent_sessi
   );
   chmodSync(fx.herdr, 0o755);
   try {
-    await runPoller(fx, tg.base, { until: () => tg.sent.length >= 1 });
-    assert.deepEqual(answers(tg), ["✗ wA:p1: agent target wA:p1 is not accepting prompts"]);
+    await runPoller(fx, tg.base, { until: () => tg.sent.length >= 2 });
+    assert.deepEqual(answers(tg), [
+      "✗ wA:p1: agent target wA:p1 is not accepting prompts",
+      "✗ wA:p1: agent target wA:p1 is not accepting prompts",
+    ]);
+    assert.deepEqual(fx.ran(), [
+      "agent get wA:p1", "agent prompt wA:p1 carry on",
+      "agent get wA:p1", "agent send-keys wA:p1 esc",
+    ]);
   } finally {
     tg.close();
   }
@@ -662,6 +951,7 @@ test("a second poller does not start, so one reply is never delivered twice", as
     stop = true;
     await held;
     assert.equal(tg.sent.length, 1, "the reply was delivered more than once");
+    assert.equal(tg.registrations.length, 1, "a poller without the lock registered the command menu");
   } finally {
     tg.close();
   }
@@ -674,6 +964,7 @@ test("turning REPLIES off stops the poller without anyone finding the process", 
     const out = await runPoller(fx, tg.base, {});
     assert.match(out, /REPLIES is off, stopping the poller/);
     assert.equal(tg.polls.length, 0);
+    assert.equal(tg.registrations.length, 0, "a disabled poller registered the command menu");
   } finally {
     tg.close();
   }
@@ -941,13 +1232,295 @@ test("a mute does not stop a reply reaching its pane — it is the other directi
   }
 });
 
+// ----------------------------------------------------------------- /stop
+
+test("/stop sends only Esc to the recorded session while working or blocked", async () => {
+  const tg = await fakeTelegram([[
+    update(1, { text: "/stop", replyTo: 100 }),
+    update(2, { text: `/stop@${BOT}`, replyTo: 101 }),
+    update(3, { text: "/stop", replyTo: 102 }),
+    update(4, { text: "/stop", replyTo: 103 }),
+    update(5, { text: "/stop", replyTo: 104 }),
+    update(6, { text: "/stop", replyTo: 105 }),
+    update(7, { text: "/stop" }),
+    update(8, { text: "/stop now", replyTo: 100 }),
+    update(9, { text: "/stop", replyTo: 999 }),
+    update(10, { text: "/stop", replyTo: 100, chat: 99 }),
+    update(11, { text: "/stop", replyTo: 100, from: 9 }),
+    update(12, { text: "/stop@otherbot", replyTo: 100 }),
+  ]]);
+  const fx = fixture({
+    agents: {
+      "wA:p1": { agent_status: "working", agent_session: { kind: "id", value: "s1" } },
+      "wA:p2": { agent_status: "blocked", agent_session: { kind: "id", value: "s2" } },
+      "wA:p3": { agent_status: "idle", agent_session: { kind: "id", value: "s3" } },
+      "wA:p4": { agent_status: "done", agent_session: { kind: "id", value: "s4" } },
+      "wA:p5": { agent_status: "working", agent_session: { kind: "id", value: "new-session" } },
+      "wA:p6": { agent_status: "unknown", agent_session: { kind: "id", value: "s6" } },
+    },
+    messages: [
+      // Esc cancels the current work or question, so stale questions should not
+      // prevent it as long as the notification's agent session still matches.
+      { id: 100, paneId: "wA:p1", session: "id:s1", question: QUESTION_UNKNOWN },
+      { id: 101, paneId: "wA:p2", session: "id:s2", question: "old question" },
+      { id: 102, paneId: "wA:p3", session: "id:s3" },
+      { id: 103, paneId: "wA:p4", session: "id:s4" },
+      { id: 104, paneId: "wA:p5", session: "id:old-session" },
+      { id: 105, paneId: "wA:p6", session: "id:s6" },
+    ],
+    env: ["REPLY_ALLOWED_USER_IDS=7"],
+  });
+  try {
+    await runPoller(fx, tg.base, { until: () => tg.polls.length >= 2 });
+    assert.deepEqual(fx.ran().filter((line) => !line.startsWith("agent get ")), [
+      "agent send-keys wA:p1 esc",
+      "agent send-keys wA:p2 esc",
+    ]);
+    const [working, blocked, idle, done, changed, unknown, notReply, args, expired] = answers(tg);
+    assert.equal(tg.sent.length, 9, "another chat, an unlisted sender or another bot's command got an answer");
+    assert.equal(working, "⏹ sent Esc to wA:p1");
+    assert.equal(blocked, "⏹ sent Esc to wA:p2");
+    assert.match(idle, /^⏹ nothing to stop in wA:p3/);
+    assert.match(done, /^⏹ nothing to stop in wA:p4/);
+    assert.match(changed, /^✗ not delivered — wA:p5 is running a different agent session now/);
+    assert.match(unknown, /^✗ not stopped — I cannot tell whether wA:p6 is working or blocked/);
+    assert.match(notReply, /^Reply to one of my notifications with \/stop/);
+    assert.equal(args, "Usage: /stop on its own, with nothing after it.");
+    assert.match(expired, /no pane recorded for message 999/);
+  } finally {
+    tg.close();
+  }
+});
+
+// --------------------------------------------------------------- /screen
+
+test("/screen reads only the recorded session and keeps the escaped screen's bottom within one message", async () => {
+  const asked = update(1, { text: `/screen@${BOT}`, replyTo: 100 });
+  asked.message.message_thread_id = 77;
+  const tg = await fakeTelegram([[
+    asked,
+    update(2, { text: "/screen", replyTo: 101 }),
+    update(3, { text: "/screen", replyTo: 102 }),
+    update(5, { text: "/screen", replyTo: 104 }),
+    update(6, { text: "/screen", replyTo: 105 }),
+    update(7, { text: "/screen" }),
+    update(8, { text: "/screen now", replyTo: 100 }),
+    update(9, { text: "/screen", replyTo: 999 }),
+    update(10, { text: "/screen", replyTo: 100, chat: 99 }),
+    update(11, { text: "/screen", replyTo: 100, from: 9 }),
+    update(12, { text: "/screen@otherbot", replyTo: 100 }),
+  ]]);
+  const fx = fixture({
+    agents: {
+      "wA:p1": { agent: "claude", display_agent: "review <worker>", agent_status: "working", agent_session: { kind: "id", value: "s1" } },
+      "wA:p2": { agent: "pi", agent_status: "working", agent_session: { kind: "id", value: "new-session" } },
+      "wA:p3": { agent: "codex", agent_status: "blocked", agent_session: { kind: "id", value: "s3" } },
+      "wA:p5": { agent: "claude", agent_status: "working", agent_session: { kind: "id", value: "s5" } },
+      "wA:p6": { agent: "pi", agent_status: "idle", agent_session: { kind: "id", value: "s6" } },
+    },
+    messages: [
+      { id: 100, paneId: "wA:p1", session: "id:s1", question: QUESTION_UNKNOWN },
+      { id: 101, paneId: "wA:p2", session: "id:old-session" },
+      { id: 102, paneId: "wA:p3", session: "id:s3", question: "old question" },
+      { id: 104, paneId: "wA:p5", session: "id:s5" },
+      { id: 105, paneId: "wA:p6", session: "id:s6" },
+    ],
+    screens: {
+      "wA:p1": `First <step> & checks\nKey ghp_${"x".repeat(36)}\nLatest > output & ready`,
+      "wA:p2": "Private text from the replacement session",
+      "wA:p3": Array.from({ length: 50 }, (_, i) => `Line ${i}: ${"<>&".repeat(80)} 😀`).join("\n") + "\nBottom <ready> & 😀",
+      "wA:p5": "\n \n",
+    },
+    env: ["REPLY_ALLOWED_USER_IDS=7"],
+  });
+  try {
+    await runPoller(fx, tg.base, { until: () => tg.polls.length >= 2 });
+    assert.equal(tg.sent.length, 8, "a screen was shown outside the configured chat, allowlist or bot");
+    assert.deepEqual(fx.ran().filter((line) => !line.startsWith("agent get ")), [
+      "pane read wA:p1 --lines 80 --format text",
+      "pane read wA:p3 --lines 80 --format text",
+      "pane read wA:p5 --lines 80 --format text",
+      "pane read wA:p6 --lines 80 --format text",
+    ]);
+    const [normal, changed, long, empty, unreadable, notReply, args, expired] = tg.sent;
+    assert.equal(normal.text, "⏳ review &lt;worker&gt; · working · wA:p1\n<pre>First &lt;step&gt; &amp; checks\nKey ghp_…[masked]\nLatest &gt; output &amp; ready</pre>");
+    assert.equal(normal.reply_to_message_id, 10);
+    assert.equal(normal.message_thread_id, 77);
+    assert.match(changed.text, /^✗ not delivered — wA:p2 is running a different agent session now/);
+    for (const message of [normal, long]) {
+      assert.equal(message.parse_mode, "HTML");
+      assert.ok(message.text.length <= 4096, `the screen has ${message.text.length} characters`);
+      assert.ok(message.text.endsWith("</pre>"));
+    }
+    assert.match(long.text, /^⚠️ codex · blocked · wA:p3\n<pre>/);
+    assert.ok(!long.text.includes("Line 11:"), "a line near the top was kept instead of the bottom");
+    assert.ok(long.text.endsWith("Bottom &lt;ready&gt; &amp; 😀</pre>"));
+    assert.match(empty.text, /no readable screen for wA:p5/i);
+    assert.match(unreadable.text, /no readable screen for wA:p6/i);
+    assert.match(notReply.text, /^Reply to one of my notifications with \/screen/);
+    assert.equal(args.text, "Usage: /screen on its own, with nothing after it.");
+    assert.match(expired.text, /no pane recorded for message 999/);
+  } finally {
+    tg.close();
+  }
+});
+
+// ----------------------------------------------------------------- /diff
+
+test("/diff returns masked changes from the live repository without external drivers or pane input", async () => {
+  const batches = [];
+  const tg = await fakeTelegram(batches);
+  const fx = fixture({ env: ["REPLY_ALLOWED_USER_IDS=7"] });
+  const binary = gitBin();
+  const previousGit = process.env.GIT_BIN_PATH;
+  // Inherited directory or index overrides must not redirect fixture commits
+  // into the project running these tests.
+  const git = (cwd, ...args) => {
+    const res = spawnSync(binary, ["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "-C", cwd, ...args], {
+      encoding: "utf8",
+      env: {
+        ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_"))),
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_AUTHOR_NAME: "Example Reviewer",
+        GIT_AUTHOR_EMAIL: "reviewer@example.invalid",
+        GIT_COMMITTER_NAME: "Example Reviewer",
+        GIT_COMMITTER_EMAIL: "reviewer@example.invalid",
+      },
+    });
+    assert.equal(res.status, 0, res.stderr);
+  };
+  const repo = (name, commit = true) => {
+    const cwd = join(fx.root, name);
+    mkdirSync(cwd);
+    git(cwd, "init", "-q", "--template=");
+    if (commit) {
+      writeFileSync(join(cwd, "tracked.txt"), "Old test line.\n");
+      writeFileSync(join(cwd, ".gitattributes"), "tracked.txt diff=example\n");
+      git(cwd, "add", "tracked.txt", ".gitattributes");
+      // These commits exist only in new fixture directories, never this project.
+      git(cwd, "commit", "-qm", "Add invented test files");
+    }
+    return cwd;
+  };
+  try {
+    const dirty = repo("work tree");
+    const clean = repo("clean");
+    const unborn = repo("unborn", false);
+    const large = repo("large");
+    const untracked = repo("untracked-only");
+    const notRepo = join(fx.root, "not-a-repo");
+    mkdirSync(notRepo);
+    const secret = `ghp_${"x".repeat(36)}`;
+    writeFileSync(join(dirty, "tracked.txt"), "New test line.\n");
+    git(dirty, "add", "tracked.txt");
+    appendFileSync(join(dirty, "tracked.txt"), `Printed ${secret}\n`);
+    writeFileSync(join(dirty, "notes.md"), "Untracked content must not be sent.\n");
+    writeFileSync(join(untracked, "notes.md"), "Another untracked file must not be read.\n");
+    writeFileSync(join(large, "tracked.txt"), "x".repeat(6 * 1024 * 1024) + "\n");
+    const marker = join(fx.root, "driver-ran");
+    const driver = join(fx.root, "diff driver.mjs");
+    writeFileSync(driver, `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, "ran");\nconsole.log("Converted test text.");\n`);
+    const command = `${JSON.stringify(process.execPath)} ${JSON.stringify(driver)}`;
+    git(dirty, "config", "diff.external", command);
+    git(dirty, "config", "diff.example.textconv", command);
+
+    // The proxy proves the poller uses gitBin() and optional locks are disabled,
+    // while the real repository and driver marker test Git's actual behaviour.
+    const log = join(fx.root, "git-calls.jsonl");
+    const proxy = join(fx.root, "fake-git.mjs");
+    writeFileSync(proxy, `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+const args = process.argv.slice(2);
+appendFileSync(${JSON.stringify(log)}, JSON.stringify({ args, locks: process.env.GIT_OPTIONAL_LOCKS }) + "\\n");
+const res = spawnSync(${JSON.stringify(binary)}, args, {
+  maxBuffer: 16 * 1024 * 1024,
+  env: {
+    ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_"))),
+    GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_OPTIONAL_LOCKS: "0",
+  },
+});
+process.stdout.write(res.stdout ?? "");
+process.stderr.write(res.stderr ?? "");
+process.exitCode = res.status ?? 1;
+`, { mode: 0o755 });
+    process.env.GIT_BIN_PATH = proxy;
+    const session = { kind: "id", value: "example-session" };
+    fx.running({
+      "wZ:p1": { agent_status: "blocked", agent_session: session, foreground_cwd: dirty },
+      "wZ:p2": { agent_status: "idle", agent_session: session, cwd: clean },
+      "wZ:p3": { agent_status: "working", agent_session: { kind: "id", value: "replacement-session" }, cwd: dirty },
+      "wZ:p4": { agent_status: "working", agent_session: session, cwd: unborn },
+      "wZ:p5": { agent_status: "working", agent_session: session, cwd: notRepo },
+      "wZ:p6": { agent_status: "working", agent_session: session, cwd: large },
+      "wZ:p7": { agent_status: "working", agent_session: session, cwd: untracked },
+      "wZ:p8": { agent_status: "working", agent_session: session },
+    });
+    for (let i = 1; i <= 8; i++) fx.remember({ id: 99 + i, paneId: `wZ:p${i}`, session: "id:example-session", question: QUESTION_UNKNOWN });
+    const asked = update(1, { text: `/diff@${BOT}`, replyTo: 100 });
+    asked.message.message_thread_id = 77;
+    batches.push([
+      asked,
+      ...Array.from({ length: 7 }, (_, i) => update(i + 2, { text: "/diff", replyTo: 101 + i })),
+      update(9, { text: "/diff" }),
+      update(10, { text: "/diff now", replyTo: 100 }),
+      update(11, { text: "/diff", replyTo: 999 }),
+      update(12, { text: "/diff@otherbot", replyTo: 100 }),
+      update(13, { text: "/diff", replyTo: 100, chat: 99 }),
+      update(14, { text: "/diff", replyTo: 100, from: 9 }),
+    ]);
+    await runPoller(fx, tg.base, { until: () => tg.polls.length >= 2 });
+    assert.equal(tg.sent.length, 11, "an ignored command got an answer");
+    const [doc, noChanges, changed, noCommits, outside, oversized, onlyNew, noCwd, noReply, args, expired] = tg.sent;
+    assert.equal(doc.method, "sendDocument");
+    assert.equal(doc["document.filename"], "wZ-p1.diff");
+    assert.match(doc.document, /diff --git .*tracked\.txt .*tracked\.txt/);
+    assert.match(doc.document, /-Old test line\.\n\+New test line\./);
+    assert.ok(doc.document.includes("ghp_…[masked]"));
+    assert.ok(!doc.document.includes(secret));
+    assert.ok(!doc.document.includes("Untracked content must not be sent"));
+    assert.equal(doc.caption, "✎ 1 file · +2 −1 · 1 new: notes.md");
+    assert.equal(doc.chat_id, String(CHAT));
+    assert.equal(doc.reply_to_message_id, "10");
+    assert.equal(doc.message_thread_id, "77");
+    assert.equal(doc.disable_notification, "true");
+    assert.match(noChanges.text, /no uncommitted changes/i);
+    assert.match(changed.text, /running a different agent session now/);
+    for (const message of [noCommits, outside]) assert.match(message.text, /not a git repo.*no commits yet/i);
+    assert.match(oversized.text, /6\.\d+ MB \(\d+ bytes\), over the 5 MB limit/);
+    assert.match(oversized.text, /✎ 1 file · \+1 −1/);
+    assert.equal(onlyNew.method, "sendDocument");
+    assert.equal(onlyNew.caption, "✎ 1 new: notes.md");
+    assert.match(onlyNew.document, /^# No tracked changes/);
+    assert.ok(!onlyNew.document.includes("Another untracked file must not be read"));
+    assert.match(noCwd.text, /no working directory reported/);
+    assert.match(noReply.text, /^Reply to one of my notifications with \/diff/);
+    assert.equal(args.text, "Usage: /diff on its own, with nothing after it.");
+    assert.match(expired.text, /no pane recorded for message 999/);
+    assert.equal(existsSync(marker), false, "Git ran an external diff driver or textconv");
+    assert.deepEqual(fx.ran(), Array.from({ length: 8 }, (_, i) => `agent get wZ:p${i + 1}`));
+    const calls = readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal(calls.filter((call) => call.args[1] === dirty).length, 4, "the changed session read the repository");
+    assert.ok(calls.every((call) => call.locks === "0"));
+    for (const { args } of calls.filter((call) => call.args.includes("diff"))) {
+      for (const flag of ["HEAD", "--no-color", "--no-ext-diff", "--no-textconv"]) assert.ok(args.includes(flag), flag);
+    }
+  } finally {
+    tg.close();
+    if (previousGit === undefined) delete process.env.GIT_BIN_PATH;
+    else process.env.GIT_BIN_PATH = previousGit;
+  }
+});
+
 // ----------------------------------------------------------------- /full
 
 const documents = (tg) => tg.sent.filter((m) => m.method === "sendDocument");
 
 test("/full sends what the notification carried, not what the agent says now", async () => {
   const tg = await fakeTelegram([[update(1, { text: "/full", replyTo: 100 })]]);
-  const whole = "The migration is done.\n\n- added an index\n- dropped the old column\n\nRéady? ✅";
+  const secret = `ghp_${"x".repeat(36)}`;
+  const whole = `The migration is done.\n\n- added an index\n- dropped the old column\n\nPrinted ${secret}\nReady? ✅`;
   const fx = fixture({
     agents: { "wA:p1": { agent_status: "working", agent_session: { kind: "id", value: "s2" } } },
     messages: [
@@ -961,7 +1534,8 @@ test("/full sends what the notification carried, not what the agent says now", a
     await runPoller(fx, tg.base, { until: () => tg.sent.length >= 1 });
     const [doc] = documents(tg);
     assert.ok(doc, `no document was sent; got ${JSON.stringify(tg.sent)}`);
-    assert.equal(doc.document, whole);
+    assert.equal(doc.document, whole.replace(secret, "ghp_…[masked]"));
+    assert.equal(doc.document.includes(secret), false);
     assert.equal(doc["document.filename"], "wA_p1-100.txt");
     assert.match(doc["document.type"], /^text\/plain; ?charset=utf-8$/);
     assert.equal(doc.chat_id, String(CHAT));
