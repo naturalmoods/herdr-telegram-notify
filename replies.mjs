@@ -93,7 +93,13 @@ if (!token || !chatId) {
 }
 
 async function telegram(method, payload, timeoutMs) {
-  return (await telegramCall(token, method, payload, timeoutMs)).json;
+  let res = await telegramCall(token, method, payload, timeoutMs);
+  // A pooled connection can go stale while a synchronous child (an agent start,
+  // a transcription) holds the event loop, and the first request after it then
+  // fails before reaching Telegram. One more try gets a fresh connection. A
+  // timeout is not retried: that request may well have arrived.
+  if (res.status === 0 && !/abort|timeout/i.test(res.text)) res = await telegramCall(token, method, payload, timeoutMs);
+  return res.json;
 }
 
 // Register the slash menu only for the poller holding the lock with replies on.
