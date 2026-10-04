@@ -1,31 +1,35 @@
 #!/usr/bin/env node
-// Event hook for herdr-plugin.toml's `pane.agent_status_changed` entry.
+// Event hook for herdr-plugin.toml's status-change and pane-closure entries.
 // Fires on every agent status change; we record the transition, filter down to
 // the configured statuses and send a Telegram message describing what the agent
 // was actually doing. See README.md for the env vars Herdr injects and for the
 // config keys that switch each part of the message on or off.
+// The startup hook starts background processes without needing a status event.
 
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync, statSync, openSync, unlinkSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { hostname } from "node:os";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 import {
+  BLOCKED_DELAY_MAX_SECONDS,
   PENDING_MAX,
   PENDING_TTL,
   QUESTION_UNKNOWN,
+  blockedEpisode,
   buildMessage,
   clip,
   clockTime,
   closeMessages,
   escapeHtml,
+  herdr,
   herdStatusText,
   firstDefined,
   flockAvailable,
   flockHeld,
-  gitBin,
+  forgetState,
   holdFlock,
   humanCost,
   humanDuration,
@@ -36,6 +40,7 @@ import {
   listMatches,
   loadConfig,
   loadSnapshot,
+  maskSecrets,
   mutedUntil,
   questionOnScreen,
   readLines,
@@ -59,6 +64,7 @@ import {
   transcriptPath,
   truncate,
   withFileLock,
+  workingTreeChanges,
   writeLines,
   writeState,
 } from "./lib.mjs";
@@ -110,8 +116,8 @@ function readJson(envVar) {
 let snapshotCache;
 let snapshotLoaded = false;
 
-// Two callers now want it — the event being handled and the reminder sweep —
-// and it costs a subprocess, so it is fetched at most once per run.
+// The event and the reminder sweep share one subprocess while handling the
+// same point in time. A delayed notification refreshes it after the wait.
 function sessionSnapshot() {
   if (!snapshotLoaded) {
     snapshotCache = loadSnapshot();
@@ -130,7 +136,7 @@ function paneInfo(snapshot, paneId) {
   if (!pane) return {};
   return {
     cwd: firstDefined(pane.cwd, pane.foreground_cwd),
-    title: pane.terminal_title_stripped,
+    title: pane.terminal_title_stripped && maskSecrets(pane.terminal_title_stripped),
     session: pane.agent_session,
     workspaceId: pane.workspace_id,
     workspaceLabel: (snapshot.workspaces ?? []).find((w) => w.workspace_id === pane.workspace_id)?.label,
@@ -167,41 +173,6 @@ function herdSummary(snap, paneId) {
 
 // ------------------------------------------------------------------- extras
 
-function git(cwd, args) {
-  const res = spawnSync(gitBin(), ["-C", cwd, ...args], {
-    encoding: "utf8",
-    timeout: 3000,
-    maxBuffer: 1024 * 1024,
-    env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
-  });
-  if (res.error || res.status !== 0) return undefined;
-  return res.stdout;
-}
-
-// What is sitting in the working tree right now. Not all of it need be this
-// turn's doing, but it is the difference between an agent that thought about the
-// problem and one that changed things — which is most of what you want to know
-// before deciding whether to walk back to the desk.
-function workingTreeChanges(cwd) {
-  const stat = git(cwd, ["diff", "--shortstat", "HEAD"]);
-  if (stat === undefined) return undefined; // not a repo, no commits yet, no git
-
-  const bits = [];
-  const files = /(\d+) files? changed/.exec(stat);
-  const added = /(\d+) insertions?\(\+\)/.exec(stat);
-  const removed = /(\d+) deletions?\(-\)/.exec(stat);
-  if (files) bits.push(`${files[1]} ${files[1] === "1" ? "file" : "files"}`);
-  if (added || removed) bits.push(`+${added?.[1] ?? 0} −${removed?.[1] ?? 0}`);
-
-  // A file the agent has only just written is untracked, so the diff above
-  // cannot see it at all — and a new file is rarely the boring half of the work.
-  const untracked = git(cwd, ["ls-files", "--others", "--exclude-standard"]);
-  const newFiles = untracked ? untracked.split("\n").filter((l) => l.trim()).length : 0;
-  if (newFiles) bits.push(`${newFiles} new`);
-
-  return bits.length ? bits.join(" · ") : undefined;
-}
-
 function gitBranch(cwd) {
   let dir = cwd;
   while (dir && dir !== dirname(dir)) {
@@ -233,8 +204,8 @@ function stateKey(event, context) {
   return sanitizeKey(firstDefined(event.data?.pane_id, context.focused_pane_id, "default"));
 }
 
-// A closed pane never comes back to clean up after itself, and an upgrade leaves
-// the previous scheme's files lying around — so the state directory only ever
+// A missed pane closure leaves its state behind, and an upgrade leaves the
+// previous scheme's files lying around — so the state directory only ever
 // grows unless someone sweeps it. Untouched for a week means the pane is gone;
 // its status is no longer worth de-duplicating against.
 function sweepState(stateDir) {
@@ -293,9 +264,9 @@ async function remindBlocked(stateDir, cfg, { token, chatId, silent }) {
   if (!due.length) return;
 
   const snap = sessionSnapshot();
-  // Counted as sent, not as found: a pane closed while blocked keeps its state
-  // file for a week, and capping the candidates let a few of those take every
-  // slot from a pane that is really waiting.
+  // Counted as sent, not as found: a missed closure can leave a blocked pane's
+  // state file for a week, and capping the candidates let a few of those take
+  // every slot from a pane that is really waiting.
   let sent = 0;
   for (const { file, state } of due) {
     if (sent >= MAX_REMINDERS) break;
@@ -375,8 +346,9 @@ function menuOptions(cfg, question, screen) {
 // A blocked agent's menu, as buttons under its notification. Each sends the
 // option's number back the way a typed reply would, through the same checks.
 function menuKeyboard(options) {
+  // Queued labels may have been captured before masking was enabled.
   return options?.length
-    ? { inline_keyboard: options.map((o) => [{ text: clip(`${o.n}. ${o.label}`, 48), callback_data: o.n }]) }
+    ? { inline_keyboard: options.map((o) => [{ text: clip(maskSecrets(`${o.n}. ${o.label}`), 48), callback_data: o.n }]) }
     : undefined;
 }
 
@@ -461,11 +433,12 @@ async function editTelegram(token, chatId, messageId, message) {
   }
 }
 
-// The notifications this pane's status change has overtaken, marked as such in
-// place: a question answered at the keyboard, a finished turn that has since
-// been seen or followed by another. What is left looking like a notification
-// in the chat is what is still waiting on you. The old screen goes — it is the
-// question that is no longer being asked — and a finished turn's answer stays.
+// The notifications this pane's status change or closure has overtaken, marked
+// as such in place: a question answered at the keyboard, a finished turn that
+// has since been seen or followed by another. What is left looking like a
+// notification in the chat is what is still waiting on you. The old screen
+// goes — it is the question that is no longer being asked — and a finished
+// turn's answer stays.
 async function markResolved(stateDir, token, chatId, paneId, status) {
   let closed;
   try {
@@ -493,12 +466,12 @@ async function markResolved(stateDir, token, chatId, paneId, status) {
 
 // ------------------------------------------------------------------- board
 
-// One message that is the herd, kept current: edited on every status change
-// rather than sent, so it costs no notification, and pinned so it is the first
-// thing the chat shows. /status is the same list on demand. Under a lock and
-// read inside it, so of two changes landing together the later edit is also
-// the later snapshot. A board that was deleted, or that sits in a chat or topic
-// the config no longer names, is replaced by a new one.
+// One message that is the herd, kept current: edited on every status change or
+// pane closure rather than sent, so it costs no notification, and pinned so it
+// is the first thing the chat shows. /status is the same list on demand. Under
+// a lock and read inside it, so of two changes landing together the later edit
+// is also the later snapshot. A board that was deleted, or that sits in a chat
+// or topic the config no longer names, is replaced by a new one.
 async function updateBoard(stateDir, cfg, token, chatId) {
   const release = holdFlock(join(stateDir, "board.lock"), { waitSeconds: 10 });
   if (!release) return;
@@ -554,11 +527,39 @@ async function updateBoard(stateDir, cfg, token, chatId) {
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 
+// Startup has no status event to record, but replies and queued messages should
+// not wait for one. Status hooks call this too, so enabling either process in
+// the config takes effect without restarting Herdr.
+async function ensureDaemons(stateDir = process.env.HERDR_PLUGIN_STATE_DIR, cfg = loadConfig()) {
+  const dryRun = isOn(cfg("DRY_RUN"));
+  const token = cfg("TELEGRAM_BOT_TOKEN");
+  const chatId = cfg("TELEGRAM_CHAT_ID");
+  // Replies are the other direction, and a mute does not apply to them: silence
+  // is about what arrives on the phone, not about being able to answer.
+  if (!dryRun && isOn(cfg("REPLIES")) && token && chatId) {
+    ensureDaemon(stateDir, { lock: "replies.lock", script: "replies.mjs", log: "replies.log", label: "reply poller" });
+  }
+  // ponytail: one idle process per machine while SWEEP_MINUTES is set, doing two
+  // directory reads a pass. Worth it for a queue and a reminder that no longer
+  // wait on someone else's pane; if that ever needs to cost nothing, the
+  // sweeper would have to exit when there is nothing queued and no reminders
+  // configured, and be woken again by the event that queues one.
+  if (!dryRun && toInt(cfg("SWEEP_MINUTES"), 0) > 0 && token && chatId) {
+    ensureDaemon(stateDir, {
+      lock: "sweep.lock",
+      script: "notify.mjs",
+      args: ["--sweep"],
+      log: "sweep.log",
+      label: "reminder sweeper",
+    });
+  }
+}
+
 // The reply poller and the sweeper both run for as long as they are wanted,
-// which is longer than any one hook. Every event checks the ones it wants are
-// still there — a lock file read, when they are — rather than anything having to
-// be started by hand. The lock is written here rather than by the child, so a
-// process that dies on startup is not spawned again by every event after it.
+// which is longer than any one hook. Startup and status hooks check their locks
+// rather than requiring either process to be started by hand. The lock is
+// written here rather than by the child, so a process that dies on startup is
+// not spawned again by every event after it.
 function ensureDaemon(stateDir, { lock, script, args = [], log: logName, label }) {
   if (!stateDir) return;
   if (!flockAvailable()) {
@@ -757,11 +758,11 @@ async function sweep(stateDir, cfg) {
 }
 
 // `notify.mjs --sweep`: the same sweep on a timer, in the detached copy of this
-// script that ensureDaemon() starts from any event. A status change is the only
-// other cue there is, and it is precisely the thing that does not arrive while
-// an agent stands blocked or the wifi is out — so without this a reminder waits
-// for someone else's pane to finish, and the last message of an outage stays in
-// the queue until it does.
+// script that ensureDaemon() starts at startup or from a status change. A
+// status change or pane closure is the only other cue there is, and neither
+// arrives while all agents stand blocked or the wifi is out — so without this
+// a reminder waits for someone else's pane to finish, and the last message of
+// an outage stays in the queue until it does.
 async function sweepLoop() {
   const stateDir = process.env.HERDR_PLUGIN_STATE_DIR;
   if (!stateDir) {
@@ -799,8 +800,8 @@ async function sweepLoop() {
     snapshotLoaded = false;
     sweepState(stateDir);
     const online = await sweep(stateDir, cfg);
-    // A pane that closes raises no status change, so the board would keep it
-    // until the next one did.
+    // A timer refresh catches changes whose event was missed while the plugin
+    // was disabled, so the board does not keep showing an old snapshot.
     const [token, chatId] = [cfg("TELEGRAM_BOT_TOKEN"), cfg("TELEGRAM_CHAT_ID")];
     if (online && token && chatId && !isOn(cfg("DRY_RUN")) && isOn(cfg("BOARD"))) {
       await updateBoard(stateDir, cfg, token, chatId);
@@ -825,7 +826,10 @@ async function main() {
     if (debug) console.log(`herdr-telegram-notify: ${why}`);
   };
 
-  const rawStatus = firstDefined(data.agent_status, context.focused_pane_status);
+  // A closure has no agent status; the focused pane's status belongs to a
+  // different pane and must not turn this event into a new notification.
+  const paneClosed = event.event === "pane_closed" || process.env.HERDR_PLUGIN_EVENT === "pane.closed";
+  const rawStatus = paneClosed ? "closed" : firstDefined(data.agent_status, context.focused_pane_status);
   const status = typeof rawStatus === "string" ? rawStatus.toLowerCase() : undefined;
   if (!status) {
     note("the event carried no agent status");
@@ -835,6 +839,10 @@ async function main() {
   // Record every transition — the working→done gap is where the duration comes
   // from — then decide whether this one is worth a message.
   const stateDir = process.env.HERDR_PLUGIN_STATE_DIR;
+  const key = stateKey(event, context);
+  // Forget a closed pane before sweeping, so it cannot produce a reminder even
+  // when message edits are disabled or Telegram is unreachable.
+  if (paneClosed && data.pane_id) forgetState(stateDir, key);
   sweepState(stateDir);
 
   const dryRun = isOn(cfg("DRY_RUN"));
@@ -844,35 +852,16 @@ async function main() {
   // does not make a sound doing it.
   const silent = inQuietHours(cfg("QUIET_HOURS"));
   const muted = mutedUntil(stateDir);
-  // Replies are the other direction, and a mute does not apply to them: silence
-  // is about what arrives on the phone, not about being able to answer.
-  if (!dryRun && isOn(cfg("REPLIES")) && token && chatId) {
-    ensureDaemon(stateDir, { lock: "replies.lock", script: "replies.mjs", log: "replies.log", label: "reply poller" });
-  }
-  // ponytail: one idle process per machine while SWEEP_MINUTES is set, doing two
-  // directory reads a pass. Worth it for a queue and a reminder that no longer
-  // wait on someone else's pane; if that ever needs to cost nothing, the
-  // sweeper would have to exit when there is nothing queued and no reminders
-  // configured, and be woken again by the event that queues one.
-  if (!dryRun && toInt(cfg("SWEEP_MINUTES"), 0) > 0 && token && chatId) {
-    ensureDaemon(stateDir, {
-      lock: "sweep.lock",
-      script: "notify.mjs",
-      args: ["--sweep"],
-      log: "sweep.log",
-      label: "reminder sweeper",
-    });
-  }
+  if (!paneClosed) await ensureDaemons(stateDir, cfg);
   // Whatever the network was down for waits in the state directory, and any
-  // status change on any pane is a cue to try again — including the ones this
-  // run is about to filter out, which is what keeps a queue from sitting there
+  // status change or pane closure is a cue to try again — even when this run
+  // filters it out, which is what keeps a queue from sitting there
   // until the next thing worth notifying happens. The sweeper above is the cue
   // for when no status change comes at all.
   const online = await sweep(stateDir, cfg);
 
-  const key = stateKey(event, context);
   const previous = readState(stateDir, key);
-  if (previous.status === status) {
+  if (!paneClosed && previous.status === status) {
     // A repeat of a state already handled.
     note(`${firstDefined(data.pane_id, "the pane")} was already ${status}`);
     return;
@@ -889,7 +878,7 @@ async function main() {
   // status change on wake, not when the agent stopped. Past this the transcript's
   // own turn is the more honest number.
   const paneElapsed = sinceWorking !== undefined && sinceWorking <= MAX_PANE_ELAPSED ? sinceWorking : undefined;
-  writeState(stateDir, key, { status, workingSince, updatedAt: now, paneId: data.pane_id });
+  if (!paneClosed) writeState(stateDir, key, { status, workingSince, updatedAt: now, paneId: data.pane_id });
 
   // Every transition, not only the ones that notify: `working` and `idle` are
   // precisely the ones that say an earlier message has been dealt with. Not
@@ -900,6 +889,7 @@ async function main() {
   if (!dryRun && online && token && chatId && isOn(cfg("BOARD")) && stateDir) {
     await updateBoard(stateDir, cfg, token, chatId);
   }
+  if (paneClosed) return;
 
   const notifyStatuses = new Set(
     String(cfg("NOTIFY_STATUSES"))
@@ -926,6 +916,26 @@ async function main() {
   }
 
   const paneId = firstDefined(data.pane_id, context.focused_pane_id);
+  const blockedDelay = Math.min(toInt(cfg("BLOCKED_DELAY_SECONDS"), 0), BLOCKED_DELAY_MAX_SECONDS);
+  // Without a state directory there is no episode to compare, so it sends at once.
+  if (status === "blocked" && blockedDelay > 0 && !dryRun && stateDir) {
+    // No lock spans this wait: another hook must be able to record an answer.
+    // The episode also distinguishes an answer followed by another question.
+    await sleep(blockedDelay * 1000);
+    let live;
+    if (blockedEpisode(stateDir, paneId) === now) {
+      try {
+        live = JSON.parse(herdr(["agent", "get", paneId]))?.result?.agent;
+      } catch {}
+    }
+    if (live?.agent_status !== "blocked" || blockedEpisode(stateDir, paneId) !== now) {
+      note(`${paneId ?? "the pane"} was answered within the blocked delay; not sending`);
+      return;
+    }
+    // A sweep or board refresh may have loaded it before the wait; the message
+    // must describe the pane as it stands now, not that earlier snapshot.
+    snapshotLoaded = false;
+  }
   const wantsSnapshot =
     isOn(cfg("SHOW_PROJECT")) ||
     isOn(cfg("SHOW_BRANCH")) ||
@@ -978,7 +988,7 @@ async function main() {
   const rawTitle = firstDefined(data.title, info.title);
   const title =
     isOn(cfg("SHOW_TITLE")) && rawTitle
-      ? String(rawTitle).replace(/^[^\p{L}\p{N}]+/u, "").trim() || undefined
+      ? maskSecrets(String(rawTitle).replace(/^[^\p{L}\p{N}]+/u, "").trim()) || undefined
       : undefined;
 
   const projectBits = [];
@@ -1172,9 +1182,9 @@ async function main() {
 // A hook that dies takes its message with it, and an unhandled rejection reports
 // that as a bare stack trace in the plugin log — through which the token would
 // travel if the failure came from anywhere near the request URL.
-// The event hook by default; the timer when the detached copy is started with
-// --sweep. One file, because the sweep is the same code either way.
-(process.argv.includes("--sweep") ? sweepLoop() : main()).catch((err) => {
+// Startup only starts background processes; it must not record a transition
+// from the focused-pane context or send a notification without a status event.
+(process.argv.includes("--sweep") ? sweepLoop() : process.argv.includes("--startup") ? ensureDaemons() : main()).catch((err) => {
   console.error(`herdr-telegram-notify: unexpected failure — ${redact(err?.stack ?? err?.message ?? err)}`);
   process.exitCode = 1;
 });

@@ -10,8 +10,11 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, chmodSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 
-const HERE = new URL(".", import.meta.url).pathname;
+import { flockHeld, holdFlock, readState, rememberMessage, sleep, writeState } from "../lib.mjs";
+
+const HERE = fileURLToPath(new URL(".", import.meta.url));
 const NOTIFY = join(HERE, "..", "notify.mjs");
 
 // Answers the scripted replies in order, then OK for anything after them.
@@ -51,6 +54,15 @@ function fakeHerdr(dir, agents = [], readsScreen = true) {
         ? 'echo "Do you want to create notes.md?"; echo " 1. Yes"; exit 0'
         : "exit 1"
   }; }
+if [ "$1" = agent ] && [ "$2" = get ]; then
+  case "$3" in
+${agents.map((agent) => `${agent.pane_id}) cat <<'JSON'
+${JSON.stringify({ result: { agent } })}
+JSON
+exit 0 ;;`).join("\n")}
+  *) exit 1 ;;
+  esac
+fi
 [ "$1" = api ] || exit 1
 cat <<'JSON'
 ${JSON.stringify(snapshot)}
@@ -88,21 +100,26 @@ function fixture(extraEnv = [], agents = [], readsScreen = true) {
   return { root, stateDir, configDir, herdr: fakeHerdr(root, agents, readsScreen) };
 }
 
-// One status change, as herdr fires it.
-function hook(fx, base, paneId, { title, status = "done" } = {}) {
+// One status change or pane closure, as Herdr fires it.
+function hook(fx, base, paneId, { title, status = "done", closed = false, context = {}, onSpawn } = {}) {
   const child = spawn(process.execPath, [NOTIFY], {
     env: {
       ...process.env,
-      HERDR_PLUGIN_EVENT_JSON: JSON.stringify({
+      HERDR_PLUGIN_EVENT: closed ? "pane.closed" : "pane.agent_status_changed",
+      HERDR_PLUGIN_EVENT_JSON: JSON.stringify(closed ? {
+        event: "pane_closed",
+        data: { type: "pane_closed", pane_id: paneId, workspace_id: "wA" },
+      } : {
         data: { pane_id: paneId, agent_status: status, agent: "claude", ...(title ? { title } : {}) },
       }),
-      HERDR_PLUGIN_CONTEXT_JSON: "{}",
+      HERDR_PLUGIN_CONTEXT_JSON: JSON.stringify(context),
       HERDR_PLUGIN_STATE_DIR: fx.stateDir,
       HERDR_PLUGIN_CONFIG_DIR: fx.configDir,
       HERDR_BIN_PATH: fx.herdr,
       TELEGRAM_API_BASE: base,
     },
   });
+  onSpawn?.(child);
   let out = "";
   child.stdout.on("data", (d) => (out += d));
   child.stderr.on("data", (d) => (out += d));
@@ -119,6 +136,127 @@ const lines = (path) =>
 
 const pending = (fx) => lines(join(fx.stateDir, "pending.jsonl"));
 const remembered = (fx) => lines(join(fx.stateDir, "messages.jsonl"));
+
+test("titles and previously queued text and button labels use the current secret masking setting", async () => {
+  const secret = `ghp_${"x".repeat(36)}`;
+  for (const enabled of [true, false]) {
+    const tg = await fakeTelegram();
+    const fx = fixture([`MASK_SECRETS=${enabled ? 1 : 0}`]);
+    const expected = enabled ? "ghp_…[masked]" : secret;
+    writeFileSync(join(fx.stateDir, "pending.jsonl"), JSON.stringify({
+      id: "example-queued-message",
+      at: Date.now(),
+      paneId: "wZ:p7",
+      parts: {
+        emoji: "✅",
+        agent: "example",
+        statusLabel: "done",
+        title: `Saved ${secret}`,
+        prompt: `▸ Use ${secret}`,
+        body: `Printed ${secret}`,
+        options: [{ n: "1", label: secret }, { n: "2", label: "Cancel" }],
+      },
+    }) + "\n", { mode: 0o600 });
+    try {
+      const { out, code } = await hook(fx, tg.base, "wZ:p8", { title: `Example ${secret}` });
+      assert.equal(code, 0, out);
+      assert.deepEqual(tg.methods, ["sendMessage", "sendMessage"], out);
+      const [queued, current] = tg.sent;
+      assert.ok(queued.text.includes(`Saved ${expected}`));
+      assert.ok(queued.text.includes(`▸ Use ${expected}`));
+      assert.ok(queued.text.includes(`Printed ${expected}`));
+      assert.deepEqual(queued.reply_markup.inline_keyboard, [
+        [{ text: `1. ${expected}`, callback_data: "1" }],
+        [{ text: "2. Cancel", callback_data: "2" }],
+      ]);
+      assert.ok(current.text.includes(`Example ${expected}`));
+      const entry = lines(join(fx.stateDir, "messages.jsonl")).find((e) => e.id === 2);
+      assert.equal(entry.parts.title, `Example ${expected}`);
+      if (enabled) assert.ok(tg.sent.every((message) => !message.text.includes(secret)));
+    } finally {
+      tg.close();
+    }
+  }
+});
+
+test("a blocked delay sends only the same live episode, with a fresh screen and buttons", async () => {
+  const paneId = "wZ:p8";
+  const key = "wZ_p8";
+  const oldScreen = "Earlier question?\n❯ 1. Earlier option\n  2. Cancel";
+  const newScreen = "Current question?\n❯ 1. Updated option\n  2. Cancel";
+  for (const change of ["working state", "new episode", "live working", "missing live agent", "unchanged"]) {
+    const tg = await fakeTelegram();
+    const agent = { pane_id: paneId, agent_status: "blocked" };
+    const fx = fixture(["BLOCKED_DELAY_SECONDS=1", "MIN_DURATION_SECONDS=60", "REPLIES=1", "DEBUG=1"], [agent], oldScreen);
+    // Stand in for the poller's ownership, so buttons are enabled without
+    // starting a detached process just to receive no replies.
+    const release = holdFlock(join(fx.stateDir, "replies.lock"));
+    assert.ok(release);
+    writeState(fx.stateDir, key, { status: "working", workingSince: Date.now(), paneId });
+    let child;
+    const sending = hook(fx, tg.base, paneId, { status: "blocked", onSpawn: (p) => { child = p; } });
+    try {
+      const deadline = Date.now() + 10_000;
+      let began;
+      while ((began = readState(fx.stateDir, key)).status !== "blocked") {
+        assert.ok(Date.now() < deadline, "the hook did not record its blocked state");
+        await sleep(20);
+      }
+      assert.equal(tg.sent.length, 0, change);
+      for (const lock of ["state.lock", "sweep-run.lock"]) {
+        assert.equal(flockHeld(join(fx.stateDir, lock)), false, lock);
+      }
+      if (change === "working state") {
+        writeState(fx.stateDir, key, { ...began, status: "working", updatedAt: Date.now() });
+      } else if (change === "new episode") {
+        writeState(fx.stateDir, key, { ...began, updatedAt: began.updatedAt + 1 });
+      }
+      const agents = change === "missing live agent" ? [] : [
+        { ...agent, agent_status: change === "live working" ? "working" : "blocked" },
+      ];
+      fakeHerdr(fx.root, agents, newScreen);
+      const { out, code } = await sending;
+      assert.equal(code, 0, out);
+      assert.equal(pending(fx).length, 0);
+      if (change !== "unchanged") {
+        assert.equal(tg.sent.length, 0, change);
+        assert.equal(remembered(fx).length, 0, change);
+        assert.match(out, /answered within the blocked delay/, change);
+      } else {
+        assert.ok(Date.now() - began.updatedAt >= 1000, "the notification did not wait a second");
+        assert.deepEqual(tg.methods, ["sendMessage"], out);
+        assert.match(tg.sent[0].text, /Current question/);
+        assert.doesNotMatch(tg.sent[0].text, /Earlier/);
+        assert.deepEqual(tg.sent[0].reply_markup.inline_keyboard, [
+          [{ text: "1. Updated option", callback_data: "1" }],
+          [{ text: "2. Cancel", callback_data: "2" }],
+        ]);
+        assert.equal(readState(fx.stateDir, key).updatedAt, began.updatedAt, "reminders must use the original blocked time");
+        assert.equal(remembered(fx).length, 1);
+        assert.doesNotMatch(out, /answered within the blocked delay/);
+      }
+    } finally {
+      child.kill("SIGKILL");
+      await sending;
+      release();
+      tg.close();
+    }
+  }
+});
+
+test("a dry run previews blocked output without waiting for live confirmation", async () => {
+  const tg = await fakeTelegram();
+  const fx = fixture(["BLOCKED_DELAY_SECONDS=1", "DRY_RUN=1"]);
+  try {
+    const { out, code } = await hook(fx, tg.base, "wZ:p8", { status: "blocked" });
+    assert.equal(code, 0, out);
+    assert.match(out, /sent as HTML/);
+    assert.match(out, /Do you want to create notes.md/);
+    assert.equal(tg.sent.length, 0);
+  } finally {
+    tg.close();
+  }
+});
 
 test("a rate limit is waited out, and the message arrives rather than queueing", async () => {
   // retry_after in seconds, as Telegram sends it — the hook honours it.
@@ -350,6 +488,58 @@ test("a question answered at the keyboard is marked so in the chat, once, and lo
     assert.equal(tg.methods.filter((m) => m === "editMessageText").length, 1);
   } finally {
     tg.close();
+  }
+});
+
+test("closing a pane marks its notification once, forgets its state and refreshes the board without notifying", async () => {
+  for (const markResolved of [1, 0]) {
+    const tg = await fakeTelegram();
+    const fx = fixture([`MARK_RESOLVED=${markResolved}`, "BOARD=1"], [
+      { pane_id: "wA:p2", agent: "pi", agent_status: "working" },
+    ]);
+    writeState(fx.stateDir, "wA_p1", { status: "blocked", updatedAt: Date.now(), paneId: "wA:p1" });
+    writeState(fx.stateDir, "wA_p2", { status: "working", updatedAt: Date.now(), paneId: "wA:p2" });
+    const otherState = readFileSync(join(fx.stateDir, "state-wA_p2.json"), "utf8");
+    rememberMessage(fx.stateDir, 101, "wA:p1", undefined, "saved question", undefined, {
+      emoji: "⚠️", agent: "claude", statusLabel: "blocked",
+      body: "Do you want to create notes.md?", bodyIsScreen: true,
+      options: [{ n: "1", label: "Yes" }],
+    });
+    rememberMessage(fx.stateDir, 102, "wA:p2", undefined, undefined, undefined, {
+      emoji: "⏳", agent: "pi", statusLabel: "working",
+    });
+    // An existing board should be edited rather than replaced by a new message.
+    writeFileSync(join(fx.stateDir, "board.json"), JSON.stringify({ messageId: 77, chatId: "42" }));
+    const closure = {
+      closed: true,
+      context: { focused_pane_id: "wA:p2", focused_pane_status: "done" },
+    };
+    try {
+      const { out, code } = await hook(fx, tg.base, "wA:p1", closure);
+      assert.equal(code, 0, out);
+      assert.deepEqual(tg.methods, markResolved ? ["editMessageText", "editMessageText"] : ["editMessageText"], out);
+      const edits = tg.sent.filter((m) => m.message_id === 101);
+      assert.equal(edits.length, markResolved);
+      if (markResolved) {
+        assert.match(edits[0].text, /^✕ pane closed · \d\d:\d\d/);
+        assert.ok(!edits[0].text.includes("Do you want"), "the closed pane's question is still shown");
+        assert.equal(edits[0].reply_markup, undefined, "the closed pane's buttons are still shown");
+      }
+      assert.ok(!existsSync(join(fx.stateDir, "state-wA_p1.json")), "the closed pane's state was kept");
+      assert.equal(readFileSync(join(fx.stateDir, "state-wA_p2.json"), "utf8"), otherState);
+      assert.equal(Boolean(remembered(fx).find((m) => m.id === 101).closed), Boolean(markResolved));
+      assert.ok(!remembered(fx).find((m) => m.id === 102).closed, "the focused pane's message was closed instead");
+      const board = tg.sent.find((m) => m.message_id === 77);
+      assert.ok(!board.text.includes("wA:p1"), "the board still lists the closed pane");
+      assert.ok(board.text.includes("wA:p2"), "the board lost the remaining pane");
+
+      // A repeated close may refresh the board, but must not edit a notification twice.
+      await hook(fx, tg.base, "wA:p1", closure);
+      assert.equal(tg.sent.filter((m) => m.message_id === 101).length, markResolved);
+      assert.ok(tg.methods.every((m) => m === "editMessageText"), "pane closure sent something new");
+    } finally {
+      tg.close();
+    }
   }
 });
 

@@ -8,36 +8,49 @@
 import { mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { randomInt } from "node:crypto";
 
 import {
   ATTACHMENT_MAX_BYTES,
   ATTACHMENT_TYPES,
+  COMMANDS,
+  DIFF_MAX_BYTES,
+  HEAD_LINE_CHARS,
   MUTE_MAX_MINUTES,
   QUESTION_UNKNOWN,
   TELEGRAM_API,
+  TELEGRAM_LIMIT,
   attachmentAllowed,
   botCommand,
   clip,
   clockTime,
+  escapeHtml,
+  firstDefined,
   flockAvailable,
   herdStatusText,
   herdrBin,
   holdFlock,
   isOn,
+  listMatches,
   loadConfig,
   loadSnapshot,
+  maskSecrets,
   muteMinutes,
   questionOnScreen,
   readMessageMap,
   redact,
+  rememberMessage,
   replyCommands,
   sanitizeKey,
+  screenTail,
   sessionKey,
   setMute,
+  statusEmoji,
   targetForMessage,
   telegramCall,
   usableReply,
   whisperBin,
+  workingTreeDiff,
 } from "./lib.mjs";
 
 const POLL_SECONDS = 50; // how long Telegram holds the request open with nothing to say
@@ -80,7 +93,22 @@ if (!token || !chatId) {
 }
 
 async function telegram(method, payload, timeoutMs) {
-  return (await telegramCall(token, method, payload, timeoutMs)).json;
+  let res = await telegramCall(token, method, payload, timeoutMs);
+  // A pooled connection can go stale while a synchronous child (an agent start,
+  // a transcription) holds the event loop, and the first request after it then
+  // fails before reaching Telegram. One more try gets a fresh connection. A
+  // timeout is not retried: that request may well have arrived.
+  if (res.status === 0 && !/abort|timeout/i.test(res.text)) res = await telegramCall(token, method, payload, timeoutMs);
+  return res.json;
+}
+
+// Register the slash menu only for the poller holding the lock with replies on.
+// A menu failure must not stop replies; the next start can try again.
+if (isOn(cfg("REPLIES"))) {
+  const registered = await telegram("setMyCommands", { commands: COMMANDS }, 10_000);
+  if (!registered?.ok) {
+    console.error(`herdr-telegram-notify: setMyCommands failed: ${redact(registered?.description ?? "no answer", token)}`);
+  }
 }
 
 // Which name this bot answers to. In a group with more than one bot, clients
@@ -97,43 +125,73 @@ await learnUsername();
 // Answering in the thread the message came from, so it reads as a conversation:
 // the same chat, the same forum topic when the group has them, and hung under
 // the message it answers.
-async function say(text, to) {
-  await telegram(
+async function say(text, to, parseMode) {
+  const res = await telegram(
     "sendMessage",
     {
       chat_id: chatId,
       text,
+      ...(parseMode ? { parse_mode: parseMode } : {}),
       reply_to_message_id: to?.messageId,
       ...(to?.threadId ? { message_thread_id: to.threadId } : {}),
       disable_notification: true,
     },
     10_000
   );
+  // An answer that never arrives looks, from the phone, like a command that did
+  // nothing; the log is the only place left to say otherwise.
+  if (!res?.ok) console.error(`herdr-telegram-notify: could not answer in the chat: ${res?.description ?? "no answer"}`);
+  return res;
 }
 
-// A text file rather than a message: the point of /full is the part that did not
-// fit in one, and Telegram counts a document's size rather than its characters.
-// UTF-8, because an agent's answer is not ASCII and a file the phone renders as
-// mojibake is not the answer either.
-async function sendFull(target, to) {
+// A response or diff need not fit one message, so send the whole text as a file.
+// UTF-8 keeps non-ASCII text readable on the phone rather than turning it into
+// mojibake, and both commands return to the same reply and forum topic.
+async function sendDocument(text, filename, caption, to) {
   const form = new FormData();
   form.append("chat_id", String(chatId));
   form.append("reply_to_message_id", String(to.messageId));
   if (to.threadId) form.append("message_thread_id", String(to.threadId));
   form.append("disable_notification", "true");
-  form.append("caption", `The whole of it — ${target.full.length} characters from ${target.paneId}.`);
-  form.append(
-    "document",
-    new Blob([target.full], { type: "text/plain; charset=utf-8" }),
-    `${sanitizeKey(target.paneId)}-${target.id}.txt`
-  );
+  form.append("caption", caption);
+  form.append("document", new Blob([text], { type: "text/plain; charset=utf-8" }), filename);
+  return telegram("sendDocument", form, 30_000);
+}
 
-  const res = await telegram("sendDocument", form, 30_000);
+async function sendFull(target, to) {
+  const res = await sendDocument(
+    target.full,
+    `${sanitizeKey(target.paneId)}-${target.id}.txt`,
+    `The whole of it — ${target.full.length} characters from ${target.paneId}.`,
+    to
+  );
   if (!res?.ok) {
     console.error(`herdr-telegram-notify: /full for message ${target.id} failed: ${res?.description ?? "no answer"}`);
     return say(`✗ could not send it: ${res?.description ?? "Telegram did not take the file"}`, to);
   }
   console.log(`herdr-telegram-notify: sent the full response for message ${target.id} (${target.full.length} chars)`);
+}
+
+async function sendDiff(paneId, cwd, to) {
+  if (typeof cwd !== "string" || !cwd) return say(`✗ no working directory reported for ${paneId}.`, to);
+  const diff = await workingTreeDiff(cwd);
+  if (diff.error) return say(`✗ ${paneId}: ${diff.error}`, to);
+  if (!diff.summary && !diff.bytes) return say(`✎ no uncommitted changes in ${paneId}.`, to);
+
+  const caption = clip(maskSecrets(`✎ ${diff.summary || "uncommitted changes"}`), 1024);
+  // Telegram refuses an empty file, but untracked-only work still has a useful
+  // summary. Explain the empty patch without adding those files' contents.
+  const text = diff.text === undefined ? undefined : maskSecrets(diff.text || "# No tracked changes; untracked files are listed in the caption.\n");
+  const bytes = Math.max(diff.bytes, text === undefined ? 0 : Buffer.byteLength(text));
+  if (bytes > DIFF_MAX_BYTES) {
+    return say(`✗ diff for ${paneId} is ${(bytes / (1024 * 1024)).toFixed(2)} MB (${bytes} bytes), over the 5 MB limit.\n${caption}`, to);
+  }
+  const res = await sendDocument(text, `${sanitizeKey(paneId).replaceAll("_", "-")}.diff`, caption, to);
+  if (!res?.ok) {
+    console.error(`herdr-telegram-notify: /diff for ${paneId} failed: ${res?.description ?? "no answer"}`);
+    return say(`✗ could not send it: ${res?.description ?? "Telegram did not take the file"}`, to);
+  }
+  console.log(`herdr-telegram-notify: sent the diff for ${paneId} (${bytes} bytes)`);
 }
 
 // Where a file sent to an agent is kept, and for how long: long enough for the
@@ -230,8 +288,14 @@ function why(res) {
   return raw.slice(0, 200);
 }
 
-function herdrRun(args) {
-  const res = spawnSync(herdrBin(), args, { encoding: "utf8", timeout: 10_000, maxBuffer: 1024 * 1024 });
+function herdrRun(args, timeout = 10_000) {
+  let res;
+  try {
+    res = spawnSync(herdrBin(), args, { encoding: "utf8", timeout, maxBuffer: 1024 * 1024 });
+  } catch (err) {
+    // Invalid text, such as a NUL byte, is a refusal rather than a dead poller.
+    return { ok: false, why: err.message };
+  }
   if (res.error) return { ok: false, why: res.error.message };
   if (res.status !== 0) return { ok: false, why: why(res) };
   return { ok: true, out: res.stdout };
@@ -244,7 +308,13 @@ function liveAgent(paneId) {
   if (!res.ok) return undefined;
   try {
     const agent = JSON.parse(res.out).result?.agent;
-    return agent && { status: agent.agent_status, session: sessionKey(agent.agent_session) };
+    return agent && {
+      name: clip(String(firstDefined(agent.display_agent, agent.agent, "agent")), 24),
+      status: agent.agent_status,
+      session: sessionKey(agent.agent_session),
+      agentSession: agent.agent_session,
+      cwd: firstDefined(agent.cwd, agent.foreground_cwd),
+    };
   } catch {
     return undefined;
   }
@@ -252,17 +322,85 @@ function liveAgent(paneId) {
 
 // ---------------------------------------------------------------- commands
 
-// The messages that do something without being a reply, and the only text this
-// ever reads as an instruction: a fixed list in lib.mjs, past the same chat and
-// sender checks as everything else, and short of anything that touches a pane.
-// Nothing here runs what the message says — the command names the act, the
-// argument is at most a number.
-async function runCommand({ command, args }, reply) {
-  // Only /mute takes anything after the command. A word after one of the others
-  // is a sentence that happens to start with a slash, and acting on it would
-  // make an unmute out of "/unmute in an hour".
-  if (args.length && command !== "/mute") {
+// The only text read as an instruction is a fixed list in lib.mjs, past the
+// same chat and sender checks as everything else. Existing agents need a
+// recorded session; /new can only create one in an existing, unfiltered workspace.
+async function startAgent(args, reply, originalText) {
+  const snapshot = loadSnapshot();
+  const workspaces = snapshot?.workspaces ?? [];
+  const known = clip(maskSecrets(workspaces.map((w) => w.label ? `${w.label} (${w.workspace_id})` : w.workspace_id).join(", ") || "(none available)"), 3000);
+  const usage = (reason = "") => say(`${reason ? `${reason}\n` : ""}Usage: /new <workspace> <kind> [prompt]\nKnown workspaces: ${known}`, reply);
+  const [workspaceArg, kind] = args;
+  if (!workspaceArg || !kind) return usage();
+  const byId = workspaces.find((w) => w.workspace_id === workspaceArg);
+  const matches = byId ? [byId] : workspaces.filter((w) => String(w.label ?? "").toLowerCase() === workspaceArg.toLowerCase());
+  if (matches.length !== 1) return usage(matches.length > 1 ? "That workspace label is ambiguous; use its id." : "Unknown workspace.");
+  const workspace = matches[0];
+  if (!/^[a-z][a-z0-9_-]{0,31}$/.test(kind)) {
+    return usage("Invalid kind: use 1–32 lowercase letters, digits, _ or -, starting with a letter.");
+  }
+  const label = clip(maskSecrets(workspace.label || workspace.workspace_id), HEAD_LINE_CHARS);
+  const allowed = listMatches(cfg("NOTIFY_WORKSPACES"), workspace.label, workspace.workspace_id);
+  const ignored = listMatches(cfg("IGNORE_WORKSPACES"), workspace.label, workspace.workspace_id);
+  if (allowed === false || ignored === true) {
+    return say(`✗ ${label} is filtered out by ${allowed === false ? "NOTIFY_WORKSPACES" : "IGNORE_WORKSPACES"}; you would not hear back from that agent.`, reply);
+  }
+
+  // Only the two selectors are split into words. The prompt stays one argv
+  // value, including its newlines, and never becomes native agent options.
+  const prompt = String(originalText ?? reply.text).replace(/^\s*\S+\s+\S+\s+\S+(?:\s|$)/, "").slice(0, MAX_TEXT);
+  const names = new Set((snapshot?.agents ?? []).map((a) => a.name));
+  let name;
+  do {
+    name = `${kind.slice(0, 27)}-${randomInt(36 ** 4).toString(36).padStart(4, "0")}`;
+  } while (names.has(name));
+  const created = herdrRun(["tab", "create", "--workspace", workspace.workspace_id, "--label", kind, "--no-focus"]);
+  if (!created.ok) return say(maskSecrets(`✗ ${label}: ${created.why}`), reply);
+  let result;
+  try {
+    result = JSON.parse(created.out).result;
+  } catch {}
+  const tabId = typeof result?.tab?.tab_id === "string" ? result.tab.tab_id : undefined;
+  const paneId = typeof result?.root_pane?.pane_id === "string" ? result.root_pane.pane_id : undefined;
+  const started = tabId && paneId
+    ? herdrRun(["agent", "start", name, "--kind", kind, "--pane", paneId], 60_000)
+    : { ok: false, why: "Herdr did not return the new tab and pane ids." };
+  if (!started.ok) {
+    // This tab belongs to this command alone; a failed start must not leave
+    // an empty tab behind, or close anything that existed before it.
+    const closed = tabId ? herdrRun(["tab", "close", tabId]) : undefined;
+    return say(maskSecrets(`✗ ${label}: ${started.why}${closed && !closed.ok ? `\nCould not close ${tabId}: ${closed.why}` : ""}`), reply);
+  }
+
+  const prompted = prompt.trim() ? herdrRun(["agent", "prompt", paneId, prompt]) : undefined;
+  const live = liveAgent(paneId);
+  const text = maskSecrets(`▶ started ${kind} in ${label} · ${paneId}${prompted && !prompted.ok ? `\n✗ prompt not delivered: ${prompted.why}` : ""}${!live?.session ? "\nReplies will work from its first notification." : ""}`);
+  const sent = await say(text, reply);
+  if (sent?.ok && live?.session) rememberMessage(stateDir, sent.result?.message_id, paneId, live.agentSession);
+}
+
+async function runCommand({ command, args }, reply, originalText) {
+  // /mute and /new take arguments. A word after the others is a sentence that
+  // happens to start with a slash, not an unmute from "/unmute in an hour".
+  if (args.length && !["/mute", "/new"].includes(command)) {
     return say(`Usage: ${command} on its own, with nothing after it.`, reply);
+  }
+
+  if (command === "/new") return startAgent(args, reply, originalText);
+
+  if (command === "/stop") {
+    if (!reply.replyTo) return say("Reply to one of my notifications with /stop to send Esc to that agent.", reply);
+    return deliver(reply, { stop: true });
+  }
+
+  if (command === "/screen") {
+    if (!reply.replyTo) return say("Reply to one of my notifications with /screen to read that agent's current screen.", reply);
+    return deliver(reply, { screen: true });
+  }
+
+  if (command === "/diff") {
+    if (!reply.replyTo) return say("Reply to one of my notifications with /diff to download that agent's uncommitted changes.", reply);
+    return deliver(reply, { diff: true });
   }
 
   if (command === "/status") {
@@ -329,7 +467,7 @@ async function runCommand({ command, args }, reply) {
 
 // --------------------------------------------------------------- dispatch
 
-async function deliver(reply) {
+async function deliver(reply, { stop = false, screen = false, diff = false } = {}) {
   const target = targetForMessage(stateDir, reply.replyTo);
   if (!target) {
     // No pane recorded for what this answers, and guessing at one is the last
@@ -369,6 +507,49 @@ async function deliver(reply) {
     console.log(`herdr-telegram-notify: refused a reply to ${paneId}: ${reason}`);
     await say(`✗ not delivered — ${reason}. Reply to a newer notification from that agent.`, reply);
     return;
+  }
+
+  // A diff is a read of current work, not an answer to a recorded question, so
+  // matching the session is enough even when that question has changed.
+  if (diff) return sendDiff(paneId, live.cwd, reply);
+
+  // Reading the current view is not an answer to an old question, so the
+  // session check is enough even when the notification carried one.
+  if (screen) {
+    const text = screenTail(paneId, 40);
+    if (!text) return say(`✗ no readable screen for ${paneId} (empty or unavailable).`, reply);
+    const status = String(firstDefined(live.status, "unknown"));
+    const head = escapeHtml(clip(`${statusEmoji(status)} ${live.name} · ${status} · ${paneId}`.replace(/\s+/g, " "), HEAD_LINE_CHARS));
+    const room = TELEGRAM_LIMIT - head.length - "\n<pre></pre>".length;
+    const lines = text.split("\n");
+    let body = escapeHtml(text);
+    // Count after escaping, and discard whole rows from the top so the newest
+    // output stays intact rather than being cut off by the message limit. A
+    // row is at most the terminal's width (`pane read` wraps), so whole rows
+    // always get under it.
+    while (body.length > room && lines.length > 1) {
+      lines.shift();
+      body = escapeHtml(lines.join("\n"));
+    }
+    console.log(`herdr-telegram-notify: showed the screen for ${paneId}`);
+    return say(`${head}\n<pre>${body}</pre>`, reply, "HTML");
+  }
+
+  // Esc cancels current work or dismisses the current question, so only the
+  // session must still match; it is not an answer to the recorded question.
+  if (stop) {
+    if (["idle", "done"].includes(live.status)) return say(`⏹ nothing to stop in ${paneId} (${live.status})`, reply);
+    if (!["working", "blocked"].includes(live.status)) {
+      return say(`✗ not stopped — I cannot tell whether ${paneId} is working or blocked.`, reply);
+    }
+    const args = ["agent", "send-keys", paneId, "esc"];
+    const res = herdrRun(args);
+    if (!res.ok) {
+      console.error(`herdr-telegram-notify: ${args.join(" ")} failed: ${res.why}`);
+      return say(`✗ ${paneId}: ${res.why}`, reply);
+    }
+    console.log(`herdr-telegram-notify: sent Esc to ${paneId}`);
+    return say(`⏹ sent Esc to ${paneId}`, reply);
   }
 
   // A blocked agent is answered with keystrokes into whatever prompt is on its
@@ -557,7 +738,7 @@ for (;;) {
     if (command) {
       // Addressed to another bot, or to no name this bot answers to: not ours to
       // answer, and not text to hand an agent either.
-      if (command.mine) await runCommand(command, reply);
+      if (command.mine) await runCommand(command, reply, update.message?.text);
       else console.log(`herdr-telegram-notify: ignored ${reply.text.split(/\s+/)[0]}, addressed elsewhere`);
       continue;
     }

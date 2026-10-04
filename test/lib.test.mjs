@@ -5,13 +5,17 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, chmodSync, statSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, chmodSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 
 import {
+  DEFAULTS,
+  HEAD_LINE_CHARS,
   TELEGRAM_LIMIT,
   buildMessage,
+  configProblems,
   clip,
   cropScreen,
   escapeHtml,
@@ -31,7 +35,9 @@ import {
   MUTE_MAX_MINUTES,
   listMatches,
   loadEnvFile,
+  maskSecrets,
   promptText,
+  questionOnScreen,
   blockedEpisode,
   sessionKey,
   targetForMessage,
@@ -42,11 +48,13 @@ import {
   retryAfterMs,
   screenColumns,
   screenOptions,
+  screenTail,
   attachmentAllowed,
   whisperBin,
   toInt,
   toolSummary,
   topicFor,
+  transcriptPath,
   truncate,
   usableReply,
   writeLines,
@@ -106,7 +114,72 @@ test("redact hides a token even where it was not passed in", () => {
   assert.equal(redact("nothing to hide"), "nothing to hide");
 });
 
+test("maskSecrets masks invented credential shapes, leaves ordinary text alone and can be disabled", () => {
+  const saved = { MASK_SECRETS: process.env.MASK_SECRETS, HERDR_PLUGIN_CONFIG_DIR: process.env.HERDR_PLUGIN_CONFIG_DIR };
+  const dir = mkdtempSync(join(scratch, "mask-config-"));
+  process.env.HERDR_PLUGIN_CONFIG_DIR = dir;
+  delete process.env.MASK_SECRETS;
+  const x = (n) => "x".repeat(n);
+  const samples = [
+    ...["sk-ant-", "sk-", "sk-proj-", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "xoxa-", "xoxb-", "xoxp-", "xoxr-", "xoxs-", "sk_live_", "rk_live_", "sk_test_"]
+      .map((prefix) => [prefix + x(36), `${prefix}…[masked]`]),
+    [`github_pat_${x(82)}`, "github_pat_…[masked]"],
+    ...["AKIA", "ASIA"].map((prefix) => [prefix + "X".repeat(16), `${prefix}…[masked]`]),
+    [`AIza${x(35)}`, "AIza…[masked]"],
+    [`123456789:AA${x(33)}`, "123456789:…[masked]"],
+    [`https://example.invalid/bot123456789:AA${x(33)}/sendMessage`, "https://example.invalid/bot123456789:…[masked]/sendMessage"],
+    [`Bearer ${x(32)}`, "Bearer …[masked]"],
+    [`bearer ${x(32)}`, "bearer …[masked]"],
+    [`eyJ${x(20)}.${x(24)}.${x(32)}`, "eyJ…[masked]"],
+    ...["PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY", "ENCRYPTED PRIVATE KEY", "OPENSSH PRIVATE KEY"]
+      .map((label) => [`-----BEGIN ${label}-----\n${x(64)}\n${x(64)}\n-----END ${label}-----`, `${label} …[masked]`]),
+    ...["SECRET", "TOKEN", "PASSWORD", "PASSWD", "API_KEY", "APIKEY", "PRIVATE_KEY"]
+      .map((name) => [`DEMO_${name}=${x(16)}`, `DEMO_${name}=…[masked]`]),
+    [`APP_PASSWORD = '${x(16)} with spaces'`, "APP_PASSWORD = '…[masked]'"],
+    [`"password": "${x(16)}"`, '"password": "…[masked]"'],
+    ['"password": "fake value with \\"quotes\\""', '"password": "…[masked]"'],
+  ];
+  try {
+    assert.equal(DEFAULTS.MASK_SECRETS, "1");
+    for (const [input, masked] of samples) {
+      assert.equal(maskSecrets(input), masked, input);
+      assert.equal(maskSecrets(`Before (${input}), after.`), `Before (${masked}), after.`, input);
+      assert.equal(maskSecrets(masked), masked, "masking must be idempotent");
+    }
+    for (const text of [
+      "The token is counted once, then the job ends.",
+      `git sha ${"abcdef0123".repeat(4)}`,
+      "UUID 00000000-0000-4000-8000-000000000000",
+      "TOKEN=1 PASSWORD=short API_KEY=xxxxxxx",
+      '"password": "short"',
+      "NAME=xxxxxxxxxxxxxxxx",
+      "sk-short ghp_tiny AKIA1234 AIzaTiny xoxb-small Bearer demo",
+    ]) assert.equal(maskSecrets(text), text);
+
+    writeFileSync(join(dir, ".env"), "MASK_SECRETS=0\n", { mode: 0o600 });
+    for (const [input] of samples) assert.equal(maskSecrets(input), input);
+    process.env.MASK_SECRETS = "1";
+    assert.equal(maskSecrets(samples[0][0]), samples[0][1], "the process env must override the file");
+    process.env.MASK_SECRETS = "0";
+    for (const [input] of samples) assert.equal(maskSecrets(input), input);
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
 // ----------------------------------------------------------------- config
+
+test("MASK_SECRETS accepts boolean values and reports a typo to doctor", () => {
+  for (const value of ["1", "true", "YES", "on", "0", "false", "NO", "off"]) {
+    assert.deepEqual(configProblems((key) => key === "MASK_SECRETS" ? value : DEFAULTS[key]), [], value);
+  }
+  const problems = configProblems((key) => key === "MASK_SECRETS" ? "sometimes" : DEFAULTS[key]);
+  assert.deepEqual(problems.map((p) => p.key), ["MASK_SECRETS"]);
+  assert.match(problems[0].detail, /secret masking is off/);
+});
 
 test("isOn, toInt and firstDefined treat empty as unset", () => {
   assert.equal(isOn("1"), true);
@@ -174,8 +247,8 @@ test("isRetryable and retryAfterMs decide what is worth another go", () => {
 
 // ------------------------------------------------------------- transcripts
 
-function transcript(name, records) {
-  const path = join(scratch, `${name}.jsonl`);
+function transcript(name, records, dir = scratch) {
+  const path = join(dir, `${name}.jsonl`);
   writeFileSync(path, records.map((r) => JSON.stringify(r)).join("\n") + "\n");
   return path;
 }
@@ -253,6 +326,143 @@ test("readTurn reads a pi turn as well as a Claude one", () => {
   assert.equal(toolSummary(turn.tools), "2 bash");
 });
 
+test("Codex ids resolve the newest matching rollout while Claude and path sessions keep their sources", () => {
+  const oldHome = process.env.CODEX_HOME;
+  const oldClaude = process.env.CLAUDE_CONFIG_DIR;
+  const oldUserHome = process.env.HOME;
+  const home = join(scratch, "example-codex-home");
+  const claude = join(scratch, "example-claude-home");
+  const id = "00000000-0000-4000-8000-000000000001";
+  const rollout = (day, name) => {
+    const dir = join(home, "sessions", ...day.split("/"));
+    mkdirSync(dir, { recursive: true });
+    return transcript(name, [], dir);
+  };
+  rollout("2025/12/31", `rollout-2025-12-31T12-00-00-${id}`);
+  rollout("2026/01/02", `rollout-2026-01-02T12-00-00-${id}`);
+  const newest = rollout("2026/01/02", `rollout-2026-01-02T13-00-00-${id}`);
+  rollout("2027/01/01", `rollout-2027-01-01T12-00-00-${id}-extra`);
+  const project = join(claude, "projects", "example-project");
+  mkdirSync(project, { recursive: true });
+  const claudePath = transcript(id, [], project);
+  try {
+    process.env.CODEX_HOME = home;
+    process.env.CLAUDE_CONFIG_DIR = claude;
+    assert.equal(transcriptPath({ agent: "codex", kind: "id", value: id }), newest);
+    assert.equal(transcriptPath({ agent: "codex", kind: "id", value: "missing-session" }), undefined);
+    assert.equal(transcriptPath({ agent: "claude", kind: "id", value: id }), claudePath);
+    assert.equal(transcriptPath({ kind: "id", value: id }), claudePath);
+    assert.equal(transcriptPath({ agent: "pi", kind: "path", value: newest }), newest);
+    assert.equal(transcriptPath({ agent: "codex", kind: "unknown", value: id }), undefined);
+    process.env.CODEX_HOME = join(scratch, "missing-codex-home");
+    assert.equal(transcriptPath({ agent: "codex", kind: "id", value: id }), undefined);
+    const defaultDir = join(scratch, "example-user-home", ".codex", "sessions", "2026", "01", "03");
+    mkdirSync(defaultDir, { recursive: true });
+    const defaultPath = transcript(`rollout-2026-01-03T12-00-00-${id}`, [], defaultDir);
+    delete process.env.CODEX_HOME;
+    process.env.HOME = join(scratch, "example-user-home");
+    assert.equal(transcriptPath({ agent: "codex", kind: "id", value: id }), defaultPath);
+  } finally {
+    if (oldHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = oldHome;
+    if (oldClaude === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = oldClaude;
+    if (oldUserHome === undefined) delete process.env.HOME;
+    else process.env.HOME = oldUserHome;
+  }
+});
+
+const codexRecord = (payload, seconds, type = "event_msg") => ({ timestamp: at(seconds), type, payload });
+
+test("readTurn reads a Codex rollout without treating injected user context as its prompt", () => {
+  const oldHome = process.env.CODEX_HOME;
+  const home = join(scratch, "example-codex-turn");
+  const dir = join(home, "sessions", "2026", "01", "01");
+  mkdirSync(dir, { recursive: true });
+  const id = "00000000-0000-4000-8000-000000000002";
+  const usage = {
+    total_token_usage: { input_tokens: 5000, output_tokens: 1280 },
+    last_token_usage: { input_tokens: 920, cached_input_tokens: 900, output_tokens: 80 },
+  };
+  const path = transcript(`rollout-2026-01-01T12-00-00-${id}`, [
+    codexRecord({ type: "task_started", started_at: Date.parse(at(2)) / 1000, model_context_window: 8192 }, 4),
+    codexRecord({ type: "user_message", message: "Update notes.md with two examples." }, 5),
+    codexRecord({ type: "message", role: "user", content: [{ type: "input_text", text: "# AGENTS.md\nUse the invented style guide." }] }, 6, "response_item"),
+    codexRecord({ type: "message", role: "developer", content: [{ type: "input_text", text: "Example plugin context." }] }, 7, "response_item"),
+    codexRecord({ type: "function_call", name: "exec_command", arguments: "{}" }, 10, "response_item"),
+    codexRecord({ type: "custom_tool_call", name: "apply_patch", input: "invented patch" }, 12, "response_item"),
+    codexRecord({ type: "token_count", info: {
+      total_token_usage: { input_tokens: 4080, output_tokens: 1200 },
+      last_token_usage: { input_tokens: 1000, cached_input_tokens: 800, output_tokens: 30 },
+    } }, 13),
+    codexRecord({ type: "function_call", name: "exec_command", arguments: "{}" }, 15, "response_item"),
+    codexRecord({ type: "token_count", info: usage }, 20),
+    codexRecord({ type: "token_count", info: usage }, 22),
+    codexRecord({ type: "message", role: "assistant", content: [{ type: "output_text", text: "Provisional final text." }] }, 30, "response_item"),
+    codexRecord({ type: "task_complete", last_agent_message: "Updated notes.md with two examples." }, 32),
+  ], dir);
+  try {
+    process.env.CODEX_HOME = home;
+    assert.equal(transcriptPath({ agent: "codex", kind: "id", value: id }), path);
+    const turn = readTurn(path);
+    assert.equal(turn.text, "Updated notes.md with two examples.");
+    assert.equal(turn.prompt, "Update notes.md with two examples.");
+    assert.equal(turn.startedAt, at(2));
+    assert.equal(turn.endedAt, at(32));
+    assert.equal(turn.duration, 30_000);
+    assert.equal(turn.out, 110);
+    assert.equal(turn.context, 920); // Cached input is included, not added again.
+    assert.equal(turn.cost, undefined);
+    assert.equal(turn.truncated, false);
+    assert.deepEqual([...turn.tools], [["exec_command", 2], ["apply_patch", 1]]);
+    assert.equal(toolSummary(turn.tools), "2 exec_command · 1 apply_patch");
+    const records = readFileSync(path, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    records[records.length - 1].payload.last_agent_message = null;
+    const fallback = readTurn(transcript("example-codex-message-fallback", records));
+    assert.equal(fallback.text, "Provisional final text.");
+    assert.equal(fallback.endedAt, at(32));
+    assert.equal(fallback.cost, undefined);
+  } finally {
+    if (oldHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = oldHome;
+  }
+});
+
+test("readTurn keeps only the last Codex turn and accepts UserMessage items", () => {
+  const path = transcript("example-two-codex-turns", [
+    codexRecord({ type: "task_started", started_at: Date.parse(at(0)) / 1000 }, 0),
+    codexRecord({ type: "user_message", message: "Read the earlier example." }, 1),
+    codexRecord({ type: "function_call", name: "read_file" }, 3, "response_item"),
+    codexRecord({ type: "token_count", info: {
+      total_token_usage: { input_tokens: 5000, output_tokens: 900 },
+      last_token_usage: { input_tokens: 1000, cached_input_tokens: 800, output_tokens: 12 },
+    } }, 6),
+    codexRecord({ type: "task_complete", last_agent_message: "Read the earlier example." }, 8),
+    codexRecord({ type: "task_started", started_at: Date.parse(at(20)) / 1000 }, 20),
+    codexRecord({ type: "item_completed", item: { type: "UserMessage", content: [{ type: "text", text: "Write the new example." }] } }, 21),
+    codexRecord({ type: "message", role: "user", content: [{ type: "input_text", text: "# AGENTS.md\nInjected example context." }] }, 22, "response_item"),
+    codexRecord({ type: "function_call", name: "apply_patch" }, 25, "response_item"),
+    codexRecord({ type: "custom_tool_call", name: "exec_command" }, 26, "response_item"),
+    codexRecord({ type: "token_count", info: {
+      total_token_usage: { input_tokens: 5210, output_tokens: 915 },
+      last_token_usage: { input_tokens: 210, cached_input_tokens: 150, output_tokens: 15 },
+    } }, 29),
+    codexRecord({ type: "task_complete", last_agent_message: "Added the final example." }, 40),
+  ]);
+  const turn = readTurn(path);
+  assert.equal(turn.text, "Added the final example.");
+  assert.equal(turn.prompt, "Write the new example.");
+  assert.equal(turn.startedAt, at(20));
+  assert.equal(turn.endedAt, at(40));
+  assert.equal(turn.duration, 20_000);
+  assert.equal(turn.out, 15);
+  assert.equal(turn.context, 210);
+  assert.equal(turn.cost, undefined);
+  assert.deepEqual([...turn.tools], [["exec_command", 1], ["apply_patch", 1]]);
+  assert.equal(turn.truncated, false);
+  assert.equal(readTurn(path, 3).truncated, true);
+});
+
 test("readTurn ignores a subagent's records", () => {
   const path = transcript("side", [
     user("do it", 0),
@@ -271,6 +481,50 @@ test("readTurn says so when the turn is longer than it looked", () => {
   ]);
   assert.equal(readTurn(path, 5).truncated, true);
   assert.equal(readTurn(path).truncated, false);
+});
+
+test("captured transcripts, saved responses, headers and screens are masked before clipping", () => {
+  const saved = { MASK_SECRETS: process.env.MASK_SECRETS, HERDR_BIN_PATH: process.env.HERDR_BIN_PATH };
+  process.env.MASK_SECRETS = "1";
+  const key = `ghp_${"x".repeat(36)}`;
+  const masked = "ghp_…[masked]";
+  const dir = mkdtempSync(join(scratch, "mask-capture-"));
+  const paneId = "wZ:p8";
+  try {
+    const turn = readTurn(transcript("masked-turn", [
+      user(`Use ${key}`, 0),
+      assistant([{ type: "text", text: `Printed ${key}` }], 10),
+    ]));
+    assert.equal(turn.prompt, `Use ${masked}`);
+    assert.equal(turn.text, `Printed ${masked}`);
+
+    // Saved and queued text may predate masking, so shared readers and formatters
+    // must protect it too rather than only trusting new transcript captures.
+    rememberMessage(dir, 91, paneId, { kind: "id", value: "example-session" }, undefined, `Saved ${key}`);
+    assert.equal(targetForMessage(dir, 91).full, `Saved ${masked}`);
+    const message = buildMessage({ emoji: "✅", agent: "example", statusLabel: "done", title: `${"a".repeat(HEAD_LINE_CHARS - 40)} ${key}`, prompt: `▸ ${key}`, body: key });
+    assert.equal(message.plain.includes(key), false);
+    assert.equal(message.html.includes(key), false);
+    assert.equal(message.plain.split(masked).length - 1, 3);
+
+    const screen = `${key}\n❯ 1. Use ${key}\n2. Cancel\n-----BEGIN PRIVATE KEY-----\n${"x".repeat(64)}\n-----END PRIVATE KEY-----`;
+    const herdr = join(dir, "fake-herdr");
+    writeFileSync(herdr, `#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(screen)});\n`, { mode: 0o755 });
+    process.env.HERDR_BIN_PATH = herdr;
+    const expected = `${masked}\n❯ 1. Use ${masked}\n2. Cancel\nPRIVATE KEY …[masked]`;
+    assert.equal(screenTail(paneId, 12), expected);
+    assert.equal(screenTail(paneId, 1), "PRIVATE KEY …[masked]");
+    assert.deepEqual(screenOptions(screenTail(paneId, 12)), [{ n: "1", label: `Use ${masked}` }, { n: "2", label: "Cancel" }]);
+    writeFileSync(join(dir, "state-wZ_p8.json"), JSON.stringify({ status: "blocked", updatedAt: 1000, paneId }));
+    const question = `1000:${createHash("sha256").update(expected).digest("hex").slice(0, 16)}`;
+    assert.equal(questionOnScreen(dir, paneId), question);
+    assert.equal(questionOnScreen(dir, paneId), question, "recorded and live question checks must use the same masking");
+  } finally {
+    for (const [name, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
 });
 
 test("toolSummary ranks the busiest four and counts the rest", () => {

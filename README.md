@@ -7,8 +7,9 @@ needs input (`blocked`), and lets you answer that agent from the chat.
 
 - [**Notifications**](#the-message) with the session title, the prompt the turn
   started from, workspace, branch, uncommitted changes, duration, tokens and
-  cost, the agent's last message, and what the other agents are doing. A
-  blocked agent's notification shows its screen, where the question is.
+  cost, the agent's last message, and what the other agents are doing, read
+  from Claude Code, Codex and pi transcripts. A blocked agent's notification
+  shows its screen, where the question is.
 - [**Replies**](#replying-from-the-chat): reply to a notification and the text
   reaches that agent, typed into its prompt if it is blocked or sent as a new
   turn if not. Replies to a finished session or an old question are refused.
@@ -17,14 +18,21 @@ needs input (`blocked`), and lets you answer that agent from the chat.
   messages**](#voice-messages) sent back to the agent. Voice is transcribed
   with a local whisper CLI if you have one.
 - [**Commands**](#commands): `/status` for the herd, `/mute` and `/unmute`,
-  and `/full` for a response too long for one message.
+  `/full` for a response too long for one message, `/stop` to interrupt an
+  agent, `/screen` for its current view, `/diff` for its uncommitted changes,
+  and `/new` to start an agent in a new tab.
 - [**Notifications that update themselves**](#keeping-the-chat-current): a
   question answered at the keyboard becomes `✓ answered`, a finished turn you
   looked at becomes `👀 seen at the desk`.
 - [**A pinned herd board**](#keeping-the-chat-current), edited in place on
-  every status change.
-- [**Less noise**](#behavior): quiet hours, a minimum turn length, workspace
-  filters, a mute on a key, and a forum topic per workspace.
+  every status change and pane closure.
+- [**Less noise**](#behavior): quiet hours, a minimum turn length, a short
+  wait before a blocked notification so a question answered at the desk does
+  not ring, workspace filters, a mute on a key, and a forum topic per
+  workspace.
+- [**Secrets masked**](#secret-masking): API keys, tokens and private keys
+  that show up on a screen or in a response are masked before they reach
+  Telegram.
 - [**Retries and reminders**](#failed-sends): a message the network was down
   for is queued and sent later, and an agent left blocked can get one
   reminder.
@@ -35,21 +43,31 @@ default.
 
 ## Requirements
 
-Herdr 0.8 or newer, Node 18+, and Linux. Herdr's server does not inherit your
-shell's PATH, so `run.sh` locates Node itself, including nvm, fnm, volta and
-mise installs.
+Herdr 0.8 or newer, Node 18+, and Linux or macOS. Herdr's server does not inherit
+your shell's PATH, so `run.sh` locates Node itself, including Homebrew, nvm, fnm,
+volta and mise installs.
 
-Linux is required for `flock(1)` from util-linux. Hook processes, the reply
-poller and the sweeper share a state directory and use kernel locks to protect
-it. These locks are released when a process dies. Without `flock`,
-notifications still send, but failed messages are not queued, replies cannot be
-routed, and neither background process starts. `doctor` checks for it.
+Linux needs `flock(1)` from util-linux. On macOS, install it with
+`brew install util-linux`; the plugin finds the keg-only binary on Apple silicon
+and Intel without changing PATH or linking the keg. `brew install flock` is
+also supported through its linked Homebrew binary.
+
+Hook processes, the reply poller and the sweeper share a state directory and
+use kernel locks to protect it. These locks are released when a process dies.
+Without `flock`, notifications still send, but failed messages are not queued,
+replies cannot be routed, and neither background process starts. `doctor` checks
+for it.
 
 ## Install
 
 ```
 herdr plugin install naturalmoods/herdr-telegram-notify --yes
 ```
+
+Run the same command to upgrade. A reply poller or sweeper that is already
+running keeps the old code until it stops: `pkill -f replies.mjs` (and
+`pkill -f 'notify.mjs --sweep'`), and the next status change or Herdr start
+brings up the new one.
 
 ### Letting Claude Code do it
 
@@ -179,8 +197,9 @@ Reply routing has these restrictions:
 The bot confirms which pane received a reply or explains why Herdr refused it.
 Messages from the wrong chat or outside the allowlist get no answer.
 
-The reply poller runs in a separate process. It starts on the next status change
-after you enable `REPLIES` and stops on the next poll after you disable it.
+The reply poller runs in a separate process. With `REPLIES` enabled, it starts
+when Herdr starts, or on the next status change after you turn it on. It stops
+on the next poll after you disable it.
 It rereads `REPLIES`, `TELEGRAM_CHAT_ID` and `REPLY_ALLOWED_USER_IDS` once
 before each poll and again when the poll returns, so removing someone from the
 allowlist takes their access away without a restart, even mid-poll. Turning
@@ -253,6 +272,11 @@ voice messages are not delivered to a blocked agent.
 Commands require `REPLIES=1` and use the same chat and user allowlist as replies.
 Responses return to the forum topic where you asked.
 
+The commands appear in Telegram's `/` menu once the reply poller has started;
+nothing needs registering in BotFather. Registration is tried once per start.
+If it fails, `replies.log` records the failure, replies still work, and the next
+poller start tries again.
+
 | Command | Result |
 | --- | --- |
 | `/status` | List agents with their workspace, state and pane id. |
@@ -260,9 +284,13 @@ Responses return to the forum topic where you asked.
 | `/mute 30` | Mute notifications for 30 minutes. |
 | `/unmute` | Turn notifications back on. |
 | `/full` | Reply to a notification to download its saved response as a text file. |
+| `/stop` | Reply to a notification to send Esc to that agent. |
+| `/screen` | Reply to a notification to read that agent's current screen. |
+| `/diff` | Reply to a notification to download its current uncommitted changes as a `.diff` file. |
+| `/new <workspace> <kind> [prompt]` | Start a real agent in a new background tab, optionally giving it a prompt. |
 
-Only `/mute` accepts an argument. Extra arguments on the other commands produce
-a usage message without changing anything. In groups, you can address your bot
+Only `/mute` and `/new` accept arguments. Extra arguments on the other commands
+produce a usage message without changing anything. In groups, you can address your bot
 with `/status@yourbot`; the same syntax works for the other commands. Supported
 commands addressed to another bot, or with a malformed suffix, are ignored.
 Other text follows the normal notification-reply rules.
@@ -280,28 +308,83 @@ The time appears when the plugin recorded that agent's change of state.
 The list shows up to 20 agents and reports how many were omitted. It does not
 control any panes and reports an error if Herdr cannot be reached.
 
+`/new storefront claude Review notes.md.` starts a real agent in a new tab,
+without moving the desktop focus. It does not need a notification reply; if
+sent as a reply, that reply target is ignored. The workspace must already
+exist: use its exact id or a complete, case-insensitive label. Use an id for
+labels containing spaces or shared by multiple workspaces. Usage errors list
+the known labels and ids. Workspaces excluded by `NOTIFY_WORKSPACES` or
+`IGNORE_WORKSPACES` are refused, since their notifications would never reach you.
+
+The kind must be 1–32 lowercase letters, digits, `_` or `-`, starting with a
+letter. Herdr decides which kinds are supported. The tab is labelled with the
+kind, and the agent gets a generated unique name. Startup waits for readiness;
+a failed start closes only the tab this command created and reports the reason.
+
+The optional prompt keeps its newlines and is capped at 4,000 characters, like
+reply text. It is passed as one text argument, without a shell, `--wait` or
+native agent options after `--`. If the prompt fails, the agent remains running
+and the confirmation says why it was not delivered.
+
+Reply to the start confirmation with text, `/stop`, `/screen` or `/diff` as you
+would to a notification; the same session checks apply. If Herdr has not yet
+reported its session, the confirmation says to use its first notification for
+replies instead. Commands and confirmations use the same chat, sender allowlist
+and forum-topic routing as existing replies. Turn on `REPLIES` only for people
+you trust to start agents as well as type into them.
+
+`/stop` sends Esc to the agent from the notification you reply to, only if the
+same recorded session is still running and is `working` or `blocked`. It
+interrupts work or dismisses the current question without quitting the agent;
+it never sends Ctrl+C. Idle or done agents have nothing to stop; unknown states
+get no key either. Use `/stop` as the reply text, with no arguments.
+
+`/screen` must be a reply to a notification. It shows up to 40 lines from the
+pane's current screen, cropped to one column, with the agent, status and pane
+above it. The recorded session must still match; it never sends input. The
+screen is a preformatted block, with older lines dropped from the top if needed
+to fit one message. An empty or unreadable screen gets an explanation. Use
+`/screen` with no arguments; `SCREEN_LINES` does not change its fixed limit.
+
+`/diff` must be a reply with no arguments, and the recorded agent session must
+still match. It reads the live agent's working directory and sends `git diff
+HEAD` as a `.diff` file named after the pane, including staged and unstaged
+changes. It never sends pane input. The caption has the ✎ summary and untracked
+filenames; their contents are not included. A long filename list is shortened
+to fit Telegram's caption limit. Untracked-only work gets a note in the file
+saying there are no tracked changes.
+
+A directory outside a git repo, a repo with no commits, or a completely clean
+working tree gets a plain explanation instead. Diffs over 5 MB (5,242,880 bytes)
+get their size and ✎ summary instead of a file. Git runs without a shell, with
+optional locks disabled and external diff drivers and textconv disabled. The
+file and caption go through `MASK_SECRETS`; masking can make the file unsuitable
+for applying as a patch, so treat it as a review copy.
+
 `/full` sends the response saved before `LAST_MESSAGE_CHARS` and Telegram's
 message limit shortened it. It uses the text captured for that notification,
 including queued notifications, so later turns do not replace it. The command
 never reaches an agent or reads a live pane.
 
-Saved responses are available for up to 24 hours, within the last 300
-notifications. Older notifications, reminders and blocked-screen notifications
-may have no saved response; the bot explains when nothing is available.
-Notification and queue files are stored with owner-only permissions.
+Saved responses are available for up to 24 hours, within the last 300 recorded
+notifications and start confirmations. Older notifications, reminders and
+blocked-screen notifications may have no saved response; the bot explains when
+nothing is available. Notification and queue files are stored with owner-only
+permissions.
 
 ## Keeping the chat current
 
 With `MARK_RESOLVED=1` (the default), a notification is edited once the
-agent's next status change overtakes it, so what still looks like a
-notification in the chat is what is still waiting on you:
+agent's next status change or pane closure overtakes it. What still looks
+like a notification in the chat is what is still waiting on you:
 
-| Notification | Next status | Marked |
+| Notification | Next event | Marked |
 | --- | --- | --- |
 | Blocked, or its reminder | `working` | `✓ answered · 14:32` |
-| Blocked, or its reminder | anything else | `✓ no longer waiting · 14:32` |
+| Blocked, or its reminder | any other status | `✓ no longer waiting · 14:32` |
 | Any other | `idle` (seen in the focused UI) | `👀 seen at the desk · 14:32` |
 | Any other | `working` | `↷ on to the next turn · 14:32` |
+| Any | pane closed | `✕ pane closed · 14:32` |
 
 The line goes above the header. A blocked notification also loses its screen
 and its buttons, because that question is no longer being asked. Replies to a
@@ -318,11 +401,12 @@ time each agent entered its state:
 ⏳ claude · storefront · working since 14:31 · wA:p1
 ```
 
-It is edited in place on every status change, so it never rings, and it goes
-to `TELEGRAM_TOPIC_ID`'s topic when set. If you delete it, the next change sends
-and pins a new one. In a group the bot needs admin rights to pin; without them
-the board still updates, unpinned. A closed pane raises no status change, so
-set `SWEEP_MINUTES` to refresh the board on a timer too. Off by default.
+It is edited in place on every status change and pane closure, so it never
+rings, and it goes to `TELEGRAM_TOPIC_ID`'s topic when set. If you delete it, the
+next change sends and pins a new one. In a group the bot needs admin rights to
+pin; without them the board still updates, unpinned. Closed panes disappear
+without needing the sweeper. `SWEEP_MINUTES` can also refresh the board on a
+timer. Off by default.
 
 ## Muting it
 
@@ -376,17 +460,30 @@ Each optional part has a setting:
 | --- | --- | --- |
 | Status header | Event's agent and status | Always shown |
 | Session title | Agent's pane title | `SHOW_TITLE` |
-| Turn's prompt | Starting prompt in the transcript | `SHOW_PROMPT`, `PROMPT_CHARS` |
+| Turn's prompt | Claude/pi prompt, or Codex user-message event (not injected context) | `SHOW_PROMPT`, `PROMPT_CHARS` |
 | Workspace, branch, cwd | Session snapshot and `.git/HEAD` | `SHOW_PROJECT`, `SHOW_BRANCH` |
 | Uncommitted changes | `git diff --shortstat HEAD` and untracked files in that cwd | `SHOW_CHANGES` |
-| Duration | Recorded `working` → stop interval, or transcript turn | `SHOW_DURATION` |
-| Tools (off by default) | Four most-used tools from the turn's `tool_use` blocks | `SHOW_TOOLS` |
-| Tokens and cost | Assistant `usage` records summed over the turn | `SHOW_TOKENS` |
+| Duration | Recorded `working` → stop interval, or transcript turn (Codex task start/complete) | `SHOW_DURATION` |
+| Tools (off by default) | Four most-used Claude `tool_use`, pi `toolCall` or Codex function/custom-tool calls | `SHOW_TOOLS` |
+| Tokens and cost | Claude/pi assistant `usage`, or Codex `token_count` records (no cost) | `SHOW_TOKENS` |
 | Clock time (off by default) | Time of the status change | `SHOW_TIMESTAMP` |
 | Host, pane and focus command | Session snapshot | `SHOW_PANE`, `SHOW_HOST` |
 | Other agents' status | Session snapshot | `SHOW_HERD` |
-| Last message | Agent transcript (`~/.claude/projects/*.jsonl`, pi's session file) | `SHOW_LAST_MESSAGE`, `LAST_MESSAGE_CHARS` |
+| Last message | Claude transcript, pi session file or Codex rollout's last agent message | `SHOW_LAST_MESSAGE`, `LAST_MESSAGE_CHARS` |
 | Screen tail (blocked only) | `herdr pane read`, cropped to one column | `SHOW_SCREEN_ON_BLOCKED`, `SCREEN_LINES` |
+
+Claude session ids resolve under `~/.claude/projects/<project>/` (or
+`CLAUDE_CONFIG_DIR/projects`); pi supplies its session-file path. A session
+reported as `agent: "codex", kind: "id"` resolves to the rollout ending in that
+id under `$CODEX_HOME/sessions/YYYY/MM/DD/`, defaulting to `~/.codex/sessions`.
+The newest day directories are searched first, stopping at the first match.
+`CODEX_HOME` must be in Herdr's environment, not the plugin's `.env`.
+
+Codex prompts come only from `user_message` events or `UserMessage` items;
+user-role response items containing AGENTS.md and other injected context are
+ignored. Output tokens cover only the current turn's calls, while context is
+from its last token-count record, with cached input already included. Codex
+records no cost, so none is estimated or shown.
 
 For split panes, the screen tail includes the column containing the question,
 or the wider column if no question is detected. The plugin detects panel edges
@@ -413,6 +510,27 @@ control. `LAST_MESSAGE_CHARS` defaults to 1200. To stay within Telegram's
 keeping the markup intact. Higher `LAST_MESSAGE_CHARS` or `SCREEN_LINES` values
 may still result in a truncated body.
 
+### Secret masking
+
+Telegram bot chats are not end-to-end encrypted. `MASK_SECRETS=1` (the default)
+masks recognizable credentials before captured text is clipped or formatted:
+last messages, prompts, titles, blocked screens and reminders, button labels,
+and `/full`, `/screen` and `/diff` output. Queued text and saved responses are
+checked against the current setting too. Replies sent to an agent are not changed.
+
+It recognizes common Anthropic, OpenAI, GitHub, AWS, Slack, Google, Stripe and
+Telegram key shapes, Bearer tokens, JWTs, PEM private-key blocks and assignments
+whose names contain `SECRET`, `TOKEN`, `PASSWORD`, `PASSWD`, `API_KEY`, `APIKEY`
+or `PRIVATE_KEY`. Matches keep a short identifying prefix, such as
+`ghp_…[masked]`; assignments keep their names and mask the value. Assignment
+values shorter than 8 characters are left alone.
+
+This is best-effort pattern matching, not a guarantee. Unrecognized or partly
+visible secrets can still reach the chat. Set `MASK_SECRETS=0` if a false
+positive gets in the way; this allows unmasked text through and does not restore
+text that was already masked. Do not rely on it to make a sensitive session safe
+to share.
+
 ### Failed sends
 
 The plugin tries a send up to three times, with an eight-second timeout per
@@ -421,34 +539,45 @@ for Telegram's `retry_after` value when provided, or one second then two seconds
 otherwise. Retries are bounded so a failing hook finishes within about half a
 minute. Rejected tokens and chat ids are not retried or queued.
 
-Other failed sends go into the state directory. The next status change on any
-pane retries them, even if that event does not send a notification of its own.
+Other failed sends go into the state directory. The next status change or pane
+closure retries them, even if that event does not send a notification of its own.
 Delivered messages show how late they are. The queue keeps the twenty most
 recent messages for up to six hours.
 
 Set `SWEEP_MINUTES` to retry on a timer too; otherwise, the queue waits for
-another status change.
+another status change or pane closure.
 
 ## Behavior
 
 - Listens for Herdr's `pane.agent_status_changed` event. It sends only for
   `NOTIFY_STATUSES` (default `done,blocked`) but records every transition to
   calculate durations.
+- `pane.closed` removes the pane's recorded state. Its open notifications are
+  marked closed when `MARK_RESOLVED=1`, and the board refreshes when `BOARD=1`.
+  The event sends no notification.
 - Herdr reports `idle` when an agent is ready for input and its tab has been
   seen in the focused UI. It reports `done` when the same state is reached
   while the work was unseen. A turn you watched therefore stays silent by
   default. Add `idle` to `NOTIFY_STATUSES` to receive those notifications too,
   including short turns in the pane you are looking at.
+- `BLOCKED_DELAY_SECONDS` waits before sending a blocked notification, so a
+  question answered at the desk need not ring the phone. It defaults to `0`
+  (send at once); try `15`. Whole seconds only, capped at `120`. After the wait,
+  both the recorded episode and the live agent must still be blocked; an answer,
+  closure or new blocked stretch drops the old notification. The screen and
+  buttons are read after the wait. `DRY_RUN` previews skip the delay.
 - `BLOCKED_REMINDER_MINUTES` sends one reminder per blocked stretch, including
   the elapsed time and current screen. The plugin checks the live session
-  before sending to confirm the agent is still blocked. Off by default.
+  before sending to confirm the agent is still blocked. Off by default. Its
+  clock starts when the agent became blocked, not when a delayed message sent.
 - `SWEEP_MINUTES` sets the background interval for queue retries and blocked
   reminders. It defaults to `0` (off), so both otherwise wait for a status
-  change on any pane. Set it to `5` to check every five minutes, including when
-  all agents are waiting and no new events arrive.
+  change or pane closure. Set it to `5` to check every five minutes, including
+  when all agents are waiting and no new events arrive.
 
-  The sweeper starts on the next status change after you enable it. After you
-  set it back to `0`, it stops on its next pass, up to one interval later.
+  With `SWEEP_MINUTES` enabled, the sweeper starts when Herdr starts, or on the
+  next status change after you turn it on. After you set it back to `0`, it
+  stops on its next pass, up to one interval later.
   To stop it immediately, kill the pid in `sweep.lock`. A lock allows only one
   sweeper at a time. `herdr plugin action invoke doctor` reports its status;
   `sweep.log` in the state directory contains its log.
