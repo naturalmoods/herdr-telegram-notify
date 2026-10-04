@@ -120,7 +120,7 @@ await learnUsername();
 // the same chat, the same forum topic when the group has them, and hung under
 // the message it answers.
 async function say(text, to, parseMode) {
-  return telegram(
+  const res = await telegram(
     "sendMessage",
     {
       chat_id: chatId,
@@ -132,6 +132,10 @@ async function say(text, to, parseMode) {
     },
     10_000
   );
+  // An answer that never arrives looks, from the phone, like a command that did
+  // nothing; the log is the only place left to say otherwise.
+  if (!res?.ok) console.error(`herdr-telegram-notify: could not answer in the chat: ${res?.description ?? "no answer"}`);
+  return res;
 }
 
 // A response or diff need not fit one message, so send the whole text as a file.
