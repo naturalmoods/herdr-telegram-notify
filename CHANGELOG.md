@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.11.0
 
 More you can do from the phone, and less of it ringing for nothing.
 
@@ -39,6 +39,9 @@ More you can do from the phone, and less of it ringing for nothing.
 - macOS support with `brew install util-linux` (or `brew install flock`). The
   plugin finds Homebrew's flock without PATH changes, and CI now runs the tests
   on macOS too.
+- The reply poller tries a chat answer once more when its connection went
+  stale during a long agent start or transcription, and logs an answer that
+  still fails instead of dropping it silently.
 - Upgrading: a reply poller that is already running keeps the old code and
   does not know the new commands. Stop it once (`pkill -f replies.mjs`); the
   next status change or Herdr start brings up the new one.
