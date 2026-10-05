@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Make the README a quick start; move the full reference to [docs/guide.md](docs/guide.md).
+- Add a `sidebar` action to set up separate `$telegram` rows in the local
+  client config, including agent overrides, with a backup and validation.
+  Doctor warns when the local layout is missing the token; remote clients
+  need setup and a menu reload on the machine where their window runs.
+
 ## 0.12.0
 
 What Herdr 0.9 offers that the plugin was not using yet.

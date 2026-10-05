@@ -30,6 +30,13 @@ title = "Mute/unmute Telegram notifications"
 description = "Stop sending for MUTE_MINUTES (default an hour), or start again if already muted."
 command = ["/bin/sh", "run.sh", "mute.mjs"]
 
+# Layouts are client-local, so run this action where the Herdr window runs.
+[[actions]]
+id = "sidebar"
+title = "Show Telegram state in the Herdr sidebar"
+description = "Add a separate $telegram row to the local client config, with a backup and config check."
+command = ["/bin/sh", "run.sh", "sidebar.mjs"]
+
 # Check everything the notifier depends on and send one test message. The report
 # lands in `herdr plugin log list`; the verdict in a Herdr notification.
 [[actions]]

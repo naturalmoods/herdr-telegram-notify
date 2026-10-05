@@ -6,8 +6,9 @@ description: Set up or diagnose the herdr-telegram-notify plugin — bot token, 
 # herdr-telegram-notify setup
 
 Everything here is one `.env` file and one `doctor` run. The file is documented
-key by key in `.env.example`; read that before inventing a key, and read
-`README.md` before changing what a key means.
+key by key in [`.env.example`](../../../.env.example); read that before inventing
+a key. Use the [complete guide](../../../docs/guide.md) for settings, limits and
+behaviour; [README.md](../../../README.md) is the quick start.
 
 Use Linux with util-linux, or macOS with `brew install util-linux`, plus Herdr
 0.8+ and Node 18+. The plugin finds Homebrew's keg-only flock on Apple silicon
@@ -174,8 +175,16 @@ again.
 
 `SIDEBAR_TOKENS=1` reports display-only metadata under the plugin's source id.
 It stays invisible until `$telegram` is added to `rows` in `[ui.sidebar.agents]`
-and `[ui.sidebar.spaces]` in the client's Herdr config.toml; the README has the
-complete snippet. Agent-specific row overrides need it added too.
+and `[ui.sidebar.spaces]` in the client's Herdr config.toml. Run
+`herdr plugin action invoke sidebar --plugin naturalmoods.herdr-telegram-notify`
+where the Herdr window runs, not on an SSH server. It honors `HERDR_CONFIG_PATH`
+and `XDG_CONFIG_HOME`, backs up and checks the local config, and adds a separate
+`["$telegram"]` row after the first, including agent overrides. An empty row
+disappears; a separate row avoids truncation beside long tab names. Existing
+`$telegram` layouts stay untouched, and unrecognized values get manual notes.
+Reload config from the Herdr menu (or your `reload_config` key); server reload
+alone does not reload the client. Doctor warns, without failing, if the local
+layout is missing the token. A client elsewhere needs its own config edited.
 `📨 HH:MM` means a notification was actually delivered and clears with
 `MARK_RESOLVED`; `📱 HH:MM` means phone input reached the pane and expires after
 30 minutes. The newest pane value replaces the previous one. Mute actions and
