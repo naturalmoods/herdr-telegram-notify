@@ -134,11 +134,24 @@ const started = fs.existsSync(startedPath) ? JSON.parse(fs.readFileSync(startedP
 const live = { ...started, ...agents };
 const ok = (result = {}) => console.log(JSON.stringify({ result }));
 const fail = (message) => { console.error(JSON.stringify({ error: { message } })); process.exit(1); };
-if (args[0] === "api" && args[1] === "snapshot") {
+if (args[1] === "report-metadata") {
+  if (creation.metadataError) fail(creation.metadataError);
+  ok();
+} else if (args[0] === "api" && args[1] === "snapshot") {
   ok({ snapshot: { agents: Object.entries(live).map(([pane_id, a]) => ({ pane_id, ...a })), workspaces } });
+} else if (args[0] === "worktree" && args[1] === "create") {
+  if (creation.createError) fail(creation.createError);
+  const ready = () => {
+    const branch = args[args.indexOf("--branch") + 1];
+    fs.writeFileSync(tabPath, JSON.stringify({ workspaceId: "wQ", paneId: "wQ:p9" }));
+    ok({ ...(creation.missingWorkspace ? {} : { workspace: { workspace_id: "wQ", label: branch } }),
+      tab: { tab_id: "wQ:t9" }, ...(creation.missingPane ? {} : { root_pane: { pane_id: "wQ:p9" } }), worktree: { branch } });
+  };
+  if (creation.worktreeDelayMs) setTimeout(ready, creation.worktreeDelayMs);
+  else ready();
 } else if (args[0] === "tab" && args[1] === "create") {
   if (creation.createError) fail(creation.createError);
-  fs.writeFileSync(tabPath, JSON.stringify({ workspaceId: args[3] }));
+  fs.writeFileSync(tabPath, JSON.stringify({ workspaceId: args[3], paneId }));
   ok({ tab: { tab_id: tabId }, ...(creation.missingPane ? {} : { root_pane: { pane_id: paneId } }) });
 } else if (args[0] === "tab" && args[1] === "close") {
   if (creation.closeError) fail(creation.closeError);
@@ -146,8 +159,9 @@ if (args[0] === "api" && args[1] === "snapshot") {
 } else if (args[0] === "agent" && args[1] === "start") {
   if (creation.startError) fail(creation.startError);
   const ready = () => {
+    const { workspaceId, paneId } = JSON.parse(fs.readFileSync(tabPath, "utf8"));
     const agent = { name: args[2], agent: args[4], agent_status: "idle",
-      workspace_id: JSON.parse(fs.readFileSync(tabPath, "utf8")).workspaceId,
+      workspace_id: workspaceId,
       agent_session: Object.hasOwn(creation, "session") ? creation.session : { kind: "id", value: "example-started-session" } };
     fs.writeFileSync(startedPath, JSON.stringify({ ...started, [paneId]: agent }));
     ok({ agent });
@@ -185,6 +199,7 @@ function fixture({ agents = {}, screens = {}, workspaces = [], messages = [], en
       "TELEGRAM_BOT_TOKEN=123456789:AAtesttesttesttesttesttesttest",
       `TELEGRAM_CHAT_ID=${CHAT}`,
       "REPLIES=1",
+      "SIDEBAR_TOKENS=0",
       ...env,
     ].join("\n")
   );
@@ -289,6 +304,46 @@ const waitFor = (cond, timeoutMs = 15000) =>
     const bomb = setTimeout(() => (clearInterval(poll), reject(new Error("timed out waiting"))), timeoutMs);
   });
 
+test("phone deliveries report a pane sidebar token with a thirty-minute TTL, but reads and refusals do not", async () => {
+  for (const kind of ["text", "stop", "button", "file", "voice", "failed-report", "screen", "refused", "disabled", "dry"]) {
+    const blocked = kind === "button";
+    const fx = fixture({
+      agents: { "wA:p1": { agent_status: blocked ? "blocked" : "working", agent_session: { kind: "id", value: "example-phone-session" } } },
+      messages: blocked ? [] : [{ id: 100, paneId: "wA:p1", session: kind === "refused" ? "id:example-old-session" : "id:example-phone-session" }],
+      screens: { "wA:p1": "Do you want to create notes.md?\n ❯ 1. Yes\n 2. No" },
+      env: ["SIDEBAR_TOKENS=1", ...(kind === "disabled" ? ["SIDEBAR_TOKENS=0"] : kind === "dry" ? ["DRY_RUN=1"] : [])],
+      creation: { metadataError: kind === "failed-report" ? "Metadata reports are unavailable" : undefined },
+    });
+    let message = update(1, { replyTo: 100, text: kind === "stop" ? "/stop" : kind === "screen" ? "/screen" : "Review notes.md." });
+    if (blocked) {
+      fx.remember({ id: 100, paneId: "wA:p1", session: "id:example-phone-session", question: questionFor(fx, "wA:p1") });
+      message = { update_id: 1, callback_query: { id: "example-tap", from: { id: 7 }, data: "1", message: { message_id: 100, chat: { id: CHAT } } } };
+    } else if (kind === "file") message = withFile(1, { document: { file_id: "example-notes", file_name: "notes.md", file_size: 100 } });
+    else if (kind === "voice") {
+      message = voiceNote(1);
+      appendFileSync(join(fx.configDir, ".env"), `\nWHISPER_BIN=${fakeWhisper(fx.root)}\nWHISPER_LANGUAGE=en\n`);
+    }
+    const expected = !["screen", "refused", "disabled", "dry"].includes(kind);
+    const tg = await fakeTelegram([[message]]);
+    try {
+      const out = await runPoller(fx, tg.base, { until: () => tg.polls.length >= 2
+        && (!expected || fx.argv().some((a) => a[1] === "report-metadata")) });
+      assert.ok(tg.sent.some((m) => m.method === "sendMessage"), out);
+      const reports = fx.argv().filter((a) => a[1] === "report-metadata");
+      assert.equal(reports.length, expected ? 1 : 0, kind);
+      if (expected) {
+        const [report] = reports;
+        assert.deepEqual(report.slice(0, 5), ["pane", "report-metadata", "wA:p1", "--source", "naturalmoods.herdr-telegram-notify"]);
+        assert.match(report[report.indexOf("--token") + 1], /^telegram=📱 \d\d:\d\d$/);
+        assert.equal(report[report.indexOf("--ttl-ms") + 1], "1800000");
+        assert.ok(BigInt(report[report.indexOf("--seq") + 1]) > 0n);
+      }
+    } finally {
+      tg.close();
+    }
+  }
+});
+
 test("/new creates a background tab and a uniquely named agent, preserving the prompt and routing confirmation replies", async () => {
   for (const entry of [
     { workspace: "STOREfront", kind: "claude", startDelayMs: 10_100 },
@@ -346,6 +401,125 @@ test("/new creates a background tab and a uniquely named agent, preserving the p
       assert.equal(recorded.find((m) => m.id === 1001)?.paneId, "wZ:p9");
       assert.equal(recorded.find((m) => m.id === 1001)?.session, "id:example-started-session");
       assert.equal(argv.some((a) => a[0] === "agent" && a[2] === "wX:p1"), false, "the command's reply target was used");
+    } finally {
+      tg.close();
+    }
+  }
+});
+
+test("/new @branch creates a background worktree, preserving the prompt and confirmation routing", async () => {
+  for (const entry of [
+    { selector: "STOREfront", label: "storefront", branch: "fix-login", worktreeDelayMs: 10_100 },
+    { selector: "store@front", label: "store@front", branch: "Feature/fix_2.1" },
+    { selector: "wZ", label: "storefront", branch: "X".repeat(100), empty: true },
+    { selector: "wZ", label: "storefront", branch: "x", empty: true },
+  ]) {
+    const prompt = entry.empty ? "" : "Review notes.md.\nKeep  two  spaces and --help as text.\n";
+    const command = update(1, { text: `/new ${entry.selector}@${entry.branch} claude ${prompt}` });
+    const followup = update(2, { replyTo: 1001, text: "Continue with the example." });
+    for (const u of [command, followup]) u.message.message_thread_id = 77;
+    const tg = await fakeTelegram([[command], [followup]]);
+    const fx = fixture({
+      workspaces: [{ workspace_id: "wZ", label: entry.label }],
+      env: [`NOTIFY_WORKSPACES=wZ,${entry.branch.toLowerCase()}`],
+      creation: { worktreeDelayMs: entry.worktreeDelayMs },
+    });
+    try {
+      const out = await runPoller(fx, tg.base, { until: () => tg.polls.length >= 3, timeoutMs: 30_000 });
+      assert.equal(tg.sent.length, 2, out);
+      const argv = fx.argv();
+      const start = argv.find((a) => a[0] === "agent" && a[1] === "start");
+      assert.match(start[2], /^claude-[a-z0-9]{4}$/);
+      assert.deepEqual(argv, [
+        ["api", "snapshot"],
+        ["worktree", "create", "--workspace", "wZ", "--branch", entry.branch, "--label", entry.branch, "--no-focus"],
+        ["agent", "start", start[2], "--kind", "claude", "--pane", "wQ:p9"],
+        ...(prompt ? [["agent", "prompt", "wQ:p9", prompt]] : []),
+        ["agent", "get", "wQ:p9"],
+        ["agent", "get", "wQ:p9"],
+        ["agent", "prompt", "wQ:p9", "Continue with the example."],
+      ]);
+      assert.ok(argv.every((a) => !["--trust-repository", "--path", "--base"].some((flag) => a.includes(flag))));
+      assert.equal(tg.sent[0].text, `▶ started claude in ${entry.label}@${entry.branch} · wQ:p9`);
+      assert.equal(tg.sent[0].reply_to_message_id, command.message.message_id);
+      assert.ok(tg.sent.every((m) => m.message_thread_id === 77 && m.chat_id === String(CHAT)));
+      const recorded = readFileSync(join(fx.stateDir, "messages.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      assert.equal(recorded[0].paneId, "wQ:p9");
+      assert.equal(recorded[0].session, "id:example-started-session");
+    } finally {
+      tg.close();
+    }
+  }
+});
+
+test("/new refuses invalid branches before any Herdr call", async () => {
+  const branches = ["", "-x", ".x", "a..b", "a//b", "x/", "x.", "x.lock", "a/x.lock",
+    "x".repeat(101), "x:y", "x;echo", "x~y", "x\\y", "x\u0000y"];
+  const tg = await fakeTelegram([branches.map((branch, i) => update(i + 1, { text: `/new storefront@${branch} claude` }))]);
+  const fx = fixture({ workspaces: [{ workspace_id: "wZ", label: "storefront" }] });
+  try {
+    const out = await runPoller(fx, tg.base, { until: () => tg.polls.length >= 2 });
+    assert.equal(tg.sent.length, branches.length, out);
+    assert.deepEqual(fx.argv(), []);
+    assert.ok(tg.sent.every((m) => /Invalid branch/.test(m.text) && m.text.includes("/new <workspace>@<branch> <kind> [prompt]")));
+  } finally {
+    tg.close();
+  }
+});
+
+test("/new refuses filtered worktree labels and parent workspaces before mutations", async () => {
+  for (const entry of [
+    { env: ["NOTIFY_WORKSPACES=wZ"], filter: "NOTIFY_WORKSPACES", advice: "Add fix-login to NOTIFY_WORKSPACES" },
+    { env: ["NOTIFY_WORKSPACES=storefront,fix-login", "IGNORE_WORKSPACES=FIX-LOGIN"], filter: "IGNORE_WORKSPACES", advice: "Remove fix-login from IGNORE_WORKSPACES" },
+    { env: ["NOTIFY_WORKSPACES=fix-login"], filter: "NOTIFY_WORKSPACES", parent: true },
+    { env: ["IGNORE_WORKSPACES=STOREFRONT"], filter: "IGNORE_WORKSPACES", parent: true },
+  ]) {
+    const tg = await fakeTelegram([[update(1, { text: "/new storefront@fix-login claude" })]]);
+    const fx = fixture({ workspaces: [{ workspace_id: "wZ", label: "storefront" }], env: entry.env });
+    try {
+      const out = await runPoller(fx, tg.base, { until: () => tg.polls.length >= 2 });
+      assert.equal(tg.sent.length, 1, out);
+      assert.deepEqual(fx.argv(), [["api", "snapshot"]]);
+      assert.ok(tg.sent[0].text.includes(`filtered out by ${entry.filter}; you would not hear back`));
+      if (entry.parent) assert.match(tg.sent[0].text, /storefront is filtered out/);
+      else {
+        assert.ok(tg.sent[0].text.includes(entry.advice));
+        assert.match(tg.sent[0].text, /start without @branch/);
+      }
+    } finally {
+      tg.close();
+    }
+  }
+});
+
+test("/new worktree failures never close or remove a checkout and identify what was left", async () => {
+  for (const creation of [
+    { startError: "Agent did not become ready" }, { missingPane: true }, { missingWorkspace: true },
+    { createError: "Branch is already checked out" }, { promptError: "Agent is blocked" }, { session: null },
+  ]) {
+    const tg = await fakeTelegram([[update(1, { text: "/new storefront@fix-login claude Review notes.md." })]]);
+    const fx = fixture({ workspaces: [{ workspace_id: "wZ", label: "storefront" }], creation });
+    try {
+      const out = await runPoller(fx, tg.base, { until: () => tg.polls.length >= 2 });
+      assert.equal(tg.sent.length, 1, out);
+      const argv = fx.argv();
+      assert.ok(argv.every((a) => !a.includes("close") && !a.includes("remove")), "a worktree or its tab was deleted");
+      if (creation.startError || creation.missingPane || creation.missingWorkspace) {
+        assert.match(tg.sent[0].text, /Left workspace .* with branch fix-login in place/);
+        assert.ok(tg.sent[0].text.includes(`herdr worktree remove --workspace ${creation.missingWorkspace ? "<id>" : "wQ"}`));
+        assert.equal(argv.length, creation.startError ? 3 : 2);
+        assert.equal(existsSync(join(fx.stateDir, "messages.jsonl")), false);
+      } else if (creation.createError) {
+        assert.deepEqual(argv.map((a) => a.slice(0, 2)), [["api", "snapshot"], ["worktree", "create"]]);
+        assert.ok(tg.sent[0].text.includes(creation.createError));
+      } else if (creation.promptError) {
+        assert.match(tg.sent[0].text, /▶ started claude in storefront@fix-login/);
+        assert.match(tg.sent[0].text, /prompt not delivered: Agent is blocked/);
+        assert.ok(existsSync(join(fx.stateDir, "messages.jsonl")));
+      } else {
+        assert.match(tg.sent[0].text, /Replies will work from its first notification/);
+        assert.equal(existsSync(join(fx.stateDir, "messages.jsonl")), false);
+      }
     } finally {
       tg.close();
     }
@@ -1064,6 +1238,40 @@ const about = (minutes, until) => {
   const want = Date.now() + minutes * 60 * 1000;
   assert.ok(Math.abs(until - want) < 30_000, `${until} is not about ${minutes} min away (${want})`);
 };
+
+test("/mute reports every workspace with its remaining TTL and /unmute clears them", async () => {
+  let until;
+  const fx = fixture({
+    workspaces: [{ workspace_id: "wA", label: "storefront" }, { workspace_id: "wB", label: "docs" }],
+    env: ["SIDEBAR_TOKENS=1"],
+  });
+  const tg = await fakeTelegram([[update(1, { text: "/mute 30" })], [update(2, { text: "/unmute" })]], {
+    onSend: (message) => { if (message.text.startsWith("🔕")) until = muteUntil(fx); },
+  });
+  try {
+    const began = Date.now();
+    const out = await runPoller(fx, tg.base, { until: () => tg.sent.length === 2
+      && fx.argv().filter((a) => a[1] === "report-metadata").length === 4 });
+    assert.equal(tg.sent.length, 2, out);
+    const reports = fx.argv().filter((a) => a[1] === "report-metadata");
+    for (const id of ["wA", "wB"]) {
+      const set = reports.find((a) => a[2] === id && a.includes("--token"));
+      const clear = reports.find((a) => a[2] === id && a.includes("--clear-token"));
+      assert.equal(set[0], "workspace");
+      assert.equal(set[set.indexOf("--source") + 1], "naturalmoods.herdr-telegram-notify");
+      assert.match(set[set.indexOf("--token") + 1], /^telegram=🔕 until \d\d:\d\d$/);
+      const ttl = Number(set[set.indexOf("--ttl-ms") + 1]);
+      assert.ok(ttl > 0 && ttl <= until - began);
+      assert.ok(ttl >= until - Date.now(), "TTL started before the mute snapshot was read");
+      assert.equal(clear[clear.indexOf("--clear-token") + 1], "telegram");
+      assert.equal(clear.includes("--ttl-ms"), false);
+      assert.ok(BigInt(clear[clear.indexOf("--seq") + 1]) > BigInt(set[set.indexOf("--seq") + 1]));
+    }
+    assert.equal(muteUntil(fx), undefined);
+  } finally {
+    tg.close();
+  }
+});
 
 test("/mute silences the notifier for the minutes asked for, and /unmute lifts it", async () => {
   const tg = await fakeTelegram([[update(1, { text: "/mute 30" })], [update(2, { text: `/unmute@${BOT}` })]]);

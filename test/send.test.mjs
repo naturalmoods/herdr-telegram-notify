@@ -38,42 +38,35 @@ async function fakeTelegram(script = []) {
   return { sent, methods, base: `http://127.0.0.1:${server.address().port}`, close: () => server.close() };
 }
 
-function fakeHerdr(dir, agents = [], readsScreen = true) {
-  const snapshot = { result: { snapshot: { workspaces: [], panes: [], agents } } };
+function fakeHerdr(dir, agents = [], readsScreen = true, metadataError = false) {
   const path = join(dir, "herdr");
-  // `pane read` answers too: a blocked agent's question is on its screen, and
-  // the message it goes out with is recorded against it. A pane it cannot read
-  // is how herdr answers for one that is gone or redrawing.
-  writeFileSync(
-    path,
-    `#!/bin/sh
-[ "$1" = pane ] && { ${
-    typeof readsScreen === "string"
-      ? `cat <<'SCREEN'\n${readsScreen}\nSCREEN\nexit 0`
-      : readsScreen
-        ? 'echo "Do you want to create notes.md?"; echo " 1. Yes"; exit 0'
-        : "exit 1"
-  }; }
-if [ "$1" = agent ] && [ "$2" = get ]; then
-  case "$3" in
-${agents.map((agent) => `${agent.pane_id}) cat <<'JSON'
-${JSON.stringify({ result: { agent } })}
-JSON
-exit 0 ;;`).join("\n")}
-  *) exit 1 ;;
-  esac
-fi
-[ "$1" = api ] || exit 1
-cat <<'JSON'
-${JSON.stringify(snapshot)}
-JSON
-`
-  );
+  // JSON argv distinguishes a pane read from a display-only metadata report,
+  // and keeps token values containing spaces available to the assertions.
+  writeFileSync(path, `#!${process.execPath}
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(join(dir, "herdr-argv.jsonl"))}, JSON.stringify(args) + "\\n");
+const agents = ${JSON.stringify(agents)};
+if (args[1] === "report-metadata") {
+  if (${metadataError}) { console.error("Metadata reports are unavailable"); process.exit(1); }
+  console.log(JSON.stringify({ result: {} }));
+} else if (args[0] === "pane" && args[1] === "read") {
+  const screen = ${JSON.stringify(typeof readsScreen === "string" ? readsScreen : readsScreen ? "Do you want to create notes.md?\n 1. Yes" : undefined)};
+  if (!screen) process.exit(1);
+  console.log(screen);
+} else if (args[0] === "agent" && args[1] === "get") {
+  const agent = agents.find((a) => a.pane_id === args[2]);
+  if (!agent) process.exit(1);
+  console.log(JSON.stringify({ result: { agent } }));
+} else if (args[0] === "api") {
+  console.log(JSON.stringify({ result: { snapshot: { workspaces: [], panes: agents.map(({ tokens, ...pane }) => pane), agents } } }));
+} else process.exit(1);
+`);
   chmodSync(path, 0o755);
   return path;
 }
 
-function fixture(extraEnv = [], agents = [], readsScreen = true) {
+function fixture(extraEnv = [], agents = [], readsScreen = true, metadataError = false) {
   const root = mkdtempSync(join(tmpdir(), "send-test-"));
   const stateDir = join(root, "state");
   const configDir = join(root, "config");
@@ -93,11 +86,13 @@ function fixture(extraEnv = [], agents = [], readsScreen = true) {
       "SHOW_TOKENS=0",
       "SHOW_DURATION=0",
       "SHOW_PROMPT=0",
+      "SIDEBAR_TOKENS=0",
       ...extraEnv,
     ].join("\n")
   );
   chmodSync(join(configDir, ".env"), 0o600);
-  return { root, stateDir, configDir, herdr: fakeHerdr(root, agents, readsScreen) };
+  return { root, stateDir, configDir, herdr: fakeHerdr(root, agents, readsScreen, metadataError),
+    argv: () => lines(join(root, "herdr-argv.jsonl")) };
 }
 
 // One status change or pane closure, as Herdr fires it.
@@ -136,6 +131,157 @@ const lines = (path) =>
 
 const pending = (fx) => lines(join(fx.stateDir, "pending.jsonl"));
 const remembered = (fx) => lines(join(fx.stateDir, "messages.jsonl"));
+
+test("notifications select the event agent's snapshot tokens after the clock, with no line when unset or absent", async () => {
+  const tokens = { quota_5h_warning: "5h 25% 59m", model: "Model Cedar", context: "context 13%", telegram: "📨 09:12" };
+  for (const entry of [
+    { setting: "model,context,quota_5h_*,telegram", tokens, expected: "📊 Model Cedar · context 13% · 5h 25% 59m" },
+    { setting: "model,*" },
+    { setting: "telegram,tele*,*", tokens: { telegram: "📱 09:12" } },
+    { setting: "", tokens },
+    { tokens },
+  ]) {
+    const tg = await fakeTelegram();
+    const fx = fixture([
+      "SHOW_TITLE=0", "SHOW_PANE=0", "SHOW_TIMESTAMP=1", "SHOW_SCREEN_ON_BLOCKED=0",
+      ...(entry.setting === undefined ? [] : [`SHOW_AGENT_TOKENS=${entry.setting}`]),
+    ], [
+      { pane_id: "wA:p7", agent_status: "done", tokens: entry.tokens },
+      { pane_id: "wA:p8", tokens: { model: "Model Birch" } },
+    ]);
+    try {
+      const { code, out } = await hook(fx, tg.base, "wA:p7");
+      assert.equal(code, 0, out);
+      assert.equal(tg.sent.length, 1);
+      const rows = tg.sent[0].text.split("\n");
+      const clock = rows.findIndex((row) => row.startsWith("⏱"));
+      assert.ok(clock >= 0);
+      if (entry.expected) {
+        assert.equal(rows[clock + 1], entry.expected);
+        assert.equal(remembered(fx)[0].parts.agentTokens, entry.expected);
+      } else assert.equal(rows.some((row) => row.startsWith("📊")), false);
+      assert.ok(!tg.sent[0].text.includes("Model Birch"));
+      assert.ok(!tg.sent[0].text.includes("📨 09:12") && !tg.sent[0].text.includes("📱 09:12"));
+      const snapshots = fx.argv().filter((args) => args[0] === "api" && args[1] === "snapshot");
+      assert.equal(snapshots.length, entry.setting ? 1 : 0);
+      assert.equal(fx.argv().some((args) => args[0] === "agent" && args[1] === "list"), false);
+    } finally {
+      tg.close();
+    }
+  }
+});
+
+test("queued notifications keep the captured agent metadata even after the setting is turned off", async () => {
+  const rejected = await fakeTelegram([{ status: 502 }, { status: 502 }, { status: 502 }]);
+  const accepted = await fakeTelegram();
+  const fx = fixture(["SHOW_AGENT_TOKENS=model"], [{ pane_id: "wA:p7", tokens: { model: "Model Cedar" } }]);
+  try {
+    const first = await hook(fx, rejected.base, "wA:p7");
+    assert.equal(pending(fx).length, 1, first.out);
+    assert.equal(pending(fx)[0].parts.agentTokens, "📊 Model Cedar");
+    const env = join(fx.configDir, ".env");
+    writeFileSync(env, readFileSync(env, "utf8") + "\nSHOW_AGENT_TOKENS=\n");
+    const { code, out } = await hook(fx, accepted.base, "wA:p8", { status: "working" });
+    assert.equal(code, 0, out);
+    assert.equal(accepted.sent.length, 1);
+    assert.match(accepted.sent[0].text, /📊 Model Cedar/);
+    assert.deepEqual(pending(fx), []);
+  } finally {
+    rejected.close();
+    accepted.close();
+  }
+});
+
+test("blocked reminders include fresh selected agent metadata after the waiting line", async () => {
+  const tg = await fakeTelegram();
+  const fx = fixture(["SHOW_AGENT_TOKENS=model", "BLOCKED_REMINDER_MINUTES=1", "SHOW_SCREEN_ON_BLOCKED=0"], [
+    { pane_id: "wA:p7", agent_status: "blocked", tokens: { model: "Model Cedar", telegram: "📱 09:12" } },
+  ]);
+  writeFileSync(join(fx.stateDir, "state-wA_p7.json"), JSON.stringify({
+    status: "blocked", updatedAt: Date.now() - 30 * 60_000, paneId: "wA:p7",
+  }));
+  try {
+    const { code, out } = await hook(fx, tg.base, "wA:p8", { status: "working" });
+    assert.equal(code, 0, out);
+    assert.equal(tg.sent.length, 1);
+    assert.match(tg.sent[0].text, /⏱ waiting [^\n]+\n📊 Model Cedar/);
+    assert.equal(remembered(fx)[0].parts.agentTokens, "📊 Model Cedar");
+  } finally {
+    tg.close();
+  }
+});
+
+test("a sent notification reports a pane sidebar token and a resolving status clears it", async () => {
+  const tg = await fakeTelegram();
+  const fx = fixture(["SIDEBAR_TOKENS="]);
+  try {
+    const first = await hook(fx, tg.base, "wA:p1");
+    assert.equal(first.code, 0, first.out);
+    const reports = fx.argv().filter((a) => a[1] === "report-metadata");
+    const sent = reports.find((a) => a.includes("--token"));
+    assert.deepEqual(sent.slice(0, 5), ["pane", "report-metadata", "wA:p1", "--source", "naturalmoods.herdr-telegram-notify"]);
+    assert.match(sent[sent.indexOf("--token") + 1], /^telegram=📨 \d\d:\d\d$/);
+    assert.equal(sent.includes("--ttl-ms"), false);
+    assert.ok(BigInt(sent[sent.indexOf("--seq") + 1]) > 0n);
+    const next = await hook(fx, tg.base, "wA:p1", { status: "working" });
+    assert.equal(next.code, 0, next.out);
+    const clear = fx.argv().filter((a) => a[1] === "report-metadata").at(-1);
+    assert.equal(clear[clear.indexOf("--clear-token") + 1], "telegram");
+    assert.equal(BigInt(clear[clear.indexOf("--seq") + 1]), BigInt(sent[sent.indexOf("--seq") + 1]) + 1n,
+      "resolution used its arrival time and could erase newer phone activity");
+    assert.deepEqual(tg.methods, ["sendMessage", "editMessageText"]);
+  } finally {
+    tg.close();
+  }
+});
+
+test("sidebar reports are absent when disabled or dry, and failed reports do not stop notifications", async () => {
+  for (const entry of [
+    { env: ["SIDEBAR_TOKENS=0"] }, { env: ["SIDEBAR_TOKENS=1", "DRY_RUN=1"], dry: true },
+    { env: ["SIDEBAR_TOKENS=1"], fails: true }, { env: ["SIDEBAR_TOKENS=1", "DEBUG=1"], fails: true, debug: true },
+    { env: ["SIDEBAR_TOKENS=1"], muted: true },
+    { env: ["SIDEBAR_TOKENS=1", "NOTIFY_STATUSES=blocked"], filtered: true },
+  ]) {
+    const tg = await fakeTelegram();
+    const fx = fixture(entry.env, [], true, entry.fails);
+    if (entry.muted) writeFileSync(join(fx.stateDir, "mute.json"), JSON.stringify({ until: Date.now() + 60_000 }));
+    try {
+      const { out, code } = await hook(fx, tg.base, "wA:p1");
+      assert.equal(code, 0, out);
+      const reports = fx.argv().filter((a) => a[1] === "report-metadata");
+      assert.equal(tg.methods.length, entry.dry || entry.muted || entry.filtered ? 0 : 1);
+      if (entry.fails) {
+        assert.ok(reports.some((a) => a.includes("--token")));
+        assert.equal(out.includes("sidebar token report failed"), Boolean(entry.debug), out);
+      } else if (entry.dry || entry.env.includes("SIDEBAR_TOKENS=0")) assert.deepEqual(reports, []);
+      else assert.ok(reports.every((a) => a.includes("--clear-token")), "a dropped notification was shown as sent");
+    } finally {
+      tg.close();
+    }
+  }
+});
+
+test("a queued notification gets its sidebar token only after delivery", async () => {
+  const rejected = await fakeTelegram([{ status: 400 }, { status: 400 }]);
+  const accepted = await fakeTelegram();
+  const fx = fixture(["SIDEBAR_TOKENS=1"]);
+  writeFileSync(join(fx.stateDir, "pending.jsonl"), JSON.stringify({
+    at: Date.now(), paneId: "wA:p1",
+    parts: { emoji: "✅", agent: "example", statusLabel: "done", body: "Example queued response." },
+  }) + "\n");
+  try {
+    await hook(fx, rejected.base, "wA:p2", { status: "working" });
+    assert.equal(fx.argv().some((a) => a[1] === "report-metadata" && a.includes("--token")), false);
+    const delivered = await hook(fx, accepted.base, "wA:p2", { status: "idle" });
+    assert.equal(delivered.code, 0, delivered.out);
+    assert.equal(accepted.sent.length, 1, "a legacy queue entry was delivered twice");
+    assert.deepEqual(pending(fx), []);
+    assert.ok(fx.argv().some((a) => a[0] === "pane" && a[2] === "wA:p1" && a.some((v) => v.startsWith("telegram=📨 "))));
+  } finally {
+    rejected.close();
+    accepted.close();
+  }
+});
 
 test("titles and previously queued text and button labels use the current secret masking setting", async () => {
   const secret = `ghp_${"x".repeat(36)}`;

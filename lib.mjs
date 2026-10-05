@@ -21,7 +21,9 @@ import {
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
-import { spawn, spawnSync } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
+import { promisify } from "node:util";
+import { performance } from "node:perf_hooks";
 
 
 // Every key is overridable from the plugin config dir's .env (see .env.example).
@@ -36,6 +38,7 @@ export const DEFAULTS = {
   SHOW_DURATION: "1",
   SHOW_TIMESTAMP: "0",
   SHOW_TOKENS: "1",
+  SHOW_AGENT_TOKENS: "",
   SHOW_TOOLS: "0",
   SHOW_PANE: "1",
   SHOW_HOST: "1",
@@ -57,6 +60,7 @@ export const DEFAULTS = {
   REPLIES: "0",
   REPLY_ALLOWED_USER_IDS: "",
   MARK_RESOLVED: "1",
+  SIDEBAR_TOKENS: "1",
   WHISPER_BIN: "",
   WHISPER_MODEL: "small",
   WHISPER_LANGUAGE: "",
@@ -223,9 +227,17 @@ export function configProblems(cfg) {
     }
   }
 
-  const masking = String(cfg("MASK_SECRETS") ?? "").toLowerCase();
-  if (masking && !["1", "true", "yes", "on", "0", "false", "no", "off"].includes(masking)) {
-    say("MASK_SECRETS", `${masking} — not 1/true/yes/on or 0/false/no/off; secret masking is off`);
+  for (const [key, what] of [["MASK_SECRETS", "secret masking"], ["SIDEBAR_TOKENS", "sidebar reporting"]]) {
+    const value = String(cfg(key) ?? "").toLowerCase();
+    if (value && !["1", "true", "yes", "on", "0", "false", "no", "off"].includes(value)) {
+      say(key, `${value} — not 1/true/yes/on or 0/false/no/off; ${what} is off`);
+    }
+  }
+
+  for (const selector of String(cfg("SHOW_AGENT_TOKENS") ?? "").split(",").map((s) => s.trim()).filter(Boolean)) {
+    if (selector !== "*" && !/^[A-Za-z0-9_-]{1,32}\*?$/.test(selector)) {
+      say("SHOW_AGENT_TOKENS", `${selector} — not a token name with an optional trailing *; it matches nothing, and the other selectors still apply`);
+    }
   }
 
   return problems;
@@ -438,6 +450,48 @@ export function loadSnapshot() {
   }
 }
 
+// -------------------------------------------------------- sidebar metadata
+
+export const SIDEBAR_PHONE_TTL_MS = 30 * 60 * 1000;
+export const SIDEBAR_TTL_MAX_MS = 24 * 60 * 60 * 1000;
+const sidebarExec = promisify(execFile);
+let sidebarSeq = 0n;
+
+// Epoch nanoseconds survive a new hook process, unlike a counter starting at
+// zero. Advance local ties as well; Herdr accepts uint64, not JavaScript numbers.
+export function sidebarSequence() {
+  const now = BigInt(Math.round(performance.timeOrigin * 1_000_000)) + BigInt(Math.round(performance.now() * 1_000_000));
+  sidebarSeq = now > sidebarSeq ? now : sidebarSeq + 1n;
+  return sidebarSeq.toString();
+}
+
+// Values are display-only. Never await this on a delivery path: a missing or
+// older Herdr must not hold up a notification, a reply or a mute confirmation.
+export async function reportSidebarToken(scope, id, value, { ttlMs, expiresAt, seq, cfg = loadConfig() } = {}) {
+  if (!isOn(cfg("SIDEBAR_TOKENS")) || isOn(cfg("DRY_RUN")) || (scope === "pane" && !id)) return;
+  // Capture the sequence before the snapshot or RPC can be delayed.
+  const sequence = seq ?? sidebarSequence();
+  const run = (args) => sidebarExec(herdrBin(), args, {
+    encoding: "utf8", timeout: 1000, killSignal: "SIGKILL", maxBuffer: 1024 * 1024,
+  });
+  try {
+    const ids = id ? [id] : (JSON.parse((await run(["api", "snapshot"])).stdout).result?.snapshot?.workspaces ?? [])
+      .map((workspace) => workspace.workspace_id).filter(Boolean);
+    await Promise.all(ids.map((target) => {
+      // Compute remaining time after the snapshot, not before it. Herdr caps
+      // TTL at one day; a longer mute still keeps its full notification silence.
+      const remaining = expiresAt === undefined ? ttlMs : expiresAt - Date.now();
+      const clear = value === undefined || (expiresAt !== undefined && remaining <= 0);
+      const args = [scope, "report-metadata", target, "--source", "naturalmoods.herdr-telegram-notify",
+        ...(clear ? ["--clear-token", "telegram"] : ["--token", `telegram=${value}`]), "--seq", String(sequence)];
+      if (!clear && remaining !== undefined) args.push("--ttl-ms", String(Math.max(1, Math.min(SIDEBAR_TTL_MAX_MS, Math.floor(remaining)))));
+      return run(args);
+    }));
+  } catch (err) {
+    if (isOn(cfg("DEBUG"))) console.error(`herdr-telegram-notify: sidebar token report failed: ${redact(err.message, cfg("TELEGRAM_BOT_TOKEN"))}`);
+  }
+}
+
 // ------------------------------------------------ formatting the message
 
 const STATUS_EMOJI = { done: "✅", blocked: "⚠️", working: "⏳", idle: "💤" };
@@ -567,8 +621,12 @@ export function promptText(raw) {
   // A slash command arrives as a wrapper around its name; the name is the ask.
   const command = /<command-name>([^<]+)<\/command-name>/.exec(text);
   if (command) return command[1].trim();
+  // A background task finishing starts a turn of its own, written as a user
+  // record; its summary says what woke the agent, the XML around it nothing.
+  const task = /<task-notification>[\s\S]*?<summary>([^<]+)<\/summary>/.exec(text);
+  if (task) return `↻ ${task[1].trim()}`;
   return text
-    .replace(/<(system-reminder|local-command-[a-z]+|command-[a-z]+)>[\s\S]*?<\/\1>/g, "")
+    .replace(/<(system-reminder|task-notification|local-command-[a-z]+|command-[a-z]+)>[\s\S]*?<\/\1>/g, "")
     .trim();
 }
 
@@ -592,11 +650,28 @@ export function clip(text, max) {
   return s.length <= max ? s : `${s.slice(0, max - 1)}…`;
 }
 
+// Use the plugins' display strings, not their names. Keep list order and avoid
+// repeats when an exact name and a wildcard select the same token.
+export function agentTokensLine(tokens, selectors) {
+  const keys = Object.keys(tokens ?? {}).filter((name) => name !== "telegram").sort();
+  const selected = new Set();
+  for (const pattern of String(selectors ?? "").split(",").map((s) => s.trim()).filter(Boolean)) {
+    for (const name of keys) {
+      if (pattern.endsWith("*") ? name.startsWith(pattern.slice(0, -1)) : name === pattern) selected.add(name);
+    }
+  }
+  const values = [...selected].map((name) => tokens[name])
+    .filter((value) => typeof value === "string" && value.trim()).map((value) => value.trim());
+  // Mask complete values before flattening or clipping, so a long credential
+  // or a multiline private key cannot turn into an unrecognizable fragment.
+  return values.length ? clip(`📊 ${maskSecrets(values.join(" · ")).replace(/\s+/g, " ")}`, 200) : undefined;
+}
+
 export function buildMessage(parts) {
   // Mask source fields before clipping or escaping, including messages queued
   // before masking was enabled and titles shared by notifications and reminders.
   parts = Object.fromEntries(Object.entries(parts).map(([key, value]) => [key, typeof value === "string" ? maskSecrets(value) : value]));
-  const { emoji, agent, statusLabel, title, prompt, project, changes, tools, meta, pane, herd, bodyIsScreen, late } = parts;
+  const { emoji, agent, statusLabel, title, prompt, project, changes, tools, meta, agentTokens, pane, herd, bodyIsScreen, late } = parts;
 
   const render = (body) => {
     const plain = [];
@@ -613,7 +688,7 @@ export function buildMessage(parts) {
       plain.push(shown);
       html.push(`<i>${escapeHtml(shown)}</i>`);
     }
-    for (const line of [prompt, project, changes, tools, meta, pane, herd ? `🐑 ${herd}` : undefined].filter(Boolean)) {
+    for (const line of [prompt, project, changes, tools, meta, agentTokens, pane, herd ? `🐑 ${herd}` : undefined].filter(Boolean)) {
       const shown = clip(line, HEAD_LINE_CHARS);
       plain.push(shown);
       html.push(escapeHtml(shown));
@@ -1389,7 +1464,7 @@ export const COMMANDS = [
   { command: "stop", description: "Send Esc to the agent (reply to a notification)" },
   { command: "screen", description: "Show the current screen (reply to a notification)" },
   { command: "diff", description: "Download uncommitted changes (reply to a notification)" },
-  { command: "new", description: "Start an agent: /new <workspace> <kind> [prompt]" },
+  { command: "new", description: "Start an agent: /new <workspace>[@<branch>] <kind> [prompt]" },
 ];
 
 export function botCommand(text, botUsername) {

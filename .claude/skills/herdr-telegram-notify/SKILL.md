@@ -21,9 +21,9 @@ message — write it straight to the `.env`, which must stay `chmod 600`.
 
 Telegram bot chats are not end-to-end encrypted. `MASK_SECRETS=1` is on by
 default and masks recognizable secrets in agent messages, prompts, titles,
-screens, button labels and `/full`, `/screen` or `/diff` output. It is best-effort
-pattern matching, not a guarantee; unknown or partly visible secrets can still
-be sent.
+screens, button labels, selected agent metadata and `/full`, `/screen` or
+`/diff` output. It is best-effort pattern matching, not a guarantee; unknown or
+partly visible secrets can still be sent.
 Secret-named assignment values shorter than 8 characters are left alone. If a
 false positive gets in the way, `MASK_SECRETS=0` allows unmasked text through;
 it cannot restore text already masked. Do not present it as making a sensitive
@@ -36,6 +36,16 @@ session. Its rollout must end in that id under `CODEX_HOME/sessions/YYYY/MM/DD/`
 is inherited from Herdr's environment, not configured in the plugin's `.env`.
 Injected AGENTS.md user-role records are not prompts. Codex reports no cost,
 so the plugin leaves it out rather than estimating one.
+
+`SHOW_AGENT_TOKENS` is separate from transcript usage: it selects other
+plugins' display strings from the snapshot agent's `tokens`, such as
+`SHOW_AGENT_TOKENS=model,context,quota_5h_*`. Empty is off. Names are
+case-sensitive; list order is display order, trailing `*` prefix matches sort
+by name, and `*` alone selects all. Overlapping matches appear once; empty
+values and `telegram` are always skipped. The masked, 200-character 📊 line
+follows ⏱ when present. Queued messages keep it, and blocked reminders use
+current snapshot values. No reporting plugin or no matching tokens means no
+line, not an error.
 
 ## Where the config is
 
@@ -112,14 +122,25 @@ tab without changing desktop focus. It needs no notification reply; a reply
 target is ignored. Only an existing workspace id or complete case-insensitive
 label is accepted, and notification workspace filters still apply. Use ids for
 labels with spaces or shared labels. Usage errors list the known workspaces.
+`/new storefront@fix-login claude Review notes.md.` instead creates a Git
+worktree workspace labelled with the branch and grouped with the parent. The
+selector splits at its last `@`. Branches must be 1–100 characters from
+`[A-Za-z0-9._/-]`, not start with `-` or `.`, contain `..` or `//`, or end with
+`/`, `.` or `.lock`. Invalid branches make no Herdr calls. Both parent and branch
+label must pass the notification filters before creation; add the branch to an
+allowlist, remove it from an ignore list, or start without `@branch`. Herdr checks
+out an existing local branch or creates it from `HEAD`, without a repository
+ownership bypass, custom path or base. Creation and startup each get 60 seconds.
 Kinds must match `[a-z][a-z0-9_-]{0,31}`; Herdr decides which are supported.
 The agent gets a generated unique name, with no native options after `--`.
 The optional prompt keeps its newlines and is capped at 4,000 characters.
-A failed start closes only its new tab. A failed prompt is reported without
-closing the running agent. Reply to the confirmation with text, `/stop`,
-`/screen` or `/diff` when its session is known; otherwise the confirmation says
-replies will work from the first notification. The same chat, sender allowlist
-and forum-topic routing apply.
+A failed plain-tab start closes only its new tab. A failed worktree start leaves
+the checkout and workspace intact, reporting the workspace id, branch and
+`herdr worktree remove --workspace <id>` for manual removal. A failed prompt is
+reported without closing the running agent. Reply to the confirmation with
+text, `/stop`, `/screen` or `/diff` when its session is known; otherwise the
+confirmation says replies will work from the first notification. The same
+chat, sender allowlist and forum-topic routing apply.
 
 Reply to a notification with `/stop` and no arguments to send Esc to that same
 agent session while it is working or blocked. It interrupts work or dismisses
@@ -148,6 +169,22 @@ Once the poller starts, the commands appear in Telegram's `/` menu without
 registering them in BotFather. Registration is tried once per start; a failure
 is logged in `replies.log` without stopping replies, and the next start tries
 again.
+
+## Sidebar tokens
+
+`SIDEBAR_TOKENS=1` reports display-only metadata under the plugin's source id.
+It stays invisible until `$telegram` is added to `rows` in `[ui.sidebar.agents]`
+and `[ui.sidebar.spaces]` in the client's Herdr config.toml; the README has the
+complete snippet. Agent-specific row overrides need it added too.
+`📨 HH:MM` means a notification was actually delivered and clears with
+`MARK_RESOLVED`; `📱 HH:MM` means phone input reached the pane and expires after
+30 minutes. The newest pane value replaces the previous one. Mute actions and
+`/mute` set `🔕 until HH:MM` on every current workspace, and unmute clears it.
+New workspaces during a mute do not get a badge automatically. TTL follows the
+remaining mute time up to Herdr's 24-hour maximum; a longer mute continues after
+its badge expires. Sequenced asynchronous reports have a one-second timeout,
+failures only log with `DEBUG=1`, and `DRY_RUN` never reports. Setting
+`SIDEBAR_TOKENS=0` stops reports without clearing values already there.
 
 ## When a reply does not arrive
 

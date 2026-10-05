@@ -14,6 +14,7 @@ import {
   DEFAULTS,
   HEAD_LINE_CHARS,
   TELEGRAM_LIMIT,
+  agentTokensLine,
   buildMessage,
   configProblems,
   clip,
@@ -181,6 +182,18 @@ test("MASK_SECRETS accepts boolean values and reports a typo to doctor", () => {
   assert.match(problems[0].detail, /secret masking is off/);
 });
 
+test("SHOW_AGENT_TOKENS defaults off and accepts token names with trailing wildcards", () => {
+  assert.equal(DEFAULTS.SHOW_AGENT_TOKENS, "");
+  for (const value of ["", "model,context,quota_5h_*", " model , * , ", " , "]) {
+    assert.deepEqual(configProblems((key) => key === "SHOW_AGENT_TOKENS" ? value : DEFAULTS[key]), [], value);
+  }
+  for (const value of ["model,quota_*warning", "context.percent", "model name", "x".repeat(33), "**"]) {
+    const problems = configProblems((key) => key === "SHOW_AGENT_TOKENS" ? value : DEFAULTS[key]);
+    assert.deepEqual(problems.map((p) => p.key), ["SHOW_AGENT_TOKENS"], value);
+    assert.match(problems[0].detail, /it matches nothing, and the other selectors still apply/);
+  }
+});
+
 test("isOn, toInt and firstDefined treat empty as unset", () => {
   assert.equal(isOn("1"), true);
   assert.equal(isOn("TRUE"), true);
@@ -265,6 +278,11 @@ test("promptText keeps what a person typed and drops what was wrapped round it",
   assert.equal(promptText("<command-name>/code-review</command-name>\n<command-args>high</command-args>"), "/code-review");
   assert.equal(promptText("<system-reminder>injected</system-reminder>\nfuttasd le"), "futtasd le");
   assert.equal(promptText("a plain question"), "a plain question");
+  assert.equal(
+    promptText("<task-notification>\n<task-id>t1</task-id>\n<status>completed</status>\n<summary>Background build finished</summary>\n</task-notification>"),
+    "↻ Background build finished"
+  );
+  assert.equal(promptText("<task-notification><task-id>t2</task-id></task-notification>\nand check it"), "and check it");
 });
 
 test("readTurn measures from the last thing a person typed", () => {
@@ -537,6 +555,44 @@ test("toolSummary ranks the busiest four and counts the rest", () => {
 // ---------------------------------------------------------------- message
 
 const head = { emoji: "✅", agent: "claude", statusLabel: "done" };
+
+test("agent tokens show exact names and sorted prefix matches in list order, without telegram or repeats", () => {
+  const tokens = {
+    quota_5h_warning: "5h 25% 59m", telegram: "📱 09:12", model: "Model Cedar",
+    context: "context 13%", quota_5h_remaining: "5h remaining 25%", quota_weekly: "weekly 60%",
+    empty: " \n ", invalid: null,
+  };
+  assert.equal(agentTokensLine(tokens, "model,context,quota_5h_warning"), "📊 Model Cedar · context 13% · 5h 25% 59m");
+  assert.equal(agentTokensLine(tokens, " context ,quota_5h_*, model,quota_5h_warning,model,telegram"),
+    "📊 context 13% · 5h remaining 25% · 5h 25% 59m · Model Cedar");
+  assert.equal(agentTokensLine(tokens, ""), undefined);
+  assert.equal(agentTokensLine(undefined, "model,*"), undefined);
+  assert.equal(agentTokensLine(tokens, "missing,MODEL,empty,invalid,telegram,tele*"), undefined);
+  assert.equal(agentTokensLine({ telegram: "📨 09:12" }, "telegram,tele*,*"), undefined);
+  assert.deepEqual(buildMessage({ ...head, agentTokens: agentTokensLine(tokens, "") }), buildMessage(head));
+});
+
+test("agent token values are masked before clipping, flattened and escaped as one short line", () => {
+  const saved = process.env.MASK_SECRETS;
+  process.env.MASK_SECRETS = "1";
+  try {
+    const secret = `ghp_${"x".repeat(36)}`;
+    const line = agentTokensLine({ model: `Model <Cedar>\n${secret} ${"x".repeat(300)}` }, "model");
+    assert.equal(line.length, 200);
+    assert.ok(line.endsWith("…"));
+    assert.ok(!line.includes(secret));
+    assert.ok(!line.includes("\n"));
+    assert.match(line, /ghp_…\[masked\]/);
+    const message = buildMessage({ ...head, meta: "⏱ ran 4m", agentTokens: line, pane: "🖥 example pane" });
+    assert.match(message.html, /Model &lt;Cedar&gt;/);
+    assert.deepEqual(message.plain.split("\n").slice(1), ["⏱ ran 4m", line, "🖥 example pane"]);
+    const pem = "-----BEGIN PRIVATE KEY-----\n" + "x".repeat(48) + "\n-----END PRIVATE KEY-----";
+    assert.equal(agentTokensLine({ model: pem }, "model"), "📊 PRIVATE KEY …[masked]");
+  } finally {
+    if (saved === undefined) delete process.env.MASK_SECRETS;
+    else process.env.MASK_SECRETS = saved;
+  }
+});
 
 test("buildMessage puts the lines in order and escapes the head", () => {
   const { html, plain } = buildMessage({

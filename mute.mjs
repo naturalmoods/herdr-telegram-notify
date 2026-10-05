@@ -7,7 +7,7 @@
 
 import { spawnSync } from "node:child_process";
 
-import { MUTE_DEFAULT_MINUTES, clockTime, herdrBin, loadConfig, mutedUntil, setMute, toInt } from "./lib.mjs";
+import { MUTE_DEFAULT_MINUTES, clockTime, herdrBin, loadConfig, mutedUntil, reportSidebarToken, setMute, toInt } from "./lib.mjs";
 
 // An action fired from the UI needs its answer in the UI, not in a log file.
 function announce(title, body) {
@@ -26,6 +26,7 @@ if (!stateDir) {
 } else if (mutedUntil(stateDir)) {
   try {
     setMute(stateDir, 0);
+    void reportSidebarToken("workspace", undefined, undefined, { cfg: config });
     announce("🔔 Telegram notify on", "messages are going out again");
   } catch (err) {
     announce("Telegram notify", `could not be unmuted: ${err.message}`);
@@ -35,6 +36,7 @@ if (!stateDir) {
   const ends = Date.now() + toInt(config("MUTE_MINUTES"), MUTE_DEFAULT_MINUTES) * 60 * 1000;
   try {
     setMute(stateDir, ends);
+    void reportSidebarToken("workspace", undefined, `🔕 until ${clockTime(new Date(ends))}`, { expiresAt: ends, cfg: config });
     announce("🔕 Telegram notify muted", `until ${clockTime(new Date(ends))} — run the action again to lift it`);
   } catch (err) {
     announce("Telegram notify", `could not be muted: ${err.message}`);
