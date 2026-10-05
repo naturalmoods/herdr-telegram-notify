@@ -18,6 +18,7 @@ import {
   HEAD_LINE_CHARS,
   MUTE_MAX_MINUTES,
   QUESTION_UNKNOWN,
+  SIDEBAR_PHONE_TTL_MS,
   TELEGRAM_API,
   TELEGRAM_LIMIT,
   attachmentAllowed,
@@ -40,6 +41,7 @@ import {
   readMessageMap,
   redact,
   rememberMessage,
+  reportSidebarToken,
   replyCommands,
   sanitizeKey,
   screenTail,
@@ -324,13 +326,23 @@ function liveAgent(paneId) {
 
 // The only text read as an instruction is a fixed list in lib.mjs, past the
 // same chat and sender checks as everything else. Existing agents need a
-// recorded session; /new can only create one in an existing, unfiltered workspace.
+// recorded session; /new needs an existing, unfiltered parent workspace.
 async function startAgent(args, reply, originalText) {
+  const [selector, kind] = args;
+  const at = selector?.lastIndexOf("@") ?? -1;
+  const workspaceArg = at < 0 ? selector : selector.slice(0, at);
+  const branch = at < 0 ? undefined : selector.slice(at + 1);
+  const usageText = "Usage: /new <workspace> <kind> [prompt]\nOr: /new <workspace>@<branch> <kind> [prompt]";
+  // A branch is chat input, not a known workspace id; reject it before even
+  // reading Herdr so no invalid selector can reach the worktree command.
+  if (branch !== undefined && (!/^(?![-.])[A-Za-z0-9._/-]{1,100}$/.test(branch)
+    || branch.includes("..") || branch.includes("//") || /(?:\/|\.|\.lock)$/.test(branch))) {
+    return say(`Invalid branch: use 1–100 letters, digits, ., _, / or -, not starting with - or .; no .. or //; do not end with /, . or .lock.\n${usageText}`, reply);
+  }
   const snapshot = loadSnapshot();
   const workspaces = snapshot?.workspaces ?? [];
   const known = clip(maskSecrets(workspaces.map((w) => w.label ? `${w.label} (${w.workspace_id})` : w.workspace_id).join(", ") || "(none available)"), 3000);
-  const usage = (reason = "") => say(`${reason ? `${reason}\n` : ""}Usage: /new <workspace> <kind> [prompt]\nKnown workspaces: ${known}`, reply);
-  const [workspaceArg, kind] = args;
+  const usage = (reason = "") => say(`${reason ? `${reason}\n` : ""}${usageText}\nKnown workspaces: ${known}`, reply);
   if (!workspaceArg || !kind) return usage();
   const byId = workspaces.find((w) => w.workspace_id === workspaceArg);
   const matches = byId ? [byId] : workspaces.filter((w) => String(w.label ?? "").toLowerCase() === workspaceArg.toLowerCase());
@@ -346,6 +358,16 @@ async function startAgent(args, reply, originalText) {
     return say(`✗ ${label} is filtered out by ${allowed === false ? "NOTIFY_WORKSPACES" : "IGNORE_WORKSPACES"}; you would not hear back from that agent.`, reply);
   }
 
+  if (branch !== undefined) {
+    const branchAllowed = listMatches(cfg("NOTIFY_WORKSPACES"), branch);
+    const branchIgnored = listMatches(cfg("IGNORE_WORKSPACES"), branch);
+    if (branchAllowed === false || branchIgnored === true) {
+      const advice = branchAllowed === false ? `Add ${branch} to NOTIFY_WORKSPACES` : `Remove ${branch} from IGNORE_WORKSPACES`;
+      return say(maskSecrets(`✗ ${branch} is filtered out by ${branchAllowed === false ? "NOTIFY_WORKSPACES" : "IGNORE_WORKSPACES"}; you would not hear back from that worktree.\n${advice}, or start without @branch.`), reply);
+    }
+  }
+  const destination = branch === undefined ? label : `${label}@${maskSecrets(branch)}`;
+
   // Only the two selectors are split into words. The prompt stays one argv
   // value, including its newlines, and never becomes native agent options.
   const prompt = String(originalText ?? reply.text).replace(/^\s*\S+\s+\S+\s+\S+(?:\s|$)/, "").slice(0, MAX_TEXT);
@@ -354,18 +376,26 @@ async function startAgent(args, reply, originalText) {
   do {
     name = `${kind.slice(0, 27)}-${randomInt(36 ** 4).toString(36).padStart(4, "0")}`;
   } while (names.has(name));
-  const created = herdrRun(["tab", "create", "--workspace", workspace.workspace_id, "--label", kind, "--no-focus"]);
-  if (!created.ok) return say(maskSecrets(`✗ ${label}: ${created.why}`), reply);
+  const created = branch === undefined
+    ? herdrRun(["tab", "create", "--workspace", workspace.workspace_id, "--label", kind, "--no-focus"])
+    : herdrRun(["worktree", "create", "--workspace", workspace.workspace_id, "--branch", branch, "--label", branch, "--no-focus"], 60_000);
+  if (!created.ok) return say(maskSecrets(`✗ ${destination}: ${created.why}`), reply);
   let result;
   try {
     result = JSON.parse(created.out).result;
   } catch {}
   const tabId = typeof result?.tab?.tab_id === "string" ? result.tab.tab_id : undefined;
   const paneId = typeof result?.root_pane?.pane_id === "string" ? result.root_pane.pane_id : undefined;
-  const started = tabId && paneId
+  const workspaceId = typeof result?.workspace?.workspace_id === "string" ? result.workspace.workspace_id : undefined;
+  const started = tabId && paneId && (branch === undefined || workspaceId)
     ? herdrRun(["agent", "start", name, "--kind", kind, "--pane", paneId], 60_000)
-    : { ok: false, why: "Herdr did not return the new tab and pane ids." };
+    : { ok: false, why: `Herdr did not return the new ${branch === undefined ? "tab and pane" : "workspace, tab and pane"} ids.` };
   if (!started.ok) {
+    // Closing a worktree workspace would delete a checkout, not just an empty
+    // tab. Leave it for the user even if Herdr returned incomplete ids.
+    if (branch !== undefined) {
+      return say(maskSecrets(`✗ ${destination}: ${started.why}\nLeft workspace ${workspaceId || "(id not reported)"} with branch ${branch} in place.\nRemove it with: herdr worktree remove --workspace ${workspaceId || "<id>"}`), reply);
+    }
     // This tab belongs to this command alone; a failed start must not leave
     // an empty tab behind, or close anything that existed before it.
     const closed = tabId ? herdrRun(["tab", "close", tabId]) : undefined;
@@ -373,8 +403,9 @@ async function startAgent(args, reply, originalText) {
   }
 
   const prompted = prompt.trim() ? herdrRun(["agent", "prompt", paneId, prompt]) : undefined;
+  if (prompted?.ok) void reportSidebarToken("pane", paneId, `📱 ${clockTime(new Date())}`, { ttlMs: SIDEBAR_PHONE_TTL_MS, cfg });
   const live = liveAgent(paneId);
-  const text = maskSecrets(`▶ started ${kind} in ${label} · ${paneId}${prompted && !prompted.ok ? `\n✗ prompt not delivered: ${prompted.why}` : ""}${!live?.session ? "\nReplies will work from its first notification." : ""}`);
+  const text = maskSecrets(`▶ started ${kind} in ${destination} · ${paneId}${prompted && !prompted.ok ? `\n✗ prompt not delivered: ${prompted.why}` : ""}${!live?.session ? "\nReplies will work from its first notification." : ""}`);
   const sent = await say(text, reply);
   if (sent?.ok && live?.session) rememberMessage(stateDir, sent.result?.message_id, paneId, live.agentSession);
 }
@@ -417,6 +448,7 @@ async function runCommand({ command, args }, reply, originalText) {
   if (command === "/unmute") {
     try {
       setMute(stateDir, 0);
+      void reportSidebarToken("workspace", undefined, undefined, { cfg });
     } catch (err) {
       console.error(`herdr-telegram-notify: could not unmute: ${err.message}`);
       return say(`✗ could not unmute: ${err.message}`, reply);
@@ -457,6 +489,7 @@ async function runCommand({ command, args }, reply, originalText) {
   const until = Date.now() + minutes * 60 * 1000;
   try {
     setMute(stateDir, until);
+    void reportSidebarToken("workspace", undefined, `🔕 until ${clockTime(new Date(until))}`, { expiresAt: until, cfg });
   } catch (err) {
     console.error(`herdr-telegram-notify: could not mute: ${err.message}`);
     return say(`✗ could not mute: ${err.message}`, reply);
@@ -548,6 +581,7 @@ async function deliver(reply, { stop = false, screen = false, diff = false } = {
       console.error(`herdr-telegram-notify: ${args.join(" ")} failed: ${res.why}`);
       return say(`✗ ${paneId}: ${res.why}`, reply);
     }
+    void reportSidebarToken("pane", paneId, `📱 ${clockTime(new Date())}`, { ttlMs: SIDEBAR_PHONE_TTL_MS, cfg });
     console.log(`herdr-telegram-notify: sent Esc to ${paneId}`);
     return say(`⏹ sent Esc to ${paneId}`, reply);
   }
@@ -657,6 +691,7 @@ async function deliver(reply, { stop = false, screen = false, diff = false } = {
       return;
     }
   }
+  void reportSidebarToken("pane", paneId, `📱 ${clockTime(new Date())}`, { ttlMs: SIDEBAR_PHONE_TTL_MS, cfg });
   console.log(`herdr-telegram-notify: delivered a reply to ${paneId} (${status ?? "status unknown"})`);
   // What was understood, so a mishearing is caught on the phone rather than
   // after the agent has acted on it.

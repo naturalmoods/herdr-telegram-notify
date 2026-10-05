@@ -20,7 +20,7 @@ needs input (`blocked`), and lets you answer that agent from the chat.
 - [**Commands**](#commands): `/status` for the herd, `/mute` and `/unmute`,
   `/full` for a response too long for one message, `/stop` to interrupt an
   agent, `/screen` for its current view, `/diff` for its uncommitted changes,
-  and `/new` to start an agent in a new tab.
+  and `/new` to start an agent in a new tab or its own Git worktree.
 - [**Notifications that update themselves**](#keeping-the-chat-current): a
   question answered at the keyboard becomes `✓ answered`, a finished turn you
   looked at becomes `👀 seen at the desk`.
@@ -288,6 +288,7 @@ poller start tries again.
 | `/screen` | Reply to a notification to read that agent's current screen. |
 | `/diff` | Reply to a notification to download its current uncommitted changes as a `.diff` file. |
 | `/new <workspace> <kind> [prompt]` | Start a real agent in a new background tab, optionally giving it a prompt. |
+| `/new <workspace>@<branch> <kind> [prompt]` | Start it in a new Git worktree workspace labelled with the branch. |
 
 Only `/mute` and `/new` accept arguments. Extra arguments on the other commands
 produce a usage message without changing anything. In groups, you can address your bot
@@ -316,10 +317,28 @@ labels containing spaces or shared by multiple workspaces. Usage errors list
 the known labels and ids. Workspaces excluded by `NOTIFY_WORKSPACES` or
 `IGNORE_WORKSPACES` are refused, since their notifications would never reach you.
 
+`/new storefront@fix-login claude Review notes.md.` gives the agent its own
+Git checkout instead of sharing the parent workspace's checkout. Herdr opens
+it as a workspace labelled `fix-login`, grouped with `storefront`, without
+moving focus. An existing local branch is checked out; otherwise Herdr creates
+it from `HEAD`. The selector splits at the last `@`.
+
+Branch names must be 1–100 characters from `[A-Za-z0-9._/-]`, not start with
+`-` or `.`, contain `..` or `//`, or end with `/`, `.` or `.lock`. Git and Herdr
+validate the rest, including repository ownership; no trust bypass, path or
+base option is passed. Both the parent workspace and the new branch label must
+pass `NOTIFY_WORKSPACES` and `IGNORE_WORKSPACES` before anything is created.
+An allowlist containing only the parent id therefore needs the branch label
+added too. Start without `@branch` to keep using the existing checkout.
+
 The kind must be 1–32 lowercase letters, digits, `_` or `-`, starting with a
-letter. Herdr decides which kinds are supported. The tab is labelled with the
-kind, and the agent gets a generated unique name. Startup waits for readiness;
-a failed start closes only the tab this command created and reports the reason.
+letter. Herdr decides which kinds are supported. Without `@branch`, the tab
+is labelled with the kind. The agent gets a generated unique name in either
+case. Worktree creation and agent startup each have a 60-second command timeout.
+A failed plain-tab start closes only the tab this command created. A failed
+worktree start leaves its checkout and workspace intact and reports the
+workspace id, branch and `herdr worktree remove --workspace <id>` for manual
+removal; it never closes or removes the worktree for you.
 
 The optional prompt keeps its newlines and is capped at 4,000 characters, like
 reply text. It is passed as one text argument, without a shell, `--wait` or
@@ -408,6 +427,45 @@ pin; without them the board still updates, unpinned. Closed panes disappear
 without needing the sweeper. `SWEEP_MINUTES` can also refresh the board on a
 timer. Off by default.
 
+## Sidebar tokens
+
+`SIDEBAR_TOKENS=1` (the default) reports display-only `telegram` metadata under
+`naturalmoods.herdr-telegram-notify`. Nothing appears until you add `$telegram`
+to the rows in your client's `~/.config/herdr/config.toml`:
+
+```toml
+[ui.sidebar.agents]
+rows = [
+  ["state_icon", "machine", "workspace", "tab"],
+  ["agent", "$telegram"],
+]
+
+[ui.sidebar.spaces]
+rows = [
+  ["state_icon", "workspace", "$telegram"],
+  ["branch", "git_status"],
+]
+```
+
+- `📨 HH:MM`: a notification was actually sent for that pane, including a queue
+  delivery or reminder. Resolution clears it when `MARK_RESOLVED=1`.
+- `📱 HH:MM`: phone input reached the pane, including replies, buttons, files,
+  voice, `/stop` and a `/new` prompt. It expires after 30 minutes.
+- `🔕 until HH:MM`: notifications are muted. The action and `/mute` report this
+  on every workspace in the snapshot; `/unmute` or the action clears it.
+
+The latest pane update replaces the previous value. Reports use sequence
+numbers to reject stale arrivals, run asynchronously with a one-second timeout,
+and never fail delivery; only `DEBUG=1` logs failures. `DRY_RUN=1` never reports.
+`SIDEBAR_TOKENS=0` stops reports without clearing older values; remove the token
+from your rows to hide those. These rows affect the expanded desktop sidebar
+only; agent-specific row overrides need `$telegram` added separately.
+
+A workspace created during a mute does not get its badge automatically.
+Mute badges use the remaining mute time as their TTL, capped at Herdr's
+24-hour limit. Longer mutes remain in force, but their badge expires after
+24 hours unless another mute command refreshes it.
+
 ## Muting it
 
 From Telegram, use `/mute` for the configured duration or `/mute 30` for thirty
@@ -467,10 +525,26 @@ Each optional part has a setting:
 | Tools (off by default) | Four most-used Claude `tool_use`, pi `toolCall` or Codex function/custom-tool calls | `SHOW_TOOLS` |
 | Tokens and cost | Claude/pi assistant `usage`, or Codex `token_count` records (no cost) | `SHOW_TOKENS` |
 | Clock time (off by default) | Time of the status change | `SHOW_TIMESTAMP` |
+| Agent metadata (off by default) | Other plugins' display values in the snapshot agent's `tokens` | `SHOW_AGENT_TOKENS` |
 | Host, pane and focus command | Session snapshot | `SHOW_PANE`, `SHOW_HOST` |
 | Other agents' status | Session snapshot | `SHOW_HERD` |
 | Last message | Claude transcript, pi session file or Codex rollout's last agent message | `SHOW_LAST_MESSAGE`, `LAST_MESSAGE_CHARS` |
 | Screen tail (blocked only) | `herdr pane read`, cropped to one column | `SHOW_SCREEN_ON_BLOCKED`, `SCREEN_LINES` |
+
+`SHOW_AGENT_TOKENS=model,context,quota_5h_*` adds a line after the ⏱ line
+when those tokens exist, for example:
+
+```text
+📊 Model Cedar · context 13% · 5h 25% 59m
+```
+
+Names are case-sensitive. List order is display order; a trailing `*` selects
+names with that prefix, sorted by name (`*` alone selects all). Overlapping
+matches appear once, empty values are skipped, and the plugin's own `telegram`
+token is never included. The line is masked and clipped to 200 characters.
+Empty `SHOW_AGENT_TOKENS` leaves messages unchanged. Queued messages keep the
+captured values; blocked reminders read current values from their snapshot.
+This is separate from `SHOW_TOKENS`, which reports transcript usage and cost.
 
 Claude session ids resolve under `~/.claude/projects/<project>/` (or
 `CLAUDE_CONFIG_DIR/projects`); pi supplies its session-file path. A session

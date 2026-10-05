@@ -104,6 +104,12 @@ for (const { key, detail } of configProblems(cfg)) {
 if (!broken.has("MASK_SECRETS")) {
   ok("MASK_SECRETS", isOn(cfg("MASK_SECRETS")) ? "on — best-effort secret masking before sending" : "off — agent text may contain secrets");
 }
+if (!broken.has("SIDEBAR_TOKENS")) {
+  ok("SIDEBAR_TOKENS", isOn(cfg("SIDEBAR_TOKENS")) ? "on — display-only $telegram sidebar tokens" : "off — no sidebar metadata is reported");
+}
+if (!broken.has("SHOW_AGENT_TOKENS")) {
+  ok("SHOW_AGENT_TOKENS", cfg("SHOW_AGENT_TOKENS") ? `${cfg("SHOW_AGENT_TOKENS")} — agent metadata values, excluding telegram` : "off — no agent metadata line");
+}
 if (!broken.has("NOTIFY_STATUSES")) ok("statuses", `notifying on ${cfg("NOTIFY_STATUSES")}`);
 for (const [key, what] of [
   ["NOTIFY_WORKSPACES", "only these workspaces send"],

@@ -68,6 +68,8 @@ test("a valid config is not reported as a config problem", () => {
   const { status, out } = runDoctor({
     NOTIFY_STATUSES: "done,blocked,working",
     MASK_SECRETS: "yes",
+    SIDEBAR_TOKENS: "yes",
+    SHOW_AGENT_TOKENS: "model,context,quota_5h_*",
     QUIET_HOURS: "23:00-07:00",
     MIN_DURATION_SECONDS: "0",
     BLOCKED_DELAY_SECONDS: "15",
@@ -81,6 +83,8 @@ test("a valid config is not reported as a config problem", () => {
   assert.equal(out.includes(TOKEN), false);
   assert.match(out, /✓ statuses: notifying on done,blocked,working/);
   assert.match(out, /✓ MASK_SECRETS: on — best-effort secret masking/);
+  assert.match(out, /✓ SIDEBAR_TOKENS: on — display-only \$telegram sidebar tokens/);
+  assert.match(out, /✓ SHOW_AGENT_TOKENS: model,context,quota_5h_\* — agent metadata values, excluding telegram/);
   assert.match(out, /✓ QUIET_HOURS: 23:00-07:00/);
   assert.match(out, /✓ BLOCKED_DELAY_SECONDS: 15/);
   assert.match(out, /✓ TELEGRAM_TOPICS: storefront:12,wB:15/);
@@ -96,6 +100,8 @@ test("every mistyped value is named, and nothing about it is reported OK", () =>
   const { status, out } = runDoctor({
     NOTIFY_STATUSES: "done,blocke",
     MASK_SECRETS: "sometimes",
+    SIDEBAR_TOKENS: "sometimes",
+    SHOW_AGENT_TOKENS: "model,quota_*warning",
     QUIET_HOURS: "23:00 to 07:00",
     MIN_DURATION_SECONDS: "-5",
     BLOCKED_DELAY_SECONDS: "1s",
@@ -114,6 +120,8 @@ test("every mistyped value is named, and nothing about it is reported OK", () =>
   for (const key of [
     "NOTIFY_STATUSES",
     "MASK_SECRETS",
+    "SIDEBAR_TOKENS",
+    "SHOW_AGENT_TOKENS",
     "QUIET_HOURS",
     "MIN_DURATION_SECONDS",
     "BLOCKED_DELAY_SECONDS",
@@ -156,6 +164,7 @@ test("blocked delays accept zero through 120 and report invalid or capped values
 test("a NOTIFY_STATUSES naming nothing is a problem, not silence", () => {
   const { out } = runDoctor({ NOTIFY_STATUSES: " , " });
   assert.match(out, /✗ NOTIFY_STATUSES: names no status/);
+  assert.match(out, /✓ SHOW_AGENT_TOKENS: off — no agent metadata line/);
   assert.equal(out.includes("✓ statuses"), false);
 });
 

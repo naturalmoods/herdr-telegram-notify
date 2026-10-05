@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+What Herdr 0.9 offers that the plugin was not using yet.
+
+- `/new <workspace>@<branch> <kind> [prompt]` starts the agent in its own Git
+  worktree on that branch, so work started from the phone does not share a
+  checkout with other agents. The new workspace is checked against the
+  workspace filters before anything is created, and a failed start leaves the
+  checkout in place with instructions to remove it.
+- `$telegram` sidebar tokens show at the desk what the phone knows: `📨 14:32`
+  on a pane with a notification still waiting, `📱 14:32` on one that just got
+  input from the phone, and `🔕 until 15:00` on every workspace while muted,
+  expiring with the mute. Add `$telegram` to your sidebar rows to see them; on
+  by default, `SIDEBAR_TOKENS=0` turns the reporting off.
+- `SHOW_AGENT_TOKENS` adds other plugins' metadata to the notification, such as
+  a quota plugin's model, context use and remaining quota:
+  `📊 Model X · context 37% · 5h 60%`. Off by default.
+- A turn started by a finished background task shows that task's summary on
+  the `▸` line instead of the raw `<task-notification>` markup.
+
 ## 0.11.0
 
 More you can do from the phone, and less of it ringing for nothing.

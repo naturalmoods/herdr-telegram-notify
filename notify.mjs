@@ -18,6 +18,7 @@ import {
   PENDING_MAX,
   PENDING_TTL,
   QUESTION_UNKNOWN,
+  agentTokensLine,
   blockedEpisode,
   buildMessage,
   clip,
@@ -48,11 +49,13 @@ import {
   readTurn,
   redact,
   rememberMessage,
+  reportSidebarToken,
   resolvedLine,
   retryAfterMs,
   sanitizeKey,
   screenOptions,
   screenTail,
+  sidebarSequence,
   sleep,
   sleepSync,
   statusEmoji,
@@ -126,18 +129,18 @@ function sessionSnapshot() {
   return snapshotCache;
 }
 
-// Workspace label, tab label, cwd and agent session for the pane the event is
-// about — which is not necessarily the focused pane the context describes.
+// Workspace label, tab label, cwd, agent session and tokens for the event pane,
+// which is not necessarily the focused pane the context describes.
 function paneInfo(snapshot, paneId) {
   if (!snapshot || !paneId) return {};
-  const pane =
-    (snapshot.panes ?? []).find((p) => p.pane_id === paneId) ??
-    (snapshot.agents ?? []).find((a) => a.pane_id === paneId);
+  const agent = (snapshot.agents ?? []).find((a) => a.pane_id === paneId);
+  const pane = (snapshot.panes ?? []).find((p) => p.pane_id === paneId) ?? agent;
   if (!pane) return {};
   return {
     cwd: firstDefined(pane.cwd, pane.foreground_cwd),
     title: pane.terminal_title_stripped && maskSecrets(pane.terminal_title_stripped),
     session: pane.agent_session,
+    tokens: agent?.tokens,
     workspaceId: pane.workspace_id,
     workspaceLabel: (snapshot.workspaces ?? []).find((w) => w.workspace_id === pane.workspace_id)?.label,
     tabLabel: (snapshot.tabs ?? []).find((t) => t.tab_id === pane.tab_id)?.label,
@@ -303,6 +306,7 @@ async function remindBlocked(stateDir, cfg, { token, chatId, silent }) {
       title: isOn(cfg("SHOW_TITLE")) ? info.title : undefined,
       project: projectBits.length ? `📁 ${projectBits.join(" · ")}` : undefined,
       meta: `⏱ waiting ${humanDuration(Date.now() - state.updatedAt)}`,
+      agentTokens: agentTokensLine(info.tokens, cfg("SHOW_AGENT_TOKENS")),
       pane: paneBits.length ? `🖥 ${paneBits.join(" · ")}` : undefined,
       body: isOn(cfg("SHOW_SCREEN_ON_BLOCKED")) ? screenTail(paneId, toInt(cfg("SCREEN_LINES"), 12)) : undefined,
       bodyIsScreen: true,
@@ -324,6 +328,9 @@ async function remindBlocked(stateDir, cfg, { token, chatId, silent }) {
         silent,
         topicId: topicFor(cfg, info.workspaceLabel, workspaceId),
         options: parts.options,
+        paneId,
+        cfg,
+        parts,
       });
       rememberMessage(stateDir, messageId, paneId, info.session, question, undefined, parts);
     } catch (err) {
@@ -352,7 +359,7 @@ function menuKeyboard(options) {
     : undefined;
 }
 
-async function sendTelegram(token, chatId, message, { silent, topicId, options } = {}) {
+async function sendTelegram(token, chatId, message, { silent, topicId, options, paneId, cfg, parts } = {}) {
   const keyboard = menuKeyboard(options);
   const post = async (payload) => {
     const res = await telegramCall(
@@ -380,7 +387,13 @@ async function sendTelegram(token, chatId, message, { silent, topicId, options }
     if (result.ok) {
       console.log(`herdr-telegram-notify: sent, response: ${result.body}`);
       try {
-        return JSON.parse(result.body)?.result?.message_id;
+        const messageId = JSON.parse(result.body)?.result?.message_id;
+        if (messageId && paneId && isOn(cfg("SIDEBAR_TOKENS"))) {
+          const seq = sidebarSequence();
+          if (parts) parts.sidebarSeq = seq;
+          void reportSidebarToken("pane", paneId, `📨 ${clockTime(new Date())}`, { seq, cfg });
+        }
+        return messageId;
       } catch {
         return undefined;
       }
@@ -439,13 +452,21 @@ async function editTelegram(token, chatId, messageId, message) {
 // notification in the chat is what is still waiting on you. The old screen
 // goes — it is the question that is no longer being asked — and a finished
 // turn's answer stays.
-async function markResolved(stateDir, token, chatId, paneId, status) {
+async function markResolved(stateDir, token, chatId, paneId, status, cfg) {
   let closed;
   try {
     closed = closeMessages(stateDir, paneId);
   } catch (err) {
     console.error(`herdr-telegram-notify: could not mark ${paneId}'s notifications as overtaken — ${err.message}`);
     return;
+  }
+  // A resolution belongs just after its notification, not after newer phone
+  // activity or another send. Persisting the send sequence lets even a late
+  // status hook clear only that old badge, without erasing the newer one.
+  const sequences = closed.map((entry) => entry.parts.sidebarSeq).filter((seq) => /^\d+$/.test(seq));
+  if (sequences.length) {
+    const latest = sequences.reduce((a, b) => BigInt(a) > BigInt(b) ? a : b);
+    void reportSidebarToken("pane", paneId, undefined, { seq: (BigInt(latest) + 1n).toString(), cfg });
   }
   for (const entry of closed) {
     const { parts } = entry;
@@ -668,7 +689,7 @@ function queuePending(stateDir, parts, topicId, paneId, session, question, full)
 // failure so nothing arrives out of order. Returns false only when a send
 // actually failed — the caller takes that as "still offline" and does not spend
 // another round of attempts proving it.
-async function flushPending(stateDir, token, chatId, silent) {
+async function flushPending(stateDir, token, chatId, silent, cfg) {
   if (!pendingPath(stateDir)) return true;
   const path = pendingPath(stateDir);
   const lock = pendingLock(stateDir);
@@ -692,6 +713,9 @@ async function flushPending(stateDir, token, chatId, silent) {
     if (!waiting.length) return true;
 
     const entry = waiting[0];
+    // Legacy queue ids hash their parts; capture one before sidebar sequencing
+    // adds a field to those parts, or it would never match the entry on disk.
+    const id = entryId(entry);
     // Telegram stamps the message with its arrival time, which by now is a lie.
     const late = `🕘 delayed ${humanDuration(Date.now() - entry.at)}`;
     try {
@@ -699,6 +723,9 @@ async function flushPending(stateDir, token, chatId, silent) {
         silent,
         topicId: entry.topicId,
         options: entry.parts.options,
+        paneId: entry.paneId,
+        cfg,
+        parts: entry.parts,
       });
       rememberMessage(stateDir, messageId, entry.paneId, entry.session, entry.question, entry.full, entry.parts);
     } catch (err) {
@@ -710,7 +737,6 @@ async function flushPending(stateDir, token, chatId, silent) {
     // Re-read rather than write back the list from before the send: another
     // process may have queued something while it was in flight.
     withFileLock(lock, () => {
-      const id = entryId(entry);
       writeLines(
         path,
         readPending(stateDir).filter((e) => entryId(e) !== id)
@@ -742,7 +768,7 @@ async function sweep(stateDir, cfg) {
 
   try {
     const silent = inQuietHours(cfg("QUIET_HOURS"));
-    const online = await flushPending(stateDir, token, chatId, silent);
+    const online = await flushPending(stateDir, token, chatId, silent, cfg);
     // A queue that just failed proves the network is down; the reminders can wait
     // for the next pass rather than spend another round of attempts on it.
     if (online) await remindBlocked(stateDir, cfg, { token, chatId, silent });
@@ -884,7 +910,7 @@ async function main() {
   // precisely the ones that say an earlier message has been dealt with. Not
   // while offline — the entries stay open for the next change to mark.
   if (!dryRun && online && token && chatId && isOn(cfg("MARK_RESOLVED")) && stateDir && data.pane_id) {
-    await markResolved(stateDir, token, chatId, data.pane_id, status);
+    await markResolved(stateDir, token, chatId, data.pane_id, status, cfg);
   }
   if (!dryRun && online && token && chatId && isOn(cfg("BOARD")) && stateDir) {
     await updateBoard(stateDir, cfg, token, chatId);
@@ -944,7 +970,8 @@ async function main() {
     isOn(cfg("SHOW_LAST_MESSAGE")) ||
     isOn(cfg("SHOW_TOKENS")) ||
     isOn(cfg("SHOW_DURATION")) ||
-    isOn(cfg("SHOW_TITLE"));
+    isOn(cfg("SHOW_TITLE")) ||
+    Boolean(cfg("SHOW_AGENT_TOKENS"));
   const snap = wantsSnapshot ? sessionSnapshot() : undefined;
   const info = paneInfo(snap, paneId);
   if (wantsSnapshot && !snap) note("no session snapshot; falling back to what the event itself carries");
@@ -1144,7 +1171,8 @@ async function main() {
   }
 
   const options = bodyIsScreen ? menuOptions(cfg, question, body) : undefined;
-  const parts = { emoji, agent, statusLabel, title, prompt, project, changes, tools, meta, pane, herd, body, bodyIsScreen, options };
+  const agentTokens = agentTokensLine(info.tokens, cfg("SHOW_AGENT_TOKENS"));
+  const parts = { emoji, agent, statusLabel, title, prompt, project, changes, tools, meta, agentTokens, pane, herd, body, bodyIsScreen, options };
   const message = buildMessage(parts);
 
   if (dryRun) {
@@ -1164,7 +1192,7 @@ async function main() {
   }
 
   try {
-    const messageId = await sendTelegram(token, chatId, message, { silent, topicId, options });
+    const messageId = await sendTelegram(token, chatId, message, { silent, topicId, options, paneId, cfg, parts });
     // Which pane this message was about, which agent was in it and what it was
     // waiting on, so a reply to it lands in the right one — and nowhere else once
     // that agent, or its question, is gone.
