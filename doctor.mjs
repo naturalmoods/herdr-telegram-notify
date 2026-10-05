@@ -4,7 +4,7 @@
 // report goes to stdout, which is where `herdr plugin log list` keeps it, with a
 // one-line verdict in a Herdr notification.
 
-import { existsSync, statSync, writeFileSync, unlinkSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync, unlinkSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { hostname } from "node:os";
 import { spawnSync } from "node:child_process";
@@ -28,7 +28,10 @@ import {
   toInt,
 } from "./lib.mjs";
 
+import { hasSidebarToken, herdrConfigPath } from "./sidebar.mjs";
+
 const results = [];
+const warn = (what, detail) => results.push({ ok: true, warning: true, what, detail });
 const ok = (what, detail) => results.push({ ok: true, what, detail });
 const bad = (what, detail) => results.push({ ok: false, what, detail });
 
@@ -106,6 +109,13 @@ if (!broken.has("MASK_SECRETS")) {
 }
 if (!broken.has("SIDEBAR_TOKENS")) {
   ok("SIDEBAR_TOKENS", isOn(cfg("SIDEBAR_TOKENS")) ? "on — display-only $telegram sidebar tokens" : "off — no sidebar metadata is reported");
+}
+if (isOn(cfg("SIDEBAR_TOKENS"))) {
+  const path = herdrConfigPath();
+  let configured = false;
+  try { configured = hasSidebarToken(readFileSync(path, "utf8")); } catch {}
+  if (configured) ok("sidebar", `${path} has $telegram in sidebar rows`);
+  else warn("sidebar", `${path} has no readable $telegram sidebar rows; run herdr plugin action invoke sidebar --plugin naturalmoods.herdr-telegram-notify where the Herdr window runs. A client on another machine needs it in that machine's config.`);
 }
 if (!broken.has("SHOW_AGENT_TOKENS")) {
   ok("SHOW_AGENT_TOKENS", cfg("SHOW_AGENT_TOKENS") ? `${cfg("SHOW_AGENT_TOKENS")} — agent metadata values, excluding telegram` : "off — no agent metadata line");
@@ -213,7 +223,7 @@ if (token && chatId) {
 // ------------------------------------------------------------- the verdict
 
 const problems = results.filter((r) => !r.ok);
-for (const r of results) console.log(`  ${r.ok ? "✓" : "✗"} ${r.what}: ${r.detail}`);
+for (const r of results) console.log(`  ${r.warning ? "⚠" : r.ok ? "✓" : "✗"} ${r.what}: ${r.detail}`);
 const title = problems.length ? `🩺 ${problems.length} problem(s)` : "🩺 Telegram notify is healthy";
 const body = problems.length ? problems.map((p) => p.what).join(", ") : "test message sent";
 console.log(`herdr-telegram-notify: ${title} — ${body}`);

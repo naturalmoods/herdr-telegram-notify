@@ -17,7 +17,7 @@ const scratch = mkdtempSync(join(tmpdir(), "herdr-telegram-notify-doctor-"));
 // chat id beside it nothing is sent either.
 const TOKEN = "123456789:AAFakeTokenForTestsOnly_notReal";
 
-function runDoctor(env, { platform, missingFlock = false } = {}) {
+function runDoctor(env, { platform, missingFlock = false, sidebarConfig } = {}) {
   const dir = mkdtempSync(join(scratch, "cfg-"));
   writeFileSync(
     join(dir, ".env"),
@@ -26,6 +26,7 @@ function runDoctor(env, { platform, missingFlock = false } = {}) {
       .join("\n")
   );
   chmodSync(join(dir, ".env"), 0o600);
+  if (sidebarConfig !== undefined) writeFileSync(join(dir, "config.toml"), sidebarConfig);
   // A missing override falls back to installed Herdr binaries, so use a real
   // fake executable to keep the offline doctor away from the live session.
   const herdr = join(dir, "herdr");
@@ -42,6 +43,7 @@ function runDoctor(env, { platform, missingFlock = false } = {}) {
       HERDR_PLUGIN_CONFIG_DIR: dir,
       HERDR_PLUGIN_STATE_DIR: mkdtempSync(join(scratch, "state-")),
       HERDR_BIN_PATH: herdr,
+      HERDR_CONFIG_PATH: join(dir, "config.toml"),
       ...(missingFlock ? { FLOCK_BIN_PATH: join(dir, "missing-flock") } : {}),
     },
   });
@@ -62,6 +64,24 @@ test("a missing flock names the platform-specific installation command", () => {
     }
     assert.doesNotMatch(out, /Linux only/);
   }
+});
+
+test("doctor warns about missing client sidebar rows without making it a config error", () => {
+  const missing = runDoctor({ SIDEBAR_TOKENS: "1" });
+  assert.match(missing.out, /⚠ sidebar:/);
+  assert.match(missing.out, /herdr plugin action invoke sidebar/);
+  assert.match(missing.out, /where the Herdr window runs/);
+  assert.match(missing.out, /another machine needs it in that machine\x27s config/);
+  assert.doesNotMatch(missing.out, /✗ sidebar:/);
+  assert.notEqual(missing.status, 2);
+  const configured = runDoctor({ SIDEBAR_TOKENS: "1" }, {
+    sidebarConfig: '[ui.sidebar.agents]\nrows = [["agent"], ["$telegram"]]\n',
+  });
+  assert.match(configured.out, /✓ sidebar: .* has \$telegram in sidebar rows/);
+  assert.doesNotMatch(configured.out, /⚠ sidebar:/);
+  assert.equal(configured.status, missing.status);
+  const disabled = runDoctor({ SIDEBAR_TOKENS: "0" });
+  assert.doesNotMatch(disabled.out, /[⚠✓✗] sidebar:/);
 });
 
 test("a valid config is not reported as a config problem", () => {
