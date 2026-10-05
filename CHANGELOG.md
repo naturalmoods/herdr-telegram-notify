@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.12.0
 
 What Herdr 0.9 offers that the plugin was not using yet.
 
