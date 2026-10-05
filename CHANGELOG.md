@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.12.1
 
 - Make the README a quick start; move the full reference to [docs/guide.md](docs/guide.md).
 - Add a `sidebar` action to set up separate `$telegram` rows in the local
