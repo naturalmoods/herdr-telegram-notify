@@ -240,7 +240,7 @@ and commands use the same setting.
     2. No, tell Claude what to do differently
 
       ↳  you: 1
-      ↳  bot: → typed into wC:p4
+      ↳  bot: 👍 on your reply
 ```
 
 For a blocked agent, the plugin types the reply and presses Enter, so `1` picks
@@ -271,7 +271,9 @@ Reply routing has these restrictions:
   they arrive as `sender_chat`, without an identifiable user id.
   `@userinfobot` can tell you your id.
 
-The bot confirms which pane received a reply or explains why Herdr refused it.
+A reply that reached the agent gets a 👍 reaction; a voice message gets its
+transcript instead. In a group that does not allow the reaction, the bot answers
+with the pane instead (`→ typed into wC:p4`). A refused reply gets an explanation.
 Messages from the wrong chat or outside the allowlist get no answer.
 
 The reply poller runs in a separate process. With `REPLIES` enabled, it starts
@@ -299,7 +301,21 @@ option. A tap sends that option's number exactly as a typed reply would,
 through the same checks. A menu is numbered lines starting at `1.`, one of them
 marked as selected (`❯`, `›`, `>`); a numbered list in the agent's prose has no
 marker and gets no buttons. Buttons are read from the screen, so they need
-`SHOW_SCREEN_ON_BLOCKED`. They disappear once the question is answered.
+`SHOW_SCREEN_ON_BLOCKED`.
+
+Below the menu, every notification also has a row of command buttons. A tap
+runs the command as if you had sent it as a reply to that notification, with
+the same checks:
+
+| Button | Shown |
+| --- | --- |
+| `📄 full` | When the message cut the response short, or did not show it. |
+| `🖥 screen` | Always. |
+| `✎ diff` | Unless the `✎` line found a clean tree or no Git repo. |
+| `⏹ stop` | On blocked notifications and their reminders. |
+
+All buttons disappear once the notification is [marked
+resolved](#keeping-the-chat-current); the typed commands still work.
 
 ### Files and photos
 
@@ -482,8 +498,9 @@ like a notification in the chat is what is still waiting on you:
 | Any other | `working` | `↷ on to the next turn · 14:32` |
 | Any | pane closed | `✕ pane closed · 14:32` |
 
-The line goes above the header. A blocked notification also loses its screen
-and its buttons, because that question is no longer being asked. Replies to a
+The line goes above the header. A blocked notification also loses its screen,
+because that question is no longer being asked, and every marked notification
+loses its buttons. Replies to a
 marked notification follow the usual rules, so an answered question still
 refuses them. Each notification is edited at most once, and only while it is in
 the reply map (24 hours, the last 300).

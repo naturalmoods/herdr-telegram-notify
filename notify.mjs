@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   BLOCKED_DELAY_MAX_SECONDS,
+  BUTTONS,
   PENDING_MAX,
   PENDING_TTL,
   QUESTION_UNKNOWN,
@@ -318,6 +319,7 @@ async function remindBlocked(stateDir, cfg, { token, chatId, silent }) {
     // one even when the question itself could not be read.
     const question = questionOnScreen(stateDir, paneId) ?? QUESTION_UNKNOWN;
     parts.options = menuOptions(cfg, question, parts.body);
+    parts.actions = actionButtons(cfg, { blocked: true });
 
     // Marked first: a reminder that fails is not worth queueing — by the time it
     // could be delivered the wait it reports is no longer the wait there is.
@@ -350,17 +352,25 @@ function menuOptions(cfg, question, screen) {
   return options.length ? options : undefined;
 }
 
-// A blocked agent's menu, as buttons under its notification. Each sends the
-// option's number back the way a typed reply would, through the same checks.
-function menuKeyboard(options) {
+// The commands worth a button under a notification, with replies on like the
+// menu: Esc only for an agent that is waiting, the whole response only when the
+// message had to cut it, and no diff for a tree the ✎ line found clean.
+function actionButtons(cfg, { blocked, cut, clean }) {
+  if (!isOn(cfg("REPLIES"))) return undefined;
+  return [cut && "full", "screen", !clean && "diff", blocked && "stop"].filter(Boolean);
+}
+
+// A blocked agent's menu, as buttons under its notification, then a row of those
+// commands. Each sends what a typed reply would, through the same checks.
+function replyKeyboard(options, actions) {
   // Queued labels may have been captured before masking was enabled.
-  return options?.length
-    ? { inline_keyboard: options.map((o) => [{ text: clip(maskSecrets(`${o.n}. ${o.label}`), 48), callback_data: o.n }]) }
-    : undefined;
+  const rows = (options ?? []).map((o) => [{ text: clip(maskSecrets(`${o.n}. ${o.label}`), 48), callback_data: o.n }]);
+  if (actions?.length) rows.push(actions.map((name) => ({ text: BUTTONS[name], callback_data: `/${name}` })));
+  return rows.length ? { inline_keyboard: rows } : undefined;
 }
 
 async function sendTelegram(token, chatId, message, { silent, topicId, options, paneId, cfg, parts } = {}) {
-  const keyboard = menuKeyboard(options);
+  const keyboard = replyKeyboard(options, parts?.actions);
   const post = async (payload) => {
     const res = await telegramCall(
       token,
@@ -1171,8 +1181,13 @@ async function main() {
   }
 
   const options = bodyIsScreen ? menuOptions(cfg, question, body) : undefined;
+  const actions = actionButtons(cfg, {
+    blocked: status === "blocked",
+    cut: Boolean(full) && body !== truncate(full, Infinity),
+    clean: Boolean(isOn(cfg("SHOW_CHANGES")) && cwd && !changes),
+  });
   const agentTokens = agentTokensLine(info.tokens, cfg("SHOW_AGENT_TOKENS"));
-  const parts = { emoji, agent, statusLabel, title, prompt, project, changes, tools, meta, agentTokens, pane, herd, body, bodyIsScreen, options };
+  const parts = { emoji, agent, statusLabel, title, prompt, project, changes, tools, meta, agentTokens, pane, herd, body, bodyIsScreen, options, actions };
   const message = buildMessage(parts);
 
   if (dryRun) {

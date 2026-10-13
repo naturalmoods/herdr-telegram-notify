@@ -296,7 +296,8 @@ function runPoller(fx, base, { until, timeoutMs = 15000 } = {}) {
   });
 }
 
-const answers = (tg) => tg.sent.map((m) => m.text);
+// A reaction reads as its emoji: the answer to input that reached the agent.
+const answers = (tg) => tg.sent.map((m) => (m.method === "setMessageReaction" ? m.reaction?.[0]?.emoji : m.text));
 
 const waitFor = (cond, timeoutMs = 15000) =>
   new Promise((resolve, reject) => {
@@ -328,7 +329,7 @@ test("phone deliveries report a pane sidebar token with a thirty-minute TTL, but
     try {
       const out = await runPoller(fx, tg.base, { until: () => tg.polls.length >= 2
         && (!expected || fx.argv().some((a) => a[1] === "report-metadata")) });
-      assert.ok(tg.sent.some((m) => m.method === "sendMessage"), out);
+      assert.ok(tg.sent.some((m) => ["sendMessage", "setMessageReaction"].includes(m.method)), out);
       const reports = fx.argv().filter((a) => a[1] === "report-metadata");
       assert.equal(reports.length, expected ? 1 : 0, kind);
       if (expected) {
@@ -392,7 +393,8 @@ test("/new creates a background tab and a uniquely named agent, preserving the p
       const label = entry.workspace === "wY" ? "design notes" : "storefront";
       assert.equal(tg.sent[0].text, `▶ started ${entry.kind} in ${label} · wZ:p9`);
       assert.equal(tg.sent[0].reply_to_message_id, command.message.message_id);
-      assert.ok(tg.sent.every((m) => m.message_thread_id === 77 && m.chat_id === String(CHAT)));
+      // A reaction sits on the message itself, so it names no topic.
+      assert.ok(tg.sent.every((m) => (m.method === "setMessageReaction" || m.message_thread_id === 77) && m.chat_id === String(CHAT)));
       assert.ok(argv.some((a) => JSON.stringify(a) === JSON.stringify(["agent", "prompt", "wZ:p9", "Continue with the example."])));
       assert.ok(argv.some((a) => JSON.stringify(a) === JSON.stringify(["agent", "send-keys", "wZ:p9", "esc"])));
       assert.match(tg.sent[3].text, /Example live output/);
@@ -442,7 +444,8 @@ test("/new @branch creates a background worktree, preserving the prompt and conf
       assert.ok(argv.every((a) => !["--trust-repository", "--path", "--base"].some((flag) => a.includes(flag))));
       assert.equal(tg.sent[0].text, `▶ started claude in ${entry.label}@${entry.branch} · wQ:p9`);
       assert.equal(tg.sent[0].reply_to_message_id, command.message.message_id);
-      assert.ok(tg.sent.every((m) => m.message_thread_id === 77 && m.chat_id === String(CHAT)));
+      // A reaction sits on the message itself, so it names no topic.
+      assert.ok(tg.sent.every((m) => (m.method === "setMessageReaction" || m.message_thread_id === 77) && m.chat_id === String(CHAT)));
       const recorded = readFileSync(join(fx.stateDir, "messages.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
       assert.equal(recorded[0].paneId, "wQ:p9");
       assert.equal(recorded[0].session, "id:example-started-session");
@@ -718,18 +721,22 @@ test("startup leaves the reply poller running without recording or sending a sta
 // --------------------------------------------------------------- delivery
 
 test("a reply reaches the pane whose notification it answers", async () => {
-  const tg = await fakeTelegram([[update(1, { replyTo: 100, text: "yes, go on" })]]);
-  const fx = fixture({
-    agents: { "wA:p1": { agent_status: "working", agent_session: { kind: "id", value: "s1" } } },
-    messages: [{ id: 100, paneId: "wA:p1", session: "id:s1" }],
-  });
-  try {
-    await runPoller(fx, tg.base, { until: () => tg.sent.length >= 1 });
-    assert.deepEqual(fx.ran(), ["agent get wA:p1", "agent prompt wA:p1 yes, go on"]);
-    assert.deepEqual(answers(tg), ["→ sent to wA:p1"]);
-    assert.equal(tg.sent[0].reply_to_message_id, 10);
-  } finally {
-    tg.close();
+  // A chat that does not allow the reaction gets the confirmation in words.
+  for (const refuse of [undefined, "setMessageReaction"]) {
+    const tg = await fakeTelegram([[update(1, { replyTo: 100, text: "yes, go on" })]], { refuse });
+    const fx = fixture({
+      agents: { "wA:p1": { agent_status: "working", agent_session: { kind: "id", value: "s1" } } },
+      messages: [{ id: 100, paneId: "wA:p1", session: "id:s1" }],
+    });
+    try {
+      await runPoller(fx, tg.base, { until: () => tg.sent.length >= (refuse ? 2 : 1) });
+      assert.deepEqual(fx.ran(), ["agent get wA:p1", "agent prompt wA:p1 yes, go on"]);
+      assert.deepEqual(answers(tg), refuse ? ["👍", "→ sent to wA:p1"] : ["👍"]);
+      assert.equal(tg.sent[0].message_id, 10); // on the reply itself
+      if (refuse) assert.equal(tg.sent[1].reply_to_message_id, 10);
+    } finally {
+      tg.close();
+    }
   }
 });
 
@@ -749,7 +756,7 @@ test("a blocked agent is typed at, not prompted", async () => {
       "pane send-text wA:p1 2",
       "pane send-keys wA:p1 Enter",
     ]);
-    assert.deepEqual(answers(tg), ["→ typed into wA:p1"]);
+    assert.deepEqual(answers(tg), ["👍"]);
   } finally {
     tg.close();
   }
@@ -807,7 +814,7 @@ test("a waiting agent is only answered when the question it waits on can be chec
     assert.match(legacy, /^✗ not delivered — wA:p1 is waiting on a question that notification was not about/);
     assert.match(unreadable, /^✗ not delivered — I cannot read what wA:p2 is waiting on now/);
     // A reply to a turn that is over is a new turn, and stays one.
-    assert.equal(finished, "→ sent to wA:p3");
+    assert.equal(finished, "👍");
     assert.deepEqual(
       fx.ran().filter((line) => line.startsWith("pane send")),
       []
@@ -1018,7 +1025,7 @@ test("another chat, an unlisted sender and an anonymous admin all get nothing", 
   });
   try {
     await runPoller(fx, tg.base, { until: () => tg.sent.length >= 1 });
-    assert.deepEqual(answers(tg), ["→ sent to wA:p1"]); // only the allowed one
+    assert.deepEqual(answers(tg), ["👍"]); // only the allowed one
     assert.deepEqual(fx.ran(), ["agent get wA:p1", "agent prompt wA:p1 allowed"]);
   } finally {
     tg.close();
@@ -1049,7 +1056,7 @@ test("an allowlist edited while the poller runs is in force at the next poll", a
   };
   try {
     await runPoller(fx, tg.base, { until: () => answered() >= 3 }); // both batches read
-    assert.deepEqual(answers(tg), ["→ sent to wA:p1"]); // the second reached nobody
+    assert.deepEqual(answers(tg), ["👍"]); // the second reached nobody
     assert.deepEqual(fx.ran(), ["agent get wA:p1", "agent prompt wA:p1 while allowed"]);
   } finally {
     tg.close();
@@ -1434,7 +1441,7 @@ test("a mute does not stop a reply reaching its pane — it is the other directi
     await runPoller(fx, tg.base, { until: () => tg.sent.length >= 2 });
     about(30, muteUntil(fx));
     assert.deepEqual(fx.ran(), ["agent get wA:p1", "agent prompt wA:p1 carry on"]);
-    assert.equal(answers(tg)[1], "→ sent to wA:p1");
+    assert.equal(answers(tg)[1], "👍");
   } finally {
     tg.close();
   }
@@ -1486,8 +1493,8 @@ test("/stop sends only Esc to the recorded session while working or blocked", as
     ]);
     const [working, blocked, idle, done, changed, unknown, notReply, args, expired] = answers(tg);
     assert.equal(tg.sent.length, 9, "another chat, an unlisted sender or another bot's command got an answer");
-    assert.equal(working, "⏹ sent Esc to wA:p1");
-    assert.equal(blocked, "⏹ sent Esc to wA:p2");
+    assert.equal(working, "👍");
+    assert.equal(blocked, "👍");
     assert.match(idle, /^⏹ nothing to stop in wA:p3/);
     assert.match(done, /^⏹ nothing to stop in wA:p4/);
     assert.match(changed, /^✗ not delivered — wA:p5 is running a different agent session now/);
@@ -1858,29 +1865,32 @@ test("only the allowed get a /full, and only this bot's is answered", async () =
   }
 });
 
-test("a button under a blocked notification is typed in like a reply, and only a menu number is", async () => {
+test("a button under a notification is typed in or run like a reply, and only a menu number or a listed command is", async () => {
   const tap = (id, data) => ({
     update_id: id,
     callback_query: { id: `q${id}`, from: { id: 7 }, data, message: { message_id: 100, chat: { id: CHAT } } },
   });
-  // A client can send any callback data it likes; only the number is an answer.
-  const tg = await fakeTelegram([[tap(1, "rm -rf ~"), tap(2, "2")]]);
+  // A client can send any callback data it likes; only a number or a button's
+  // command is an answer, and /status has no button.
+  const tg = await fakeTelegram([[tap(1, "rm -rf ~"), tap(2, "/status"), tap(3, "2"), tap(4, "/screen")]]);
   const fx = fixture({
     agents: { "wA:p1": { agent_status: "blocked", agent_session: { kind: "id", value: "s1" } } },
     screens: { "wA:p1": "Do you want to create notes.md?\n ❯ 1. Yes\n 2. No" },
   });
   fx.remember({ id: 100, paneId: "wA:p1", session: "id:s1", question: questionFor(fx, "wA:p1") });
   try {
-    await runPoller(fx, tg.base, { until: () => tg.sent.length >= 2 });
+    await runPoller(fx, tg.base, { until: () => tg.sent.length >= 4 });
     assert.deepEqual(tg.polls[0].allowed_updates, ["message", "callback_query"]);
     assert.deepEqual(
       tg.sent.map((m) => m.method),
-      ["answerCallbackQuery", "sendMessage"]
+      ["answerCallbackQuery", "setMessageReaction", "answerCallbackQuery", "sendMessage"]
     );
-    assert.equal(tg.sent[0].callback_query_id, "q2");
-    assert.deepEqual(fx.ran().slice(-2), ["pane send-text wA:p1 2", "pane send-keys wA:p1 Enter"]);
-    assert.equal(tg.sent[1].text, "→ typed into wA:p1");
-    assert.equal(tg.sent[1].reply_to_message_id, 100); // under the notification it was tapped on
+    assert.deepEqual([tg.sent[0].callback_query_id, tg.sent[2].callback_query_id], ["q3", "q4"]);
+    assert.ok(fx.ran().includes("pane send-text wA:p1 2"));
+    assert.ok(fx.ran().includes("pane send-keys wA:p1 Enter"));
+    assert.equal(tg.sent[1].message_id, 100); // the 👍 sits on the notification that was tapped
+    assert.match(tg.sent[3].text, /Do you want to create notes\.md\?/);
+    assert.equal(tg.sent[3].reply_to_message_id, 100); // under the notification it was tapped on
   } finally {
     tg.close();
   }
@@ -1924,7 +1934,7 @@ test("a photo or a document reaches the agent as a file it can open", async () =
     const ran = readFileSync(join(fx.root, "herdr.log"), "utf8");
     assert.ok(ran.includes(`agent prompt wA:p1 this is what I see\n\nAttached file: ${photo}`), ran);
     assert.ok(ran.includes(`agent prompt wA:p1 Attached file: ${doc}`), ran);
-    assert.deepEqual(answers(tg), ["→ sent to wA:p1", "→ sent to wA:p1"]);
+    assert.deepEqual(answers(tg), ["👍", "👍"]);
   } finally {
     tg.close();
   }
@@ -1954,7 +1964,7 @@ test("a file of the wrong kind, or one sent at a question, is refused before it 
     assert.match(kind, /^✗ not delivered — I only pass on jpg, .*docx files/);
     assert.match(size, /20 MB/);
     // A caption that looks like a command is still the file's caption.
-    assert.match(captioned, /^→ sent to wA:p1/);
+    assert.equal(captioned, "👍");
     assert.deepEqual(tg.files, ["cap"], "a refused file was fetched anyway");
 
     await runPoller(blockedFx, blockedTg.base, { until: () => blockedTg.sent.length >= 1 });

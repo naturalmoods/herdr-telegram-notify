@@ -1364,16 +1364,16 @@ export function targetForMessage(stateDir, messageId) {
 // GroupAnonymousBot id, so there is no one to check against the list.
 export function usableReply(update, chatId, allowedUserIds) {
   // A button under a notification is a reply to it that the bot wrote the text
-  // of: the same chat and sender checks, and only a menu number gets through —
-  // callback data is whatever the client sends, not necessarily what the
-  // button said.
+  // of: the same chat and sender checks, and only a menu number or one of the
+  // BUTTONS commands gets through — callback data is whatever the client sends,
+  // not necessarily what the button said.
   const query = update?.callback_query;
   if (query) {
     const message = query.message;
     if (!message || String(message.chat?.id ?? "") !== String(chatId)) return undefined;
     if (listMatches(allowedUserIds, query.from?.id) === false) return undefined;
     const data = String(query.data ?? "");
-    if (!/^\d{1,2}$/.test(data)) return undefined;
+    if (!/^\d{1,2}$/.test(data) && !Object.keys(BUTTONS).some((name) => data === `/${name}`)) return undefined;
     return {
       text: data,
       messageId: message.message_id,
@@ -1466,6 +1466,10 @@ export const COMMANDS = [
   { command: "diff", description: "Download uncommitted changes (reply to a notification)" },
   { command: "new", description: "Start an agent: /new <workspace>[@<branch>] <kind> [prompt]" },
 ];
+
+// The reply-to-a-notification commands a notification also carries as buttons,
+// with their labels. A tap is that command sent as a reply to it.
+export const BUTTONS = { full: "📄 full", screen: "🖥 screen", diff: "✎ diff", stop: "⏹ stop" };
 
 export function botCommand(text, botUsername) {
   const [first = "", ...args] = String(text ?? "").trim().split(/\s+/);
