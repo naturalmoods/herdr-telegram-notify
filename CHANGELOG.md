@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.13.0
 
 - Notifications carry `/full`, `/screen`, `/diff` and `/stop` as buttons, so
   you can run them with a tap instead of typing a reply. Each appears only
