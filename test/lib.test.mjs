@@ -1016,6 +1016,11 @@ test("usableReply takes a button tap as a reply to the message it sits under", (
     callbackId: "q1",
   });
   assert.equal(usableReply(tap({ data: "2; rm -rf ~" }), 42), undefined);
+  // A command button's data is that command; one without a button is refused.
+  assert.equal(usableReply(tap({ data: "/diff" }), 42)?.text, "/diff");
+  for (const data of ["/new wA claude", "/status", "/screen@otherbot", "/diff "]) {
+    assert.equal(usableReply(tap({ data }), 42), undefined, data);
+  }
   assert.equal(usableReply(tap({ message: { message_id: 100, chat: { id: 99 } } }), 42), undefined);
   assert.equal(usableReply(tap({ message: undefined }), 42), undefined);
   assert.equal(usableReply(tap(), 42, "8"), undefined);

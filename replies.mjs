@@ -146,6 +146,19 @@ async function say(text, to, parseMode) {
   return res;
 }
 
+// Input that reached the agent is acknowledged with a 👍 on the message that
+// carried it — a reply, or the notification whose button was tapped — rather
+// than with another message. A chat that does not allow that reaction gets
+// the words instead.
+async function acknowledge(text, to) {
+  const res = await telegram(
+    "setMessageReaction",
+    { chat_id: chatId, message_id: to.messageId, reaction: [{ type: "emoji", emoji: "👍" }] },
+    10_000
+  );
+  if (!res?.ok) return say(text, to);
+}
+
 // A response or diff need not fit one message, so send the whole text as a file.
 // UTF-8 keeps non-ASCII text readable on the phone rather than turning it into
 // mojibake, and both commands return to the same reply and forum topic.
@@ -583,7 +596,7 @@ async function deliver(reply, { stop = false, screen = false, diff = false } = {
     }
     void reportSidebarToken("pane", paneId, `📱 ${clockTime(new Date())}`, { ttlMs: SIDEBAR_PHONE_TTL_MS, cfg });
     console.log(`herdr-telegram-notify: sent Esc to ${paneId}`);
-    return say(`⏹ sent Esc to ${paneId}`, reply);
+    return acknowledge(`⏹ sent Esc to ${paneId}`, reply);
   }
 
   // A blocked agent is answered with keystrokes into whatever prompt is on its
@@ -693,10 +706,10 @@ async function deliver(reply, { stop = false, screen = false, diff = false } = {
   }
   void reportSidebarToken("pane", paneId, `📱 ${clockTime(new Date())}`, { ttlMs: SIDEBAR_PHONE_TTL_MS, cfg });
   console.log(`herdr-telegram-notify: delivered a reply to ${paneId} (${status ?? "status unknown"})`);
-  // What was understood, so a mishearing is caught on the phone rather than
-  // after the agent has acted on it.
+  // A voice message is answered in words, with what was understood, so a
+  // mishearing is caught on the phone rather than after the agent has acted on it.
   const sent = status === "blocked" ? `→ typed into ${paneId}` : `→ sent to ${paneId}`;
-  await say(heard ? `🎙 “${clip(heard, 300)}”\n${sent}` : sent, reply);
+  await (heard ? say(`🎙 “${clip(heard, 300)}”\n${sent}`, reply) : acknowledge(sent, reply));
 }
 
 // ------------------------------------------------------------------- loop
@@ -761,13 +774,10 @@ for (;;) {
     if (stopping) continue;
     const reply = usableReply(update, chatId, cfg("REPLY_ALLOWED_USER_IDS"));
     if (!reply) continue;
-    if (reply.callbackId) {
-      // Told first, so the button stops spinning; what happened to the answer
-      // comes as a reply to the notification, like a typed one.
-      await telegram("answerCallbackQuery", { callback_query_id: reply.callbackId }, 10_000);
-      await deliver(reply);
-      continue;
-    }
+    // Told first, so the button stops spinning; what happened to the answer
+    // comes as a reply to the notification, like a typed one. The tap is then
+    // a menu number or a command, and goes the way typing it would.
+    if (reply.callbackId) await telegram("answerCallbackQuery", { callback_query_id: reply.callbackId }, 10_000);
     // A caption that starts with a slash is still a caption: the file is the point.
     const command = reply.file ? undefined : botCommand(reply.text, botUsername);
     if (command) {

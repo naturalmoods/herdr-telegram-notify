@@ -376,6 +376,11 @@ test("a blocked delay sends only the same live episode, with a fresh screen and 
         assert.deepEqual(tg.sent[0].reply_markup.inline_keyboard, [
           [{ text: "1. Updated option", callback_data: "1" }],
           [{ text: "2. Cancel", callback_data: "2" }],
+          [
+            { text: "🖥 screen", callback_data: "/screen" },
+            { text: "✎ diff", callback_data: "/diff" },
+            { text: "⏹ stop", callback_data: "/stop" },
+          ],
         ]);
         assert.equal(readState(fx.stateDir, key).updatedAt, began.updatedAt, "reminders must use the original blocked time");
         assert.equal(remembered(fx).length, 1);
@@ -759,11 +764,12 @@ test("a blocked agent's menu comes as buttons when replies are on, and goes when
     const keyboard = calls(tg, "sendMessage")[0]?.reply_markup?.inline_keyboard;
     assert.deepEqual(
       keyboard?.map(([b]) => b.callback_data),
-      ["1", "2", "3"],
+      ["1", "2", "3", "/screen"],
       out
     );
     assert.equal(keyboard[0][0].text, "1. Yes");
     assert.ok(keyboard[2][0].text.length <= 48);
+    assert.deepEqual(keyboard[3].map((b) => b.callback_data), ["/screen", "/diff", "/stop"]);
     // Answered: the edit carries no keyboard, so the buttons go with the question.
     await hook(fx, tg.base, "wA:p1", { status: "working" });
     const edits = calls(tg, "editMessageText");
@@ -785,5 +791,32 @@ test("a blocked agent's menu comes as buttons when replies are on, and goes when
     }
     tg.close();
     offTg.close();
+  }
+});
+
+test("a finished turn's buttons offer the whole response only when it was cut, and a diff only for changes", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "send-turn-")); // not a git repo: no changes to show
+  for (const entry of [
+    { text: "Short answer.", env: ["SHOW_CHANGES=0"], expected: ["/screen", "/diff"] },
+    { text: "word ".repeat(100), env: ["LAST_MESSAGE_CHARS=50", "SHOW_CHANGES=1"], expected: ["/full", "/screen"] },
+  ]) {
+    const transcript = join(dir, `${entry.expected.join("")}.jsonl`.replaceAll("/", "-"));
+    writeFileSync(transcript, [
+      { type: "user", timestamp: new Date().toISOString(), message: { role: "user", content: "Answer the question." } },
+      { type: "assistant", timestamp: new Date().toISOString(), message: { role: "assistant", content: [{ type: "text", text: entry.text }] } },
+    ].map((r) => JSON.stringify(r)).join("\n") + "\n");
+    const agent = { pane_id: "wA:p1", agent: "claude", agent_status: "done", cwd: dir, agent_session: { kind: "path", value: transcript } };
+    const tg = await fakeTelegram();
+    const fx = fixture(["REPLIES=1", "SHOW_LAST_MESSAGE=1", ...entry.env], [agent]);
+    // Stand in for the poller, as above.
+    const release = holdFlock(join(fx.stateDir, "replies.lock"));
+    try {
+      const { out } = await hook(fx, tg.base, "wA:p1");
+      const keyboard = tg.sent[tg.methods.indexOf("sendMessage")]?.reply_markup?.inline_keyboard;
+      assert.deepEqual(keyboard?.map((row) => row.map((b) => b.callback_data)), [entry.expected], out);
+    } finally {
+      release();
+      tg.close();
+    }
   }
 });

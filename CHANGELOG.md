@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Notifications carry `/full`, `/screen`, `/diff` and `/stop` as buttons, so
+  you can run them with a tap instead of typing a reply. Each appears only
+  where it is useful: `full` when the response was cut, `diff` unless the tree
+  was clean, `stop` while the agent waits. They need `REPLIES=1`, like the menu
+  buttons, and go when the notification is marked resolved.
+- A reply, button tap or `/stop` that reached the agent is acknowledged with a
+  👍 reaction instead of a `→ sent to wA:p1` message. Voice messages still get
+  their transcript, and a chat that does not allow the reaction gets the text.
+
 ## 0.12.1
 
 - Make the README a quick start; move the full reference to [docs/guide.md](docs/guide.md).

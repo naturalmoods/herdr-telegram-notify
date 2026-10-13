@@ -76,7 +76,8 @@ other agents get a new turn. [Reply rules and limits](docs/guide.md#replies-and-
 ## Commands
 
 All commands need `REPLIES=1` and use the chat and sender allowlist above.
-`/full`, `/stop`, `/screen` and `/diff` must reply to a notification.
+`/full`, `/stop`, `/screen` and `/diff` must reply to a notification; notifications
+also carry them as buttons.
 
 | Command | Result |
 | --- | --- |
