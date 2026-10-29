@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Support the Herdr app, whose agents run in herdr-core (`hc`). herdr-core has
+  no plugin hooks, so `daemon.mjs` follows `hc events` and runs the same
+  notifier; replies go through `hc send`, `/stop` through `hc interrupt`, and
+  `/new` starts a labelled terminal the app adopts as a new tab. Run it as a
+  service on the machine where the agents run. See [docs/core.md](docs/core.md).
+  Herdr TUI is unchanged.
+
 ## 0.13.0
 
 - Notifications carry `/full`, `/screen`, `/diff` and `/stop` as buttons, so

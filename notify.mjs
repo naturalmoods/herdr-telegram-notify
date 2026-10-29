@@ -26,7 +26,7 @@ import {
   clockTime,
   closeMessages,
   escapeHtml,
-  herdr,
+  focusHint,
   herdStatusText,
   firstDefined,
   flockAvailable,
@@ -40,6 +40,7 @@ import {
   isOn,
   isRetryable,
   listMatches,
+  liveAgentRecord,
   loadConfig,
   loadSnapshot,
   maskSecrets,
@@ -297,7 +298,7 @@ async function remindBlocked(stateDir, cfg, { token, chatId, silent }) {
     const paneBits = [];
     if (isOn(cfg("SHOW_PANE"))) {
       if (isOn(cfg("SHOW_HOST"))) paneBits.push(hostname());
-      paneBits.push(`herdr agent focus ${paneId}`);
+      paneBits.push(focusHint(paneId));
     }
 
     const parts = {
@@ -960,9 +961,7 @@ async function main() {
     await sleep(blockedDelay * 1000);
     let live;
     if (blockedEpisode(stateDir, paneId) === now) {
-      try {
-        live = JSON.parse(herdr(["agent", "get", paneId]))?.result?.agent;
-      } catch {}
+      live = liveAgentRecord(paneId);
     }
     if (live?.agent_status !== "blocked" || blockedEpisode(stateDir, paneId) !== now) {
       note(`${paneId ?? "the pane"} was answered within the blocked delay; not sending`);
@@ -1105,7 +1104,7 @@ async function main() {
   if (isOn(cfg("SHOW_PANE")) && paneId) {
     if (isOn(cfg("SHOW_HOST"))) paneBits.push(hostname());
     if (tabLabel && !/^\d+$/.test(String(tabLabel))) paneBits.push(`tab ${tabLabel}`);
-    paneBits.push(`herdr agent focus ${paneId}`);
+    paneBits.push(focusHint(paneId));
   }
   const pane = paneBits.length ? `🖥 ${paneBits.join(" · ")}` : undefined;
 
