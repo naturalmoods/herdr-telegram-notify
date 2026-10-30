@@ -45,6 +45,7 @@ import {
   loadSnapshot,
   maskSecrets,
   mutedUntil,
+  notifyStatuses,
   questionOnScreen,
   readLines,
   readState,
@@ -143,6 +144,7 @@ function paneInfo(snapshot, paneId) {
     title: pane.terminal_title_stripped && maskSecrets(pane.terminal_title_stripped),
     session: pane.agent_session,
     tokens: agent?.tokens,
+    helpers: pane.helpers,
     workspaceId: pane.workspace_id,
     workspaceLabel: (snapshot.workspaces ?? []).find((w) => w.workspace_id === pane.workspace_id)?.label,
     tabLabel: (snapshot.tabs ?? []).find((t) => t.tab_id === pane.tab_id)?.label,
@@ -174,6 +176,17 @@ function herdSummary(snap, paneId) {
   const quiet = others.filter((a) => !["blocked", "working"].includes(a.agent_status)).length;
   if (quiet) bits.push(`${quiet} idle`);
   return bits.length ? bits.join(" · ") : undefined;
+}
+
+// Helpers an agent started with `hc run` are its business, not the phone's, so
+// they get one line in its parent's message instead of a notification each.
+function helpersLine(helpers) {
+  if (!helpers?.length) return undefined;
+  const names = helpers
+    .slice(0, 5)
+    .map((h) => `${clip(String(firstDefined(h.name, h.address)), 32)} ${firstDefined(h.status, "running")}`);
+  const more = helpers.length - names.length;
+  return `🧩 ${helpers.length} helper${helpers.length === 1 ? "" : "s"}: ${names.join(", ")}${more > 0 ? ` +${more}` : ""}`;
 }
 
 // ------------------------------------------------------------------- extras
@@ -928,14 +941,9 @@ async function main() {
   }
   if (paneClosed) return;
 
-  const notifyStatuses = new Set(
-    String(cfg("NOTIFY_STATUSES"))
-      .split(",")
-      .map((s) => s.trim().toLowerCase())
-      .filter(Boolean)
-  );
-  if (!notifyStatuses.has(status)) {
-    note(`${status} is not in NOTIFY_STATUSES (${[...notifyStatuses].join(", ")})`);
+  const wanted = new Set(notifyStatuses(cfg));
+  if (!wanted.has(status)) {
+    note(`${status} is not in NOTIFY_STATUSES (${[...wanted].join(", ")})`);
     return;
   }
 
@@ -1109,6 +1117,8 @@ async function main() {
   }
   const pane = paneBits.length ? `🖥 ${paneBits.join(" · ")}` : undefined;
 
+  const helpers = helpersLine(info.helpers);
+
   const herd = isOn(cfg("SHOW_HERD")) ? herdSummary(snap, paneId) : undefined;
 
   // Which question this is, when it is one. An answer to a blocked agent is
@@ -1187,7 +1197,7 @@ async function main() {
     clean: Boolean(isOn(cfg("SHOW_CHANGES")) && cwd && !changes),
   });
   const agentTokens = agentTokensLine(info.tokens, cfg("SHOW_AGENT_TOKENS"));
-  const parts = { emoji, agent, statusLabel, title, prompt, project, changes, tools, meta, agentTokens, pane, herd, body, bodyIsScreen, options, actions };
+  const parts = { emoji, agent, statusLabel, title, prompt, project, changes, tools, meta, agentTokens, pane, helpers, herd, body, bodyIsScreen, options, actions };
   const message = buildMessage(parts);
 
   if (dryRun) {

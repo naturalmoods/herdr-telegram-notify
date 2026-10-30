@@ -24,6 +24,15 @@
   refused for now. Empty by default, as before. Do not include a machine that
   runs its own daemon on the same bot, or every message comes twice. See
   [docs/core.md](docs/core.md#where-it-runs).
+- Under herdr-core, pi transcripts are found by the folder pi slugs the cwd
+  into (`~/.pi/agent/sessions`, or `PI_CODING_AGENT_DIR`), so a pi turn has a
+  last message, duration and token count like Claude's and Codex's.
+- herdr-core's `error` status is heard by default: with no `NOTIFY_STATUSES`
+  of your own, `done,blocked,error` notify. A list you write is used exactly
+  as it stands, and the doctor shows the effective one.
+- A parent's notification lists the helpers it started with `hc run` on one
+  line (`🧩 2 helpers: sub-auth done, sub-docs working`) instead of leaving
+  them out entirely.
 
 ## 0.13.0
 

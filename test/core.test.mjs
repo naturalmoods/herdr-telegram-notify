@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 import { applyEvent, coreMachines, coreSession, guessTranscript, hookEvent, loadCoreSnapshot, remoteTranscript, toSnapshot, transitions } from "../core.mjs";
-import { DEFAULTS, questionOnScreen, readTurn, reportSidebarToken, transcriptPath, workingTreeChanges, workingTreeDiff } from "../lib.mjs";
+import { DEFAULTS, questionOnScreen, readTurn, reportSidebarToken, toolSummary, transcriptPath, workingTreeChanges, workingTreeDiff } from "../lib.mjs";
 import { telegramEntries } from "../contrib/herdr-app/telegram/entries.js";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
@@ -291,10 +291,55 @@ test("guessTranscript takes Claude's newest file for that folder written since t
     assert.equal(guessTranscript(session), fresh);
     assert.equal(guessTranscript({ ...session, since: 4000 }), undefined, "nothing written since it started");
     assert.equal(guessTranscript({ ...session, shared: true }), undefined);
-    assert.equal(guessTranscript({ ...session, agent: "pi" }), undefined);
   } finally {
     if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR;
     else process.env.CLAUDE_CONFIG_DIR = saved;
+  }
+});
+
+test("guessTranscript finds pi's newest session for the folder, and readTurn reads its format", () => {
+  const root = mkdtempSync(join(tmpdir(), "core-pi-"));
+  const dir = join(root, "sessions", "--work-storefront--");
+  mkdirSync(dir, { recursive: true });
+  const old = join(dir, "20260101T120000_aaaaaaaa.jsonl");
+  const fresh = join(dir, "20260101T130000_bbbbbbbb.jsonl");
+  writeFileSync(old, "{}\n");
+  const piMessage = (role, content, s, usage) => ({
+    type: "message",
+    timestamp: new Date(Date.UTC(2026, 0, 1, 12, 0, s)).toISOString(),
+    message: { role, content, ...(usage ? { usage } : {}) },
+  });
+  writeFileSync(
+    fresh,
+    [
+      JSON.stringify({ type: "session", version: 3, id: "bbbbbbbb", timestamp: "2026-01-01T13:00:00Z" }),
+      JSON.stringify(piMessage("user", [{ type: "text", text: "fix the login" }], 0)),
+      JSON.stringify(piMessage("assistant", [{ type: "toolCall", name: "bash", id: "c1", arguments: {} }], 30)),
+      JSON.stringify(piMessage("assistant", [{ type: "text", text: "Login fixed." }], 60, {
+        input: 10, output: 20, cacheRead: 5, cost: { total: 0.01 },
+      })),
+    ].join("\n") + "\n"
+  );
+  utimesSync(old, 1, 1);
+  utimesSync(fresh, 3, 3);
+  const saved = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = root;
+  try {
+    const session = { agent: "pi", cwd: "/work/storefront", since: 2000 };
+    assert.equal(guessTranscript(session), fresh);
+    assert.equal(guessTranscript({ ...session, since: 4000 }), undefined, "nothing written since it started");
+    assert.equal(guessTranscript({ ...session, shared: true }), undefined);
+    // A program whose name only contains "pi" is not pi.
+    assert.equal(guessTranscript({ ...session, agent: "copilot" }), undefined);
+    const turn = readTurn(fresh);
+    assert.equal(turn.prompt, "fix the login");
+    assert.equal(turn.text, "Login fixed.");
+    assert.equal(turn.duration, 60_000);
+    assert.equal(turn.out, 20);
+    assert.equal(toolSummary(turn.tools), "1 bash");
+  } finally {
+    if (saved === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = saved;
   }
 });
 
@@ -670,6 +715,45 @@ test("the daemon turns an hc status event into the TUI plugin's message, with th
   assert.match(out, /fix the login/);
   const terminals = JSON.parse(readFileSync(join(fx.stateDir, "core-terminals.json"), "utf8")).terminals;
   assert.equal(terminals[0].status.state, "done");
+});
+
+test("a parent's notification lists its live helpers on one line, and only when it has some", async () => {
+  const helper = (address, extra = {}) => terminal(address, { parent: "t3", ...extra });
+  const cases = [
+    {
+      helpers: [
+        helper("h1", { name: "sub-auth", status: { state: "done", app: "bash" } }),
+        helper("h2", { name: "sub-docs" }),
+        helper("h3", { name: "sub-gone", state: "finished" }),
+      ],
+      line: "🧩 2 helpers: sub-auth done, sub-docs running",
+    },
+    { helpers: [], line: undefined },
+    {
+      helpers: [1, 2, 3, 4, 5, 6, 7].map((n) => helper(`h${n}`, { name: `sub-${n}` })),
+      line: "🧩 7 helpers: sub-1 running, sub-2 running, sub-3 running, sub-4 running, sub-5 running +2",
+    },
+  ];
+  for (const { helpers, line } of cases) {
+    const fx = dirs();
+    const hc = fakeHc(fx.root, {
+      terminals: [agent("t3", "working", { labels: { "herdr.space": "s1" } }), ...helpers],
+      events: [
+        { type: "status", terminal: "t3", data: { status: { state: "done", app: "claude" }, records: {}, reported: true } },
+      ],
+    });
+    const out = await run(DAEMON, [], {
+      HC_BIN_PATH: hc.path,
+      HERDR_PLUGIN_STATE_DIR: fx.stateDir,
+      HERDR_PLUGIN_CONFIG_DIR: fx.configDir,
+      CLAUDE_CONFIG_DIR: join(fx.root, "claude"),
+      DRY_RUN: "1",
+      SHOW_CHANGES: "0",
+    }, { until: (o) => o.includes("--- plain-text fallback ---") });
+    assert.match(out, /claude · done/);
+    if (line) assert.ok(out.includes(line), out);
+    else assert.equal(out.includes("🧩"), false, out);
+  }
 });
 
 test("the daemon does not report what was already done before it started, and refuses a second copy", async () => {

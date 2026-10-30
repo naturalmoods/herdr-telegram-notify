@@ -154,12 +154,27 @@ export function warnUnknownKeys(fileEnv) {
 export function loadConfig() {
   const fileEnv = loadEnvFile(process.env.HERDR_PLUGIN_CONFIG_DIR);
   warnUnknownKeys(fileEnv);
-  return (key) => firstDefined(process.env[key], fileEnv[key], DEFAULTS[key]);
+  const cfg = (key) => firstDefined(process.env[key], fileEnv[key], DEFAULTS[key]);
+  // A key the user set, as opposed to one that fell back to DEFAULTS.
+  cfg.userSet = (key) => firstDefined(process.env[key], fileEnv[key]) !== undefined;
+  return cfg;
 }
 
 // The statuses herdr reports, and so the only ones NOTIFY_STATUSES can name.
 // `error` comes from herdr-core only.
 export const STATUSES = ["done", "blocked", "working", "idle", "error"];
+
+// The statuses a run notifies on. herdr-core reports `error`, which the TUI
+// never does, so it is heard by default there too — unless the user wrote
+// NOTIFY_STATUSES, whose list is then taken exactly as it stands.
+export function notifyStatuses(cfg) {
+  const list = String(cfg("NOTIFY_STATUSES") ?? "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  if (isCore() && !cfg.userSet?.("NOTIFY_STATUSES") && !list.includes("error")) list.push("error");
+  return list;
+}
 
 // A value the runtime cannot parse falls back to the default, silently — the
 // failure mode of `SWEEP_MINUTES=5min` is a sweeper that never runs and a config
@@ -752,7 +767,7 @@ export function buildMessage(parts) {
   // Mask source fields before clipping or escaping, including messages queued
   // before masking was enabled and titles shared by notifications and reminders.
   parts = Object.fromEntries(Object.entries(parts).map(([key, value]) => [key, typeof value === "string" ? maskSecrets(value) : value]));
-  const { emoji, agent, statusLabel, title, prompt, project, changes, tools, meta, agentTokens, pane, herd, bodyIsScreen, late } = parts;
+  const { emoji, agent, statusLabel, title, prompt, project, changes, tools, meta, agentTokens, pane, helpers, herd, bodyIsScreen, late } = parts;
 
   const render = (body) => {
     const plain = [];
@@ -769,7 +784,7 @@ export function buildMessage(parts) {
       plain.push(shown);
       html.push(`<i>${escapeHtml(shown)}</i>`);
     }
-    for (const line of [prompt, project, changes, tools, meta, agentTokens, pane, herd ? `🐑 ${herd}` : undefined].filter(Boolean)) {
+    for (const line of [prompt, project, changes, tools, meta, agentTokens, pane, helpers, herd ? `🐑 ${herd}` : undefined].filter(Boolean)) {
       const shown = clip(line, HEAD_LINE_CHARS);
       plain.push(shown);
       html.push(escapeHtml(shown));

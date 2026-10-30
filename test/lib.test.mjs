@@ -35,8 +35,10 @@ import {
   setMute,
   MUTE_MAX_MINUTES,
   listMatches,
+  loadConfig,
   loadEnvFile,
   maskSecrets,
+  notifyStatuses,
   promptText,
   questionOnScreen,
   blockedEpisode,
@@ -216,6 +218,43 @@ test("loadEnvFile skips comments and unquotes values", () => {
   chmodSync(join(dir, ".env"), 0o600);
   assert.deepEqual(loadEnvFile(dir), { A: "1", B: "two words", C: "x", D: "a=b" });
   assert.deepEqual(loadEnvFile(undefined), {});
+});
+
+// herdr-core reports `error`, the TUI never does. It is heard by default there,
+// but a list the user wrote is theirs alone.
+test("herdr-core hears error by default unless NOTIFY_STATUSES was set", () => {
+  const dir = mkdtempSync(join(scratch, "statuses-"));
+  writeFileSync(join(dir, ".env"), "");
+  const saved = {
+    backend: process.env.HERDR_BACKEND,
+    config: process.env.HERDR_PLUGIN_CONFIG_DIR,
+    statuses: process.env.NOTIFY_STATUSES,
+  };
+  process.env.HERDR_PLUGIN_CONFIG_DIR = dir;
+  delete process.env.NOTIFY_STATUSES;
+  try {
+    process.env.HERDR_BACKEND = "core";
+    assert.deepEqual(notifyStatuses(loadConfig()), ["done", "blocked", "error"]);
+    writeFileSync(join(dir, ".env"), "NOTIFY_STATUSES=done\n");
+    assert.deepEqual(notifyStatuses(loadConfig()), ["done"], "an explicit list is respected exactly");
+    process.env.NOTIFY_STATUSES = "blocked,working";
+    assert.deepEqual(notifyStatuses(loadConfig()), ["blocked", "working"], "the environment beats the .env");
+    delete process.env.HERDR_BACKEND;
+    assert.deepEqual(notifyStatuses(loadConfig()), ["blocked", "working"]);
+    delete process.env.NOTIFY_STATUSES;
+    assert.deepEqual(notifyStatuses(loadConfig()), ["done"]);
+    writeFileSync(join(dir, ".env"), "");
+    assert.deepEqual(notifyStatuses(loadConfig()), ["done", "blocked"], "Herdr TUI does not add error");
+  } finally {
+    for (const [key, value] of [
+      ["HERDR_BACKEND", saved.backend],
+      ["HERDR_PLUGIN_CONFIG_DIR", saved.config],
+      ["NOTIFY_STATUSES", saved.statuses],
+    ]) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 });
 
 test("listMatches separates 'nothing said' from 'said no'", () => {

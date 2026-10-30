@@ -233,6 +233,9 @@ export function toSnapshot(terminals = [], doc = {}, machines) {
     .map((t) => {
       const machine = machineOf(t.address);
       const prefix = machine ? `${machine}/` : "";
+      // The terminals this one started with `hc run`: left out of the agents,
+      // but worth a line in its parent's message.
+      const helpers = live.filter((h) => h.parent === t.address);
       return {
         pane_id: t.address,
         name: t.name ?? undefined,
@@ -240,6 +243,9 @@ export function toSnapshot(terminals = [], doc = {}, machines) {
         tab_id: t.labels?.["herdr.tab"] ? `${prefix}${t.labels["herdr.tab"]}` : undefined,
         cwd: cwdOf(t),
         terminal_title_stripped: t.status?.title || t.title || undefined,
+        ...(helpers.length
+          ? { helpers: helpers.map((h) => ({ address: h.address, name: h.name ?? undefined, status: h.status?.state ?? undefined })) }
+          : {}),
         ...(t.status?.state
           ? {
               agent: appOf(t),
@@ -353,8 +359,9 @@ export function remoteTranscript(session) {
 
 // Herdr TUI is told each agent's session; herdr-core is not, so the transcript
 // is found where the agent keeps it: Claude Code by folder, Codex by the folder
-// its rollout names. Only files written since the terminal started, and none at
-// all when two agents of a kind share the folder.
+// its rollout names, pi by the folder it slugs the cwd into. Only files written
+// since the terminal started, and none at all when two agents of a kind share
+// the folder.
 export function guessTranscript(session) {
   if (!session?.cwd || session.shared) return undefined;
   const since = Number(session.since) || 0;
@@ -387,6 +394,13 @@ export function guessTranscript(session) {
       } catch {}
     }
     return best?.path;
+  }
+  if (/^pi(\b|$)/.test(app)) {
+    // ~/.pi/agent/sessions/--home-x-api--/<timestamp>_<uuid>.jsonl: pi drops the
+    // leading separator and turns the rest of the cwd's separators into dashes.
+    const root = join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "sessions");
+    const slug = `--${session.cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+    return newestFile(join(root, slug), (n) => n.endsWith(".jsonl"), since);
   }
   return undefined;
 }

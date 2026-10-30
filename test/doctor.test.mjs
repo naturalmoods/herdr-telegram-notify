@@ -17,7 +17,7 @@ const scratch = mkdtempSync(join(tmpdir(), "herdr-telegram-notify-doctor-"));
 // chat id beside it nothing is sent either.
 const TOKEN = "123456789:AAFakeTokenForTestsOnly_notReal";
 
-function runDoctor(env, { platform, missingFlock = false, sidebarConfig } = {}) {
+function runDoctor(env, { platform, missingFlock = false, sidebarConfig, backend } = {}) {
   const dir = mkdtempSync(join(scratch, "cfg-"));
   writeFileSync(
     join(dir, ".env"),
@@ -31,6 +31,9 @@ function runDoctor(env, { platform, missingFlock = false, sidebarConfig } = {}) 
   // fake executable to keep the offline doctor away from the live session.
   const herdr = join(dir, "herdr");
   writeFileSync(herdr, `#!${process.execPath}\nprocess.exit(1);\n`, { mode: 0o755 });
+  // herdr-core is asked through hc; a fake that answers nothing keeps this offline.
+  const hc = join(dir, "hc");
+  writeFileSync(hc, `#!${process.execPath}\nprocess.exit(1);\n`, { mode: 0o755 });
   const args = platform ? ["--input-type=module", "-e", `
     Object.defineProperty(process, "platform", { value: ${JSON.stringify(platform)} });
     await import(${JSON.stringify(new URL("../doctor.mjs", import.meta.url).href)});
@@ -43,7 +46,9 @@ function runDoctor(env, { platform, missingFlock = false, sidebarConfig } = {}) 
       HERDR_PLUGIN_CONFIG_DIR: dir,
       HERDR_PLUGIN_STATE_DIR: mkdtempSync(join(scratch, "state-")),
       HERDR_BIN_PATH: herdr,
+      HC_BIN_PATH: hc,
       HERDR_CONFIG_PATH: join(dir, "config.toml"),
+      ...(backend ? { HERDR_BACKEND: backend } : {}),
       ...(missingFlock ? { FLOCK_BIN_PATH: join(dir, "missing-flock") } : {}),
     },
   });
@@ -114,6 +119,18 @@ test("a valid config is not reported as a config problem", () => {
   for (const key of ["QUIET_HOURS", "SWEEP_MINUTES", "TELEGRAM_TOPICS", "REPLY_ALLOWED_USER_IDS"]) {
     assert.equal(out.includes(`✗ ${key}`), false);
   }
+});
+
+// herdr-core's `error` is the one status the TUI never reports, so it is heard
+// by default there — and shown in the line that says what is heard.
+test("under herdr-core the statuses line includes error unless the user wrote the list", () => {
+  const byDefault = runDoctor({}, { backend: "core" });
+  assert.match(byDefault.out, /✓ statuses: notifying on done,blocked,error/);
+  const written = runDoctor({ NOTIFY_STATUSES: "done,blocked" }, { backend: "core" });
+  assert.match(written.out, /✓ statuses: notifying on done,blocked\n/);
+  assert.doesNotMatch(written.out, /✓ statuses: [^\n]*error/);
+  const tui = runDoctor({});
+  assert.match(tui.out, /✓ statuses: notifying on done,blocked\n/);
 });
 
 test("every mistyped value is named, and nothing about it is reported OK", () => {

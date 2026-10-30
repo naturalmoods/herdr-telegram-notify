@@ -25,6 +25,7 @@ import {
   isOn,
   loadConfig,
   mutedUntil,
+  notifyStatuses,
   readLines,
   showNotification,
   telegramCall,
@@ -133,7 +134,7 @@ if (isOn(cfg("SIDEBAR_TOKENS")) && !isCore()) {
 if (!broken.has("SHOW_AGENT_TOKENS")) {
   ok("SHOW_AGENT_TOKENS", cfg("SHOW_AGENT_TOKENS") ? `${cfg("SHOW_AGENT_TOKENS")} — agent metadata values, excluding telegram` : "off — no agent metadata line");
 }
-if (!broken.has("NOTIFY_STATUSES")) ok("statuses", `notifying on ${cfg("NOTIFY_STATUSES")}`);
+if (!broken.has("NOTIFY_STATUSES")) ok("statuses", `notifying on ${notifyStatuses(cfg).join(",")}`);
 for (const [key, what] of [
   ["NOTIFY_WORKSPACES", "only these workspaces send"],
   ["IGNORE_WORKSPACES", "these workspaces never send"],

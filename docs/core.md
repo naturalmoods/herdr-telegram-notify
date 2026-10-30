@@ -19,7 +19,9 @@ is closed or that computer is off, because herdr-core keeps running.
 
 It follows only this machine's terminals. Terminals on machines this core
 added (`box/t7`) belong to the daemon running there. Helpers an agent started
-with `hc run` (terminals with a parent) are left out.
+with `hc run` (terminals with a parent) are left out; instead they get one line
+in their parent's notification, naming the live ones and what they are doing:
+`🧩 2 helpers: sub-auth done, sub-docs working`.
 
 `CORE_MACHINES` in `.env` changes that: empty (the default) follows this
 machine only; a comma list of names as `hc machine ls` shows them (`box,vps`)
@@ -102,9 +104,10 @@ Claude agents in one folder keep their own transcript.
 
 - **Names.** Spaces and tabs come from the app's document on this core. A
   space nobody named is called after its repo, as in the app.
-- **Status.** herdr-core reports `error` as well. Add it to `NOTIFY_STATUSES`
-  to hear about it. A blocked agent that says why shows it:
-  `blocked (permission)`.
+- **Status.** herdr-core reports `error` as well, and it is heard by default:
+  without a `NOTIFY_STATUSES` of your own, `done,blocked,error` notify. A list
+  you write is used exactly as it stands. A blocked agent that says why shows
+  it: `blocked (permission)`.
 - **Where to find it.** The 🖥 line says `hc attach t3`, or `hc attach box/t7`
   for an agent on an added machine.
 - **Sessions.** herdr-core reports no agent session. With the
@@ -116,11 +119,13 @@ Claude agents in one folder keep their own transcript.
   `/clear` inside the same agent is not noticed.
 - **Transcripts.** Found where the agent keeps them: Claude Code by the
   folder or by the id the [hook](#claude-code-sessions) labels it with, Codex
-  by the folder its rollout names. Only files written since the terminal
-  started count. Two Claude agents in one folder share one transcript folder:
+  by the folder its rollout names, pi by the folder it slugs its cwd into
+  (`--home-x-api--` under `~/.pi/agent/sessions`, or `PI_CODING_AGENT_DIR`).
+  Only files written since the terminal started count. Two Claude agents in
+  one folder share one transcript folder:
   without the hook neither gets a transcript (no last message, duration or
   cost), rather than the wrong one; with it, each has its own id and its own
-  transcript. pi transcripts are not found yet.
+  transcript.
 - **/new** starts the program in a new tab of the space, from the space's
   folder. Only names in `CORE_AGENT_KINDS` are started. `@branch` makes a
   checkout under `~/.herdr/worktrees/<repo>/<branch>` and starts the agent
