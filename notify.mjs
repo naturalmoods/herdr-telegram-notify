@@ -1032,13 +1032,14 @@ async function main() {
     if (workspaceLabel) projectBits.push(String(workspaceLabel));
     if (cwd && String(workspaceLabel) !== String(cwd)) projectBits.push(tilde(cwd));
   }
-  if (isOn(cfg("SHOW_BRANCH")) && cwd) {
+  if (isOn(cfg("SHOW_BRANCH")) && cwd && !info.session?.machine) {
     const branch = gitBranch(cwd);
     if (branch) projectBits.splice(1, 0, branch);
   }
   const project = projectBits.length ? `📁 ${projectBits.join(" · ")}` : undefined;
 
-  const changed = isOn(cfg("SHOW_CHANGES")) && cwd ? workingTreeChanges(cwd) : undefined;
+  // On another machine the folder is not on this disk; hc runs git there.
+  const changed = isOn(cfg("SHOW_CHANGES")) && cwd ? workingTreeChanges(cwd, false, info.session?.machine) : undefined;
   const changes = changed ? `✎ ${changed}` : undefined;
 
   // One read of the transcript feeds the duration, the token counts and the

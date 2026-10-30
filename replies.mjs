@@ -9,7 +9,7 @@ import { mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSy
 import { basename, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { randomInt } from "node:crypto";
-import { coreAgent, createWorktree, freshSpaceId, freshTabId, hcRun, isCore } from "./core.mjs";
+import { coreAgent, coreMachines, createWorktree, freshSpaceId, freshTabId, hcRun, isCore, machineOf } from "./core.mjs";
 
 import {
   ATTACHMENT_MAX_BYTES,
@@ -190,7 +190,8 @@ async function sendFull(target, to) {
 
 async function sendDiff(paneId, cwd, to) {
   if (typeof cwd !== "string" || !cwd) return say(`✗ no working directory reported for ${paneId}.`, to);
-  const diff = await workingTreeDiff(cwd);
+  // A remote agent's folder is on its own machine; git runs there through hc.
+  const diff = await workingTreeDiff(cwd, isCore() ? machineOf(paneId) : undefined);
   if (diff.error) return say(`✗ ${paneId}: ${diff.error}`, to);
   if (!diff.summary && !diff.bytes) return say(`✎ no uncommitted changes in ${paneId}.`, to);
 
@@ -323,7 +324,7 @@ function herdrRun(args, timeout = 10_000) {
 function liveAgent(paneId) {
   let agent;
   if (isCore()) {
-    agent = coreAgent(paneId);
+    agent = coreAgent(paneId, coreMachines(cfg("CORE_MACHINES")));
   } else {
     const res = herdrRun(["agent", "get", paneId]);
     if (!res.ok) return undefined;
@@ -376,6 +377,11 @@ async function startAgent(args, reply, originalText) {
     return usage("Invalid kind: use 1–32 lowercase letters, digits, _ or -, starting with a letter.");
   }
   const label = clip(maskSecrets(workspace.label || workspace.workspace_id), HEAD_LINE_CHARS);
+  // /new makes a tab and a checkout on this machine; a remote space's belong to
+  // that machine's core.
+  if (isCore() && machineOf(workspace.workspace_id)) {
+    return say(`✗ ${label}: /new on another machine is not supported yet. Start it there from the app.`, reply);
+  }
   const allowed = listMatches(cfg("NOTIFY_WORKSPACES"), workspace.label, workspace.workspace_id);
   const ignored = listMatches(cfg("IGNORE_WORKSPACES"), workspace.label, workspace.workspace_id);
   if (allowed === false || ignored === true) {

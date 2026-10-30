@@ -151,13 +151,41 @@ function repoName(cwd) {
   return cwd ? basename(cwd) || cwd : undefined;
 }
 
+// ---------------------------------------------------------------- machines
+
+// A remote terminal's address carries its machine: `box/t7`.
+export function machineOf(address) {
+  const text = String(address ?? "");
+  const at = text.indexOf("/");
+  return at === -1 ? undefined : text.slice(0, at);
+}
+
+// CORE_MACHINES: which added machines this daemon also speaks for. Empty is
+// this machine only, `*` is every added machine, otherwise the names `hc
+// machine ls` prints. A machine that runs its own daemon on this bot stays out,
+// or every message comes twice.
+export function coreMachines(spec = "") {
+  const items = String(spec ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  return { all: items.includes("*"), names: new Set(items.filter((s) => s !== "*")) };
+}
+
+export function machineAllowed(machine, machines) {
+  return Boolean(machines?.all || machines?.names?.has(machine));
+}
+
+export function machineIncluded(address, machines) {
+  const machine = machineOf(address);
+  return !machine || machineAllowed(machine, machines);
+}
+
 // ------------------------------------------------------------------- agents
 
 // Agents are terminals whose program reports a status. Helpers an agent
 // started (`parent`) are its business, not the phone's, and another machine's
-// terminals belong to the notifier running there.
-export function isAgent(t) {
-  return Boolean(t && t.state === "live" && t.status?.state && !t.parent && !String(t.address).includes("/"));
+// terminals belong to the notifier running there unless CORE_MACHINES says
+// this daemon speaks for that machine too.
+export function isAgent(t, machines) {
+  return Boolean(t && t.state === "live" && t.status?.state && !t.parent && machineIncluded(t.address, machines));
 }
 
 const cwdOf = (t) => t.foreground?.cwd || t.cwd;
@@ -184,72 +212,95 @@ export function coreSession(t, terminals = []) {
   if (!pid) return undefined;
   const app = appOf(t);
   const cwd = cwdOf(t);
+  const machine = machineOf(t.address);
   const id = app.toLowerCase().includes("claude") ? labelledSession(t, pid) : undefined;
   // A real id names one conversation, so another agent in the folder cannot be
   // behind the transcript it finds; the shared check is only about guessing.
-  if (id) return { kind: "id", value: id, agent: app, cwd, since: t.created_ms };
+  if (id) return { kind: "id", value: id, agent: app, cwd, since: t.created_ms, ...(machine ? { machine } : {}) };
   // Two agents of one kind in one folder write to one transcript folder, and
   // the newest file there could be either's; no transcript beats the wrong one.
   const shared = terminals.some((o) => o.address !== t.address && isAgent(o) && appOf(o) === app && cwdOf(o) === cwd);
-  return { kind: "proc", value: `${t.address}:${pid}`, agent: app, cwd, since: t.created_ms, shared };
+  return { kind: "proc", value: `${t.address}:${pid}`, agent: app, cwd, since: t.created_ms, shared, ...(machine ? { machine } : {}) };
 }
 
 // The TUI's snapshot shape, which notify.mjs, replies.mjs and the board read.
-export function toSnapshot(terminals = [], doc = {}) {
-  const spaces = Array.isArray(doc.spaces) ? doc.spaces : [];
+// A remote terminal's space and tab ids are local to its machine, so they
+// carry the same `machine/` prefix as its address.
+export function toSnapshot(terminals = [], doc = {}, machines) {
   const live = terminals.filter((t) => t.state === "live");
   const panes = live
-    .filter((t) => !t.parent && !String(t.address).includes("/"))
-    .map((t) => ({
-      pane_id: t.address,
-      name: t.name ?? undefined,
-      workspace_id: t.labels?.["herdr.space"] || undefined,
-      tab_id: t.labels?.["herdr.tab"] || undefined,
-      cwd: cwdOf(t),
-      terminal_title_stripped: t.status?.title || t.title || undefined,
-      ...(t.status?.state
-        ? {
-            agent: appOf(t),
-            display_agent: appOf(t),
-            agent_status: t.status.state,
-            agent_kind: t.status.kind ?? undefined,
-            agent_session: coreSession(t, live),
-          }
-        : {}),
-    }));
+    .filter((t) => !t.parent && machineIncluded(t.address, machines))
+    .map((t) => {
+      const machine = machineOf(t.address);
+      const prefix = machine ? `${machine}/` : "";
+      return {
+        pane_id: t.address,
+        name: t.name ?? undefined,
+        workspace_id: t.labels?.["herdr.space"] ? `${prefix}${t.labels["herdr.space"]}` : undefined,
+        tab_id: t.labels?.["herdr.tab"] ? `${prefix}${t.labels["herdr.tab"]}` : undefined,
+        cwd: cwdOf(t),
+        terminal_title_stripped: t.status?.title || t.title || undefined,
+        ...(t.status?.state
+          ? {
+              agent: appOf(t),
+              display_agent: appOf(t),
+              agent_status: t.status.state,
+              agent_kind: t.status.kind ?? undefined,
+              agent_session: coreSession(t, live),
+            }
+          : {}),
+      };
+    });
   const agents = panes.filter((p) => p.agent_status);
 
+  // This machine's document, then each included machine's, all with the ids the
+  // app shows. A copy from before this setting has no `machines` at all.
+  const machineDocs = doc.machines && typeof doc.machines === "object" ? doc.machines : {};
+  const names = machines?.all ? Object.keys(machineDocs).sort() : [...(machines?.names ?? [])];
+  const docs = [{ prefix: "", doc }, ...names.map((name) => ({ prefix: `${name}/`, doc: machineDocs[name] ?? {} }))];
+
   const firstCwd = (spaceId) => panes.find((p) => p.workspace_id === spaceId)?.cwd;
-  const workspaces = spaces.map((s) => ({
-    workspace_id: s.id,
-    label: s.name || repoName(firstCwd(s.id) || s.folder) || s.id,
-    folder: s.folder || firstCwd(s.id),
-  }));
+  const workspaces = docs.flatMap(({ prefix, doc: d }) =>
+    (Array.isArray(d.spaces) ? d.spaces : []).map((s) => {
+      const id = `${prefix}${s.id}`;
+      return {
+        workspace_id: id,
+        label: s.name || repoName(firstCwd(id) || s.folder) || id,
+        folder: s.folder || firstCwd(id),
+      };
+    })
+  );
   // A labelled terminal whose space the copy of the document does not know yet.
   for (const id of new Set(panes.map((p) => p.workspace_id).filter(Boolean))) {
     if (!workspaces.some((w) => w.workspace_id === id)) {
       workspaces.push({ workspace_id: id, label: repoName(firstCwd(id)) || id, folder: firstCwd(id) });
     }
   }
-  const tabs = spaces.flatMap((s) =>
-    (Array.isArray(s.tabs) ? s.tabs : []).map((tab, i) => ({ tab_id: tab.id, workspace_id: s.id, label: tab.name || String(i + 1) }))
+  const tabs = docs.flatMap(({ prefix, doc: d }) =>
+    (Array.isArray(d.spaces) ? d.spaces : []).flatMap((s) =>
+      (Array.isArray(s.tabs) ? s.tabs : []).map((tab, i) => ({
+        tab_id: `${prefix}${tab.id}`,
+        workspace_id: `${prefix}${s.id}`,
+        label: tab.name || String(i + 1),
+      }))
+    )
   );
   return { workspaces, tabs, panes, agents };
 }
 
 // Undefined without the daemon's copy: a snapshot missing its spaces and its
 // statuses would say "no agents" with confidence.
-export function loadCoreSnapshot(stateDir = process.env.HERDR_PLUGIN_STATE_DIR) {
+export function loadCoreSnapshot(stateDir = process.env.HERDR_PLUGIN_STATE_DIR, machines) {
   const terminals = readTerminals(stateDir);
   if (!Array.isArray(terminals)) return undefined;
-  return toSnapshot(terminals, readSpaces(stateDir));
+  return toSnapshot(terminals, readSpaces(stateDir), machines);
 }
 
 // One terminal as `herdr agent get` would have described it.
-export function coreAgent(paneId) {
+export function coreAgent(paneId, machines) {
   const t = hcJson(["get", paneId]);
   if (!t?.address) return undefined;
-  return toSnapshot([t]).panes[0];
+  return toSnapshot([t], {}, machines).panes[0];
 }
 
 // ---------------------------------------------------------------- transcript
@@ -279,6 +330,25 @@ function firstLine(path, bytes = 64 * 1024) {
   } finally {
     if (fd !== undefined) closeSync(fd);
   }
+}
+
+// A remote agent's transcript is not on this disk, and the folder it keeps is
+// no help from here: only an id names one. The Claude Code hook labels remote
+// terminals too, so with it the file is found on that machine and read through
+// hc.
+export function remoteTranscript(session) {
+  if (session?.kind !== "id" || !session.machine) return undefined;
+  // The id is validated by coreSession(), so it is a file name and nothing else.
+  // The tail only, as readTail() takes locally: a long session outgrows what
+  // one hc call can carry whole.
+  const tail = hcRun(
+    [
+      "exec", "--on", session.machine, "sh", "-c",
+      `f=$(ls -t ~/.claude/projects/*/${session.value}.jsonl 2>/dev/null | head -1) && [ -n "$f" ] && tail -c 4194304 "$f"`,
+    ],
+    30_000
+  );
+  return tail.ok ? tail.out : undefined;
 }
 
 // Herdr TUI is told each agent's session; herdr-core is not, so the transcript
@@ -326,9 +396,9 @@ export function guessTranscript(session) {
 // What a change to one terminal means for the hooks: a new status, a terminal
 // that is gone, or nothing. `before` and `after` are whole records (undefined
 // when the terminal was not known, or is removed).
-export function transitions(before, after) {
-  const was = isAgent(before) ? before.status.state : undefined;
-  const now = isAgent(after) ? after.status.state : undefined;
+export function transitions(before, after, machines) {
+  const was = isAgent(before, machines) ? before.status.state : undefined;
+  const now = isAgent(after, machines) ? after.status.state : undefined;
   if (now && now !== was) return [{ type: "status", terminal: after }];
   // Gone: removed, finished (hc clears the status just before), or the agent
   // quit and left its shell. A terminal that was never one has nothing to close.
@@ -383,9 +453,11 @@ export function applyEvent(terminals, ev) {
 // What notify.mjs gets, in the shape Herdr TUI's hooks hand it.
 export function hookEvent(change) {
   const t = change.terminal;
+  const machine = machineOf(t.address);
+  const space = t.labels?.["herdr.space"];
   const data = {
     pane_id: t.address,
-    workspace_id: t.labels?.["herdr.space"] || undefined,
+    workspace_id: space ? `${machine ? `${machine}/` : ""}${space}` : undefined,
   };
   if (change.type === "closed") return { name: "pane.closed", json: { event: "pane_closed", data } };
   const state = t.status.state;

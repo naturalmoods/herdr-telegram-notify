@@ -18,6 +18,12 @@
 - The Herdr app shows the same 📨, 📱 and 🔕 badges in a band at the bottom of
   the window: `contrib/herdr-app/telegram` reads the labels the daemon sets on
   its terminals. See [docs/core.md](docs/core.md#sidebar).
+- `CORE_MACHINES` lets the daemon notify for agents on machines this core
+  added (`box/t7`) too: notifications, replies, `/stop`, `/screen`, `/diff` and
+  transcripts work as they do locally, and `/new` on one of their spaces is
+  refused for now. Empty by default, as before. Do not include a machine that
+  runs its own daemon on the same bot, or every message comes twice. See
+  [docs/core.md](docs/core.md#where-it-runs).
 
 ## 0.13.0
 

@@ -21,6 +21,14 @@ It follows only this machine's terminals. Terminals on machines this core
 added (`box/t7`) belong to the daemon running there. Helpers an agent started
 with `hc run` (terminals with a parent) are left out.
 
+`CORE_MACHINES` in `.env` changes that: empty (the default) follows this
+machine only; a comma list of names as `hc machine ls` shows them (`box,vps`)
+adds those machines; `*` includes every added machine. Their agents get the same
+notifications, replies and `/diff`, with space and tab names read from that
+machine's document, and `/new` on one of their spaces is refused for now. Do
+not include a machine that runs its own daemon on the same bot — every message
+would come twice.
+
 ## Setup
 
 Requirements: herdr-core, Node 18+, Linux or macOS, `flock` (util-linux).
@@ -97,7 +105,8 @@ Claude agents in one folder keep their own transcript.
 - **Status.** herdr-core reports `error` as well. Add it to `NOTIFY_STATUSES`
   to hear about it. A blocked agent that says why shows it:
   `blocked (permission)`.
-- **Where to find it.** The 🖥 line says `hc attach t3`.
+- **Where to find it.** The 🖥 line says `hc attach t3`, or `hc attach box/t7`
+  for an agent on an added machine.
 - **Sessions.** herdr-core reports no agent session. With the
   [Claude Code hook](#claude-code-sessions), Claude Code's own session id is
   the session: a `/clear` starts a new one, and a label left by an earlier

@@ -12,8 +12,8 @@ import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
-import { applyEvent, coreSession, guessTranscript, hookEvent, toSnapshot, transitions } from "../core.mjs";
-import { DEFAULTS, questionOnScreen, reportSidebarToken, transcriptPath } from "../lib.mjs";
+import { applyEvent, coreMachines, coreSession, guessTranscript, hookEvent, loadCoreSnapshot, remoteTranscript, toSnapshot, transitions } from "../core.mjs";
+import { DEFAULTS, questionOnScreen, readTurn, reportSidebarToken, transcriptPath, workingTreeChanges, workingTreeDiff } from "../lib.mjs";
 import { telegramEntries } from "../contrib/herdr-app/telegram/entries.js";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
@@ -68,6 +68,100 @@ test("toSnapshot names spaces and tabs the way the app does, and leaves helpers 
 test("a space the document does not know yet still has a name", () => {
   const snap = toSnapshot([agent("t1", "done", { labels: { "herdr.space": "s9" } })], {});
   assert.deepEqual(snap.workspaces, [{ workspace_id: "s9", label: "storefront", folder: "/work/storefront" }]);
+});
+
+test("CORE_MACHINES adds a machine's agents, with its own spaces and tabs and box/-prefixed ids", () => {
+  const doc = {
+    spaces: [{ id: "s1", name: "Storefront", folder: "/work/storefront", tabs: [{ id: "a", name: "login" }] }],
+    machines: { box: { spaces: [{ id: "s1", name: "Boxes", folder: "/srv/boxes", tabs: [{ id: "a", name: "deploy" }] }] } },
+  };
+  const list = [
+    agent("t1", "done", { labels: { "herdr.space": "s1", "herdr.tab": "a" } }),
+    agent("box/t7", "working", { cwd: "/srv/boxes", labels: { "herdr.space": "s1", "herdr.tab": "a" } }),
+    agent("vps/t8", "done", { cwd: "/srv/notes" }),
+    agent("vps/t9", "idle", { parent: "vps/t8" }),
+  ];
+  // Empty: this machine only, as before.
+  assert.deepEqual(toSnapshot(list, doc).agents.map((a) => a.pane_id), ["t1"]);
+  const scoped = toSnapshot(list, doc, coreMachines("box"));
+  assert.deepEqual(scoped.agents.map((a) => a.pane_id), ["t1", "box/t7"]);
+  assert.equal(scoped.agents[1].workspace_id, "box/s1");
+  assert.equal(scoped.agents[1].tab_id, "box/a");
+  assert.equal(scoped.workspaces.find((w) => w.workspace_id === "box/s1").label, "Boxes");
+  assert.equal(scoped.tabs.find((t) => t.tab_id === "box/a").label, "deploy");
+  // A helper stays out wherever it runs, and `*` adds every added machine.
+  assert.deepEqual(toSnapshot(list, doc, coreMachines("box")).agents.map((a) => a.pane_id), ["t1", "box/t7"]);
+  assert.deepEqual(toSnapshot(list, doc, coreMachines("*")).agents.map((a) => a.pane_id), ["t1", "box/t7", "vps/t8"]);
+  // transitions follows the same rule.
+  const before = agent("box/t7", "working");
+  const after = agent("box/t7", "done");
+  assert.deepEqual(transitions(before, after), []);
+  assert.deepEqual(transitions(before, after, coreMachines("box")).map((c) => c.type), ["status"]);
+  assert.deepEqual(transitions(before, after, coreMachines("*")).map((c) => c.type), ["status"]);
+});
+
+test("a state file written before CORE_MACHINES still loads", () => {
+  const fx = dirs();
+  writeFileSync(join(fx.stateDir, "core-terminals.json"), JSON.stringify({ terminals: [agent("t1", "done")] }));
+  writeFileSync(
+    join(fx.stateDir, "core-spaces.json"),
+    JSON.stringify({ spaces: [{ id: "s1", name: "Storefront", folder: "/work/storefront", tabs: [] }] })
+  );
+  const snap = loadCoreSnapshot(fx.stateDir);
+  assert.deepEqual(snap.agents.map((a) => a.pane_id), ["t1"]);
+  assert.equal(snap.workspaces[0].label, "Storefront");
+});
+
+test("a remote transcript is tailed through hc, and only an id session has one", async () => {
+  const fx = dirs();
+  const id = "aaaaaaaa-1111-2222-3333-444444444444";
+  const body = [
+    JSON.stringify({ type: "user", timestamp: "2026-09-22T10:00:00Z", message: { role: "user", content: "make the boxes roll" } }),
+    JSON.stringify({ type: "assistant", timestamp: "2026-09-22T10:01:00Z", message: { role: "assistant", content: [{ type: "text", text: "Boxes roll." }] } }),
+  ].join("\n") + "\n";
+  const hc = fakeHc(fx.root, { exec: [["ls -t", body]] });
+  await withCore(hc, fx, async () => {
+    const session = { kind: "id", value: id, agent: "claude", cwd: "/srv/boxes", since: 0, machine: "box" };
+    const transcript = transcriptPath(session);
+    assert.deepEqual(transcript, { text: body });
+    assert.deepEqual(hc.argv(), [
+      [
+        "exec", "--on", "box", "sh", "-c",
+        `f=$(ls -t ~/.claude/projects/*/${id}.jsonl 2>/dev/null | head -1) && [ -n "$f" ] && tail -c 4194304 "$f"`,
+      ],
+    ]);
+    const turn = readTurn(transcript);
+    assert.equal(turn.prompt, "make the boxes roll");
+    assert.equal(turn.text, "Boxes roll.");
+    assert.equal(turn.duration, 60_000);
+    // The program is not a session on another machine, and its folder is no help.
+    const proc = { kind: "proc", value: "box/t7:4242", agent: "claude", cwd: "/srv/boxes", since: 0, machine: "box" };
+    assert.equal(transcriptPath(proc), undefined);
+    assert.equal(remoteTranscript(proc), undefined);
+    assert.equal(hc.argv().length, 1, "no transcript, no hc call");
+  });
+});
+
+test("a remote agent's changes summary and diff run git on its machine through hc", async () => {
+  const fx = dirs();
+  const hc = fakeHc(fx.root, {
+    exec: [
+      ["--shortstat", " 2 files changed, 3 insertions(+)\n"],
+      ["ls-files", "new.txt\0"],
+      ["diff HEAD", "--- a\n+++ b\n"],
+      ["rev-parse", "abc123\n"],
+    ],
+  });
+  await withCore(hc, fx, async () => {
+    assert.equal(workingTreeChanges("/srv/boxes", false, "box"), "2 files · +3 −0 · 1 new");
+    const diff = await workingTreeDiff("/srv/boxes", "box");
+    assert.equal(diff.summary, "2 files · +3 −0 · 1 new: new.txt");
+    assert.equal(diff.text, "--- a\n+++ b\n");
+    const execs = hc.argv().filter((a) => a[0] === "exec");
+    assert.deepEqual(execs[0].slice(0, 5), ["exec", "--on", "box", "--cwd", "/srv/boxes"]);
+    assert.ok(execs.every((a) => a.includes("git")));
+    assert.ok(execs.some((a) => a.includes("diff") && a.includes("HEAD")));
+  });
 });
 
 test("the session is the program in the terminal, and two of a kind in one folder share no transcript", () => {
@@ -321,7 +415,7 @@ test("the app's band shows an agent's token and the mute once, and drops what ex
 // before anything changes), then the events it was given, and stays open.
 // `hc connect` answers doc.get. Every other call is logged as JSON argv and
 // answered from the records file, which a test can rewrite as things change.
-function fakeHc(dir, { terminals = [], events = [], doc = {}, screens = {} } = {}) {
+function fakeHc(dir, { terminals = [], events = [], doc = {}, docs = {}, screens = {}, exec = [] } = {}) {
   const records = join(dir, "records.json");
   writeFileSync(records, JSON.stringify(terminals));
   const path = join(dir, "hc");
@@ -331,8 +425,10 @@ const args = process.argv.slice(2);
 fs.appendFileSync(${JSON.stringify(join(dir, "hc-argv.jsonl"))}, JSON.stringify(args) + "\\n");
 const records = JSON.parse(fs.readFileSync(${JSON.stringify(records)}, "utf8"));
 const screens = ${JSON.stringify(screens)};
+const docs = ${JSON.stringify(docs)};
+const exec = ${JSON.stringify(exec)};
 const out = (v) => console.log(JSON.stringify(v));
-const target = args.filter((a) => /^t\\d+$/.test(a)).pop();
+const target = args.filter((a) => /(^|\\/)t\\d+$/.test(a)).pop();
 if (args[0] === "events") {
   out({ seq: 0, terminals: records });
   setTimeout(() => {
@@ -342,8 +438,13 @@ if (args[0] === "events") {
 } else if (args[0] === "connect") {
   process.stdin.once("data", (d) => {
     const req = JSON.parse(String(d).split("\\n")[0]);
-    out({ jsonrpc: "2.0", id: req.id, result: { value: ${JSON.stringify(doc)}, version: 1 } });
+    const value = req.params?.on ? (docs[req.params.on] ?? null) : ${JSON.stringify(doc)};
+    out({ jsonrpc: "2.0", id: req.id, result: { value, version: 1 } });
   });
+} else if (args[0] === "exec") {
+  const joined = args.join(" ");
+  const hit = exec.find(([needle]) => joined.includes(needle));
+  process.stdout.write(hit ? hit[1] : "");
 } else if (args[0] === "get") {
   const t = records.find((r) => r.address === target);
   if (!t) { console.error(JSON.stringify({ error: { kind: "not_found", message: "no terminal " + target } })); process.exit(3); }
@@ -769,6 +870,99 @@ test("an answer to a blocked agent's question is typed into it with a forced sen
       TELEGRAM_API_BASE: tg.base,
     }, { until: () => hc.argv().some((a) => a[0] === "send") });
     assert.deepEqual(hc.argv().find((a) => a[0] === "send"), ["send", "--force", "--", "t3", "2"]);
+  } finally {
+    tg.close();
+  }
+});
+
+test("the daemon follows a box agent only when CORE_MACHINES names that machine", async () => {
+  const setup = () => {
+    const fx = dirs();
+    const hc = fakeHc(fx.root, {
+      terminals: [agent("box/t7", "working", { cwd: "/srv/boxes", created_ms: 0, labels: { "herdr.space": "s1", "herdr.tab": "a" } })],
+      docs: { box: { spaces: [{ id: "s1", name: "Boxes", folder: "/srv/boxes", tabs: [{ id: "a", name: "deploy" }] }] } },
+      events: [
+        { type: "status", terminal: "box/t7", data: { status: { state: "done", app: "claude", title: "Fix the login" }, records: {}, reported: true } },
+      ],
+    });
+    const env = { HC_BIN_PATH: hc.path, HERDR_PLUGIN_STATE_DIR: fx.stateDir, HERDR_PLUGIN_CONFIG_DIR: fx.configDir, DRY_RUN: "1" };
+    return { fx, hc, env };
+  };
+
+  // Empty: this machine only, so the remote change is not news.
+  {
+    const { hc, env } = setup();
+    const child = spawn(process.execPath, [DAEMON], { env: { ...process.env, ...env } });
+    let out = "";
+    child.stdout.on("data", (d) => (out += d));
+    try {
+      await new Promise((r) => {
+        const poll = setInterval(() => out.includes("following hc events") && (clearInterval(poll), r()), 50);
+      });
+      await new Promise((r) => setTimeout(r, 1500));
+      assert.doesNotMatch(out, /--- plain-text fallback ---/);
+      assert.equal(hc.argv().filter((a) => a[0] === "label").length, 0);
+    } finally {
+      child.kill("SIGKILL");
+    }
+  }
+
+  // Named: its agent gets the message a local one gets, with box's own names.
+  {
+    const { fx, env } = setup();
+    const out = await run(DAEMON, [], { ...env, CORE_MACHINES: "box" }, { until: (o) => o.includes("--- plain-text fallback ---") });
+    assert.match(out, /claude · done/);
+    assert.match(out, /Boxes/);
+    assert.match(out, /tab deploy/);
+    assert.match(out, /hc attach box\/t7/);
+    const spaces = JSON.parse(readFileSync(join(fx.stateDir, "core-spaces.json"), "utf8"));
+    assert.equal(spaces.machines.box.spaces[0].name, "Boxes");
+  }
+});
+
+test("a reply to a remote agent goes to its box/t7 address through hc", async () => {
+  const fx = dirs(["REPLIES=1", "CORE_MACHINES=box"]);
+  const t7 = agent("box/t7", "working", { foreground: { pid: 4242, cwd: "/srv/boxes", name: "claude", argv: ["claude"] } });
+  const hc = fakeHc(fx.root, { terminals: [t7] });
+  writeFileSync(
+    join(fx.stateDir, "messages.jsonl"),
+    JSON.stringify({ id: 500, paneId: "box/t7", session: "proc:box/t7:4242", at: Date.now() }) + "\n"
+  );
+  const tg = await fakeTelegram([[{ update_id: 1, message: { message_id: 10, chat: { id: CHAT }, from: { id: 7 }, text: "carry on", reply_to_message: { message_id: 500 } } }]]);
+  try {
+    await run(REPLIES, [], {
+      HERDR_BACKEND: "core",
+      HC_BIN_PATH: hc.path,
+      HERDR_PLUGIN_STATE_DIR: fx.stateDir,
+      HERDR_PLUGIN_CONFIG_DIR: fx.configDir,
+      TELEGRAM_API_BASE: tg.base,
+    }, { until: () => hc.argv().some((a) => a[0] === "send") });
+    assert.deepEqual(hc.argv().find((a) => a[0] === "send"), ["send", "--", "box/t7", "carry on"]);
+  } finally {
+    tg.close();
+  }
+});
+
+test("/new on a space on another machine is refused, and starts nothing", async () => {
+  const fx = dirs(["REPLIES=1", "CORE_MACHINES=box"]);
+  writeFileSync(
+    join(fx.stateDir, "core-spaces.json"),
+    JSON.stringify({ spaces: [], machines: { box: { spaces: [{ id: "s1", name: "Boxes", folder: "/srv/boxes", tabs: [] }] } } })
+  );
+  writeFileSync(join(fx.stateDir, "core-terminals.json"), JSON.stringify({ terminals: [] }));
+  const hc = fakeHc(fx.root, { terminals: [] });
+  const update = { update_id: 1, message: { message_id: 10, chat: { id: CHAT }, from: { id: 7 }, text: "/new Boxes claude Review notes.md" } };
+  const tg = await fakeTelegram([[update]]);
+  try {
+    await run(REPLIES, [], {
+      HERDR_BACKEND: "core",
+      HC_BIN_PATH: hc.path,
+      HERDR_PLUGIN_STATE_DIR: fx.stateDir,
+      HERDR_PLUGIN_CONFIG_DIR: fx.configDir,
+      TELEGRAM_API_BASE: tg.base,
+    }, { until: () => tg.sent.length >= 1 });
+    assert.match(tg.sent[0].text, /^✗ Boxes: \/new on another machine is not supported yet/);
+    assert.equal(hc.argv().filter((a) => a[0] === "run").length, 0);
   } finally {
     tg.close();
   }
