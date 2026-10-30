@@ -24,6 +24,9 @@ import { createHash, randomUUID } from "node:crypto";
 import { execFile, spawn, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
 import { performance } from "node:perf_hooks";
+import { coreAgent, guessTranscript, hcJson, isCore, loadCoreSnapshot } from "./core.mjs";
+
+export { isCore };
 
 
 // Every key is overridable from the plugin config dir's .env (see .env.example).
@@ -65,6 +68,8 @@ export const DEFAULTS = {
   WHISPER_MODEL: "small",
   WHISPER_LANGUAGE: "",
   BOARD: "0",
+  // herdr-core only: the programs /new may start (it runs them by name).
+  CORE_AGENT_KINDS: "claude,codex,pi,opencode,gemini",
   DEBUG: "0",
   DRY_RUN: "0",
 };
@@ -151,7 +156,8 @@ export function loadConfig() {
 }
 
 // The statuses herdr reports, and so the only ones NOTIFY_STATUSES can name.
-export const STATUSES = ["done", "blocked", "working", "idle"];
+// `error` comes from herdr-core only.
+export const STATUSES = ["done", "blocked", "working", "idle", "error"];
 
 // A value the runtime cannot parse falls back to the default, silently — the
 // failure mode of `SWEEP_MINUTES=5min` is a sweeper that never runs and a config
@@ -428,6 +434,33 @@ export async function workingTreeDiff(cwd) {
   });
 }
 
+// One agent as it stands now, in `herdr agent get`'s shape, from whichever
+// runtime this runs under.
+export function liveAgentRecord(paneId) {
+  if (isCore()) return coreAgent(paneId);
+  try {
+    return JSON.parse(herdr(["agent", "get", paneId]))?.result?.agent;
+  } catch {
+    return undefined;
+  }
+}
+
+// The command that gets you to a pane, as the notification shows it.
+export function focusHint(paneId) {
+  return isCore() ? `hc attach ${paneId}` : `herdr agent focus ${paneId}`;
+}
+
+// A note in Herdr's own notification area. herdr-core draws nothing, so there
+// it is a line in the log, which is where a service's output goes anyway.
+export function showNotification(title, body) {
+  console.log(`herdr-telegram-notify: ${title}${body ? ` — ${body}` : ""}`);
+  if (isCore()) return;
+  spawnSync(herdrBin(), ["notification", "show", title, ...(body ? ["--body", body] : []), "--sound", "none"], {
+    encoding: "utf8",
+    timeout: 4000,
+  });
+}
+
 export function herdr(args, timeout = 4000) {
   const res = spawnSync(herdrBin(), args, {
     encoding: "utf8",
@@ -441,6 +474,7 @@ export function herdr(args, timeout = 4000) {
 // Every workspace, pane and agent herdr knows about. The notifier and the
 // poller's /status both need it, so it lives here rather than in either.
 export function loadSnapshot() {
+  if (isCore()) return loadCoreSnapshot();
   const out = herdr(["api", "snapshot"]);
   if (!out) return undefined;
   try {
@@ -468,6 +502,8 @@ export function sidebarSequence() {
 // Values are display-only. Never await this on a delivery path: a missing or
 // older Herdr must not hold up a notification, a reply or a mute confirmation.
 export async function reportSidebarToken(scope, id, value, { ttlMs, expiresAt, seq, cfg = loadConfig() } = {}) {
+  // herdr-core has no sidebar; the app draws its own from mods.
+  if (isCore()) return;
   if (!isOn(cfg("SIDEBAR_TOKENS")) || isOn(cfg("DRY_RUN")) || (scope === "pane" && !id)) return;
   // Capture the sequence before the snapshot or RPC can be delayed.
   const sequence = seq ?? sidebarSequence();
@@ -494,7 +530,7 @@ export async function reportSidebarToken(scope, id, value, { ttlMs, expiresAt, s
 
 // ------------------------------------------------ formatting the message
 
-const STATUS_EMOJI = { done: "✅", blocked: "⚠️", working: "⏳", idle: "💤" };
+const STATUS_EMOJI = { done: "✅", blocked: "⚠️", working: "⏳", idle: "💤", error: "❌" };
 
 export function statusEmoji(status) {
   return STATUS_EMOJI[status] ?? "🔔";
@@ -851,7 +887,9 @@ export function screenTail(paneId, maxLines) {
   // More rows than will be shown: finding the column boundary is a question
   // about the shape of the whole screen, and a handful of rows cannot answer it.
   const rows = Math.max(maxLines * 2, 24);
-  const out = herdr(["pane", "read", paneId, "--lines", String(rows), "--format", "text"]);
+  const out = isCore()
+    ? hcJson(["read", "--lines", String(rows), paneId])?.text
+    : herdr(["pane", "read", paneId, "--lines", String(rows), "--format", "text"]);
   if (!out) return undefined;
 
   // Escapes and box drawing go first and column positions are kept: a vertical
@@ -1437,7 +1475,12 @@ export function attachmentAllowed(name) {
 // wants a keystroke — `herdr agent prompt` refuses it outright with
 // agent_blocked — so the text is typed in and entered. Anything else takes it as
 // a new turn.
+//
+// herdr-core's send pastes and presses Enter in one call, and refuses a blocked
+// program unless forced: forcing it is the same typed-in answer.
 export function replyCommands(paneId, status, text) {
+  // `--`: a reply that starts with a dash is text, not an option.
+  if (isCore()) return [status === "blocked" ? ["send", "--force", "--", paneId, text] : ["send", "--", paneId, text]];
   if (status === "blocked") {
     return [
       ["pane", "send-text", paneId, text],
@@ -1486,7 +1529,7 @@ export function botCommand(text, botUsername) {
 // Most agents one answer names — past this it stops being something you read on
 // a phone, and the count says what was left out.
 const STATUS_AGENTS_MAX = 20;
-const STATUS_ORDER = ["blocked", "working", "done", "idle"];
+const STATUS_ORDER = ["blocked", "error", "working", "done", "idle"];
 
 // The herd on demand: what each agent is, where it is, what it is doing and the
 // pane to reach it in. Blocked first, because the reason to ask is usually
@@ -1528,6 +1571,7 @@ export function herdStatusText(snap, stateDir) {
 // Codex stores dated rollouts, so recent days are searched before old history.
 export function transcriptPath(session) {
   if (!session?.value) return undefined;
+  if (session.kind === "proc") return guessTranscript(session);
   if (session.kind === "path") return existsSync(session.value) ? session.value : undefined;
   if (session.kind !== "id") return undefined;
   if (session.agent === "codex") {

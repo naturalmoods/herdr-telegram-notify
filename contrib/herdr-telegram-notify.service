@@ -1,0 +1,19 @@
+# Telegram notifications for agents in herdr-core (the Herdr app).
+# See docs/core.md. Install as a user unit:
+#   cp contrib/herdr-telegram-notify.service ~/.config/systemd/user/
+#   systemctl --user enable --now herdr-telegram-notify
+
+[Unit]
+Description=Telegram notifications for herdr-core agents
+After=network-online.target
+
+[Service]
+# %h is your home folder. Point this at where you cloned the repo.
+ExecStart=/usr/bin/env node %h/.local/share/herdr-telegram-notify/daemon.mjs
+# A service does not get your shell's PATH: add where node and hc live.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -27,6 +27,12 @@ herdr plugin install naturalmoods/herdr-telegram-notify --yes
 
 For a local checkout, run `herdr plugin link .` instead.
 
+### The Herdr app (herdr-core)
+
+The app runs agents in herdr-core (`hc`), which has no plugin hooks. Run
+`daemon.mjs` as a service on the machine where the agents run instead; it
+follows `hc events` and sends the same messages. See [docs/core.md](docs/core.md).
+
 ## Setup
 
 1. Open [@BotFather](https://t.me/BotFather), send `/newbot`, and keep the token private.

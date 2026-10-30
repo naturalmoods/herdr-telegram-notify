@@ -5,18 +5,10 @@
 // how long — see .env.example. The bot's /mute command says a length instead and
 // writes the same file; see replies.mjs.
 
-import { spawnSync } from "node:child_process";
-
-import { MUTE_DEFAULT_MINUTES, clockTime, herdrBin, loadConfig, mutedUntil, reportSidebarToken, setMute, toInt } from "./lib.mjs";
+import { MUTE_DEFAULT_MINUTES, clockTime, loadConfig, mutedUntil, reportSidebarToken, setMute, showNotification, toInt } from "./lib.mjs";
 
 // An action fired from the UI needs its answer in the UI, not in a log file.
-function announce(title, body) {
-  console.log(`herdr-telegram-notify: ${title}${body ? ` — ${body}` : ""}`);
-  spawnSync(herdrBin(), ["notification", "show", title, ...(body ? ["--body", body] : []), "--sound", "none"], {
-    encoding: "utf8",
-    timeout: 4000,
-  });
-}
+const announce = showNotification;
 
 const config = loadConfig();
 const stateDir = process.env.HERDR_PLUGIN_STATE_DIR;

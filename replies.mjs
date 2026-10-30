@@ -9,6 +9,7 @@ import { mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSy
 import { basename, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { randomInt } from "node:crypto";
+import { coreAgent, freshTabId, hcRun, isCore } from "./core.mjs";
 
 import {
   ATTACHMENT_MAX_BYTES,
@@ -304,6 +305,7 @@ function why(res) {
 }
 
 function herdrRun(args, timeout = 10_000) {
+  if (isCore()) return hcRun(args, timeout);
   let res;
   try {
     res = spawnSync(herdrBin(), args, { encoding: "utf8", timeout, maxBuffer: 1024 * 1024 });
@@ -319,10 +321,19 @@ function herdrRun(args, timeout = 10_000) {
 // What is in that pane right now: the status decides how the reply is delivered,
 // the session decides whether it may be delivered at all.
 function liveAgent(paneId) {
-  const res = herdrRun(["agent", "get", paneId]);
-  if (!res.ok) return undefined;
+  let agent;
+  if (isCore()) {
+    agent = coreAgent(paneId);
+  } else {
+    const res = herdrRun(["agent", "get", paneId]);
+    if (!res.ok) return undefined;
+    try {
+      agent = JSON.parse(res.out).result?.agent;
+    } catch {
+      return undefined;
+    }
+  }
   try {
-    const agent = JSON.parse(res.out).result?.agent;
     return agent && {
       name: clip(String(firstDefined(agent.display_agent, agent.agent, "agent")), 24),
       status: agent.agent_status,
@@ -389,6 +400,7 @@ async function startAgent(args, reply, originalText) {
   do {
     name = `${kind.slice(0, 27)}-${randomInt(36 ** 4).toString(36).padStart(4, "0")}`;
   } while (names.has(name));
+  if (isCore()) return startCoreAgent({ workspace, branch, kind, name, prompt, label, destination }, reply);
   const created = branch === undefined
     ? herdrRun(["tab", "create", "--workspace", workspace.workspace_id, "--label", kind, "--no-focus"])
     : herdrRun(["worktree", "create", "--workspace", workspace.workspace_id, "--branch", branch, "--label", branch, "--no-focus"], 60_000);
@@ -417,6 +429,40 @@ async function startAgent(args, reply, originalText) {
 
   const prompted = prompt.trim() ? herdrRun(["agent", "prompt", paneId, prompt]) : undefined;
   if (prompted?.ok) void reportSidebarToken("pane", paneId, `📱 ${clockTime(new Date())}`, { ttlMs: SIDEBAR_PHONE_TTL_MS, cfg });
+  const live = liveAgent(paneId);
+  const text = maskSecrets(`▶ started ${kind} in ${destination} · ${paneId}${prompted && !prompted.ok ? `\n✗ prompt not delivered: ${prompted.why}` : ""}${!live?.session ? "\nReplies will work from its first notification." : ""}`);
+  const sent = await say(text, reply);
+  if (sent?.ok && live?.session) rememberMessage(stateDir, sent.result?.message_id, paneId, live.agentSession);
+}
+
+// /new under herdr-core: a terminal labelled with the space and a tab id the
+// app has not seen, which the app adopts as a new tab there. The program is
+// started bare and told the prompt once it says it is ready: a send to an agent
+// still booting can be dropped.
+async function startCoreAgent({ workspace, branch, kind, name, prompt, label, destination }, reply) {
+  if (branch !== undefined) {
+    return say(maskSecrets(`✗ ${destination}: worktrees are not started from the chat with herdr-core yet; use /new ${label} ${kind} without @branch.`), reply);
+  }
+  const kinds = String(cfg("CORE_AGENT_KINDS")).split(",").map((k) => k.trim()).filter(Boolean);
+  if (!kinds.includes(kind)) {
+    return say(`✗ ${kind} is not one of CORE_AGENT_KINDS (${kinds.join(", ") || "none"}).`, reply);
+  }
+  const args = ["run", "--bg", "--keep", "--no-parent", "--name", name,
+    "--label", `herdr.space=${workspace.workspace_id}`, "--label", `herdr.tab=${freshTabId()}`];
+  if (workspace.folder) args.push("--cwd", workspace.folder);
+  const started = herdrRun([...args, "--json", kind], 30_000);
+  let paneId;
+  try {
+    paneId = JSON.parse(started.out ?? "")?.address;
+  } catch {}
+  if (!started.ok || !paneId) return say(maskSecrets(`✗ ${label}: ${started.why ?? "hc did not say which terminal it started"}`), reply);
+
+  let prompted;
+  if (prompt.trim()) {
+    // Ready is the first status it reports; a timeout is only a check-in.
+    herdrRun(["wait", "--timeout", "60", paneId], 70_000);
+    prompted = herdrRun(["send", "--", paneId, prompt], 30_000);
+  }
   const live = liveAgent(paneId);
   const text = maskSecrets(`▶ started ${kind} in ${destination} · ${paneId}${prompted && !prompted.ok ? `\n✗ prompt not delivered: ${prompted.why}` : ""}${!live?.session ? "\nReplies will work from its first notification." : ""}`);
   const sent = await say(text, reply);
@@ -588,7 +634,7 @@ async function deliver(reply, { stop = false, screen = false, diff = false } = {
     if (!["working", "blocked"].includes(live.status)) {
       return say(`✗ not stopped — I cannot tell whether ${paneId} is working or blocked.`, reply);
     }
-    const args = ["agent", "send-keys", paneId, "esc"];
+    const args = isCore() ? ["interrupt", paneId] : ["agent", "send-keys", paneId, "esc"];
     const res = herdrRun(args);
     if (!res.ok) {
       console.error(`herdr-telegram-notify: ${args.join(" ")} failed: ${res.why}`);

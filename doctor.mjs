@@ -19,16 +19,20 @@ import {
   gitBin,
   herdr,
   herdrBin,
+  isCore,
+  loadSnapshot,
   whisperBin,
   isOn,
   loadConfig,
   mutedUntil,
   readLines,
+  showNotification,
   telegramCall,
   toInt,
 } from "./lib.mjs";
 
 import { hasSidebarToken, herdrConfigPath } from "./sidebar.mjs";
+import { hcBin, hcJson } from "./core.mjs";
 
 const results = [];
 const warn = (what, detail) => results.push({ ok: true, warning: true, what, detail });
@@ -40,6 +44,14 @@ const bad = (what, detail) => results.push({ ok: false, what, detail });
 const major = Number(process.versions.node.split(".")[0]);
 (major >= 18 ? ok : bad)("Node", `${process.version}${major >= 18 ? "" : " — 18 or newer is required"}`);
 
+if (isCore()) {
+  const status = hcJson(["server", "status"]);
+  if (status?.version) ok("herdr-core", `${hcBin()} ${status.version} answers, core ${status.core?.name ?? "?"}`);
+  else bad("herdr-core", `${hcBin()} did not answer — is the core running on this machine (hc server status)?`);
+  const snap = loadSnapshot();
+  if (snap) ok("daemon", `${snap.agents.length} agent(s) in the daemon's copy of the terminal list`);
+  else bad("daemon", "no terminal list in the state directory — is daemon.mjs running (systemctl --user status herdr-telegram-notify)?");
+} else {
 const snapshot = herdr(["api", "snapshot"]);
 if (snapshot) {
   let agents = "?";
@@ -49,6 +61,7 @@ if (snapshot) {
   ok("herdr", `${herdrBin()} answers, ${agents} agent(s) in the session`);
 } else {
   bad("herdr", `${herdrBin()} did not answer — the message loses its title, project and herd lines`);
+}
 }
 
 const gitVersion = spawnSync(gitBin(), ["--version"], { encoding: "utf8", timeout: 3000 });
@@ -110,7 +123,7 @@ if (!broken.has("MASK_SECRETS")) {
 if (!broken.has("SIDEBAR_TOKENS")) {
   ok("SIDEBAR_TOKENS", isOn(cfg("SIDEBAR_TOKENS")) ? "on — display-only $telegram sidebar tokens" : "off — no sidebar metadata is reported");
 }
-if (isOn(cfg("SIDEBAR_TOKENS"))) {
+if (isOn(cfg("SIDEBAR_TOKENS")) && !isCore()) {
   const path = herdrConfigPath();
   let configured = false;
   try { configured = hasSidebarToken(readFileSync(path, "utf8")); } catch {}
@@ -226,11 +239,7 @@ const problems = results.filter((r) => !r.ok);
 for (const r of results) console.log(`  ${r.warning ? "⚠" : r.ok ? "✓" : "✗"} ${r.what}: ${r.detail}`);
 const title = problems.length ? `🩺 ${problems.length} problem(s)` : "🩺 Telegram notify is healthy";
 const body = problems.length ? problems.map((p) => p.what).join(", ") : "test message sent";
-console.log(`herdr-telegram-notify: ${title} — ${body}`);
-spawnSync(herdrBin(), ["notification", "show", title, "--body", body, "--sound", "none"], {
-  encoding: "utf8",
-  timeout: 4000,
-});
+showNotification(title, body);
 // 2 says the config itself is wrong, which is the one outcome a caller can fix
 // without reading the report; 1 is everything else that failed.
 if (problems.length) process.exitCode = broken.size ? 2 : 1;
