@@ -8,6 +8,8 @@
   `/new` starts a labelled terminal the app adopts as a new tab. Run it as a
   service on the machine where the agents run. See [docs/core.md](docs/core.md).
   Herdr TUI is unchanged.
+- Under herdr-core, `/new <workspace>@<branch>` makes the app's checkout under
+  `~/.herdr/worktrees/<repo>/<branch>` and starts the agent there in a new space.
 - Claude Code can report its real session under herdr-core: add
   [`contrib/claude-session-hook.sh`](contrib/claude-session-hook.sh) to
   `SessionStart` in `~/.claude/settings.json`, and a `/clear` no longer breaks

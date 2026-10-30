@@ -113,8 +113,10 @@ Claude agents in one folder keep their own transcript.
   cost), rather than the wrong one; with it, each has its own id and its own
   transcript. pi transcripts are not found yet.
 - **/new** starts the program in a new tab of the space, from the space's
-  folder. Only names in `CORE_AGENT_KINDS` are started. `@branch` worktrees
-  are not supported yet.
+  folder. Only names in `CORE_AGENT_KINDS` are started. `@branch` makes a
+  checkout under `~/.herdr/worktrees/<repo>/<branch>` and starts the agent
+  there in a new space of its own, as the app's New worktree does: a branch
+  that exists is checked out, a new one starts from HEAD.
 - **/stop** uses `hc interrupt` (Esc for agents that report status).
 - **Mute.** `node daemon.mjs mute`, or `/mute` from the chat.
 

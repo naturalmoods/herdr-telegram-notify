@@ -411,3 +411,45 @@ export function hookEvent(change) {
 
 // A tab id the app has not seen: it adopts the terminal into a new tab there.
 export const freshTabId = () => `t${randomBytes(16).toString("hex")}`;
+
+// Likewise a space: a terminal labelled with it gets a space of its own.
+export const freshSpaceId = () => `sp${randomBytes(16).toString("hex")}`;
+
+// The app's New worktree: checkouts go to <home>/.herdr/worktrees/<repo>/
+// <branch, slashes as dashes>, so the app's spaces sidebar nests it under its
+// repo. The slug is the app's.
+const slug = (branch) => branch.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+
+// One git call. argv only: the branch is chat input and never reaches a shell.
+function gitRun(cwd, args, timeout = 60_000) {
+  let res;
+  try {
+    res = spawnSync("git", args, { cwd, encoding: "utf8", timeout, maxBuffer: 1024 * 1024 });
+  } catch (err) {
+    return { ok: false, why: err.message };
+  }
+  if (res.error) return { ok: false, why: res.error.message };
+  const out = (res.stdout ?? "").trim();
+  if (res.status !== 0) {
+    return { ok: false, why: (res.stderr || res.stdout || `git exited ${res.status}`).trim().slice(0, 300) };
+  }
+  return { ok: true, out };
+}
+
+// A checkout of a branch, as the app's New worktree makes it: from the space's
+// folder, in its repo. An existing branch is checked out, a new one starts from
+// HEAD. Returns the path, or why there is nothing to start in.
+export function createWorktree(folder, branch) {
+  const top = gitRun(folder, ["rev-parse", "--show-toplevel"]);
+  const common = gitRun(folder, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  if (!top.ok || !common.ok) return { ok: false, why: `${folder} is not in a git repository` };
+  // The main checkout is the common dir without its trailing /.git; the repo is
+  // named after it, as the app names it.
+  const main = common.out.endsWith("/.git") ? common.out.slice(0, -5) : common.out;
+  const path = join(homedir(), ".herdr", "worktrees", basename(main), slug(branch));
+  if (existsSync(path)) return { ok: false, why: `${path} is already there` };
+  const exists = gitRun(top.out, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`]).ok;
+  const added = gitRun(top.out, exists ? ["worktree", "add", path, branch] : ["worktree", "add", "-b", branch, path, "HEAD"]);
+  if (!added.ok) return { ok: false, why: added.why };
+  return { ok: true, path };
+}

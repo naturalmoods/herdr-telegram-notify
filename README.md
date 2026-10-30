@@ -115,7 +115,7 @@ also carry them as buttons.
 | `/stop` | Send Esc to a working or blocked agent, without quitting it. |
 | `/screen` | Read up to 40 cropped lines of the agent's current screen. |
 | `/diff` | Download staged and unstaged changes; list untracked names only. |
-| `/new <workspace>[@<branch>] <kind> [prompt]` | Start an agent in a background tab, or its own Git worktree (Herdr TUI only). |
+| `/new <workspace>[@<branch>] <kind> [prompt]` | Start an agent in a background tab, or its own Git worktree. |
 
 [Command details, safety checks and limits](docs/guide.md#commands).
 

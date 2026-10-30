@@ -6,9 +6,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, chmodSync, existsSync, utimesSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
@@ -377,6 +377,23 @@ if (args[0] === "events") {
   };
 }
 
+// A real repo in a temp dir, for the branch path: `/new` runs actual git.
+function git(cwd, ...args) {
+  const res = spawnSync("git", args, { cwd, encoding: "utf8" });
+  assert.equal(res.status, 0, `git ${args.join(" ")} in ${cwd}: ${res.stderr}`);
+  return res.stdout.trim();
+}
+
+function initRepo(dir) {
+  mkdirSync(dir, { recursive: true });
+  git(dir, "init", "-q");
+  git(dir, "config", "user.email", "test@example.com");
+  git(dir, "config", "user.name", "Test");
+  writeFileSync(join(dir, "README.md"), "storefront\n");
+  git(dir, "add", "README.md");
+  git(dir, "commit", "-q", "-m", "init");
+}
+
 function dirs(env = []) {
   const root = mkdtempSync(join(tmpdir(), "core-test-"));
   const stateDir = join(root, "state");
@@ -633,6 +650,91 @@ test("/new starts the agent in a new tab of that space, from its folder, and tel
     assert.equal(tg.sent[0].text, "▶ started claude in Storefront · t9");
     assert.match(tg.sent[1].text, /rm is not one of CORE_AGENT_KINDS/);
     assert.equal(argv.filter((a) => a[0] === "run").length, 1);
+  } finally {
+    tg.close();
+  }
+});
+
+test("/new with a branch makes the app's checkout under ~/.herdr/worktrees and starts the agent there in a new space", async () => {
+  const fx = dirs(["REPLIES=1"]);
+  const home = join(fx.root, "home");
+  mkdirSync(home);
+  const repo = join(fx.root, "storefront");
+  initRepo(repo);
+  git(repo, "branch", "release"); // a branch that already exists
+  writeFileSync(join(fx.stateDir, "core-spaces.json"), JSON.stringify({ spaces: [{ id: "s1", name: "Storefront", folder: repo, tabs: [] }] }));
+  writeFileSync(join(fx.stateDir, "core-terminals.json"), JSON.stringify({ terminals: [] }));
+  const hc = fakeHc(fx.root, { terminals: [agent("t9", "idle", { foreground: { pid: 9, cwd: repo, name: "claude", argv: ["claude"] } })] });
+  const update = (id, text) => ({ update_id: id, message: { message_id: id * 10, chat: { id: CHAT }, from: { id: 7 }, text } });
+  const tg = await fakeTelegram([[update(1, "/new storefront@feature/login claude Review notes.md"), update(2, "/new storefront@release claude")]]);
+  try {
+    await run(REPLIES, [], {
+      HOME: home,
+      HERDR_BACKEND: "core",
+      HC_BIN_PATH: hc.path,
+      HERDR_PLUGIN_STATE_DIR: fx.stateDir,
+      HERDR_PLUGIN_CONFIG_DIR: fx.configDir,
+      TELEGRAM_API_BASE: tg.base,
+    }, { until: () => tg.sent.length >= 2 });
+    const root = join(home, ".herdr", "worktrees", basename(repo));
+    const fresh = join(root, "feature-login");
+    const reused = join(root, "release");
+    // A new branch starts from HEAD; an existing one is checked out as it is.
+    assert.equal(git(fresh, "rev-parse", "--abbrev-ref", "HEAD"), "feature/login");
+    assert.equal(git(fresh, "rev-parse", "HEAD"), git(repo, "rev-parse", "HEAD"));
+    assert.equal(git(reused, "rev-parse", "--abbrev-ref", "HEAD"), "release");
+    const runs = hc.argv().filter((a) => a[0] === "run");
+    assert.equal(runs.length, 2);
+    assert.deepEqual(runs[0].slice(-4), ["--cwd", fresh, "--json", "claude"]);
+    assert.deepEqual(runs[1].slice(-4), ["--cwd", reused, "--json", "claude"]);
+    const spaces = runs.map((a) => a.find((v) => v.startsWith("herdr.space=")));
+    for (const run of runs) {
+      assert.match(run.find((v) => v.startsWith("herdr.space=")), /^herdr\.space=sp[0-9a-f]{32}$/);
+      assert.match(run.find((v) => v.startsWith("herdr.tab=")), /^herdr\.tab=t[0-9a-f]{32}$/);
+      assert.ok(!run.includes("herdr.space=s1"), "the checkout did not get a space of its own");
+    }
+    assert.notEqual(spaces[0], spaces[1], "both checkouts went into one space");
+    assert.deepEqual(hc.argv().find((a) => a[0] === "send"), ["send", "--", "t9", "Review notes.md"]);
+    assert.equal(tg.sent[0].text, "▶ started claude in Storefront@feature/login · t9");
+    assert.equal(tg.sent[1].text, "▶ started claude in Storefront@release · t9");
+  } finally {
+    tg.close();
+  }
+});
+
+test("/new with a branch starts nothing when the checkout cannot be made", async () => {
+  const fx = dirs(["REPLIES=1"]);
+  const home = join(fx.root, "home");
+  // Where that branch's checkout already is, empty or not.
+  mkdirSync(join(home, ".herdr", "worktrees", "storefront", "taken"), { recursive: true });
+  const repo = join(fx.root, "storefront");
+  initRepo(repo);
+  const notes = join(fx.root, "notes");
+  mkdirSync(notes);
+  writeFileSync(join(fx.stateDir, "core-spaces.json"), JSON.stringify({ spaces: [
+    { id: "s1", name: "Storefront", folder: repo, tabs: [] },
+    { id: "s2", name: "Notes", folder: notes, tabs: [] },
+  ] }));
+  writeFileSync(join(fx.stateDir, "core-terminals.json"), JSON.stringify({ terminals: [] }));
+  const hc = fakeHc(fx.root, { terminals: [] });
+  const update = (id, text) => ({ update_id: id, message: { message_id: id * 10, chat: { id: CHAT }, from: { id: 7 }, text } });
+  const tg = await fakeTelegram([[update(1, "/new storefront@taken claude"), update(2, "/new notes@main claude"), update(3, "/new storefront@reserved rm")]]);
+  try {
+    await run(REPLIES, [], {
+      HOME: home,
+      HERDR_BACKEND: "core",
+      HC_BIN_PATH: hc.path,
+      HERDR_PLUGIN_STATE_DIR: fx.stateDir,
+      HERDR_PLUGIN_CONFIG_DIR: fx.configDir,
+      TELEGRAM_API_BASE: tg.base,
+    }, { until: () => tg.sent.length >= 3 });
+    assert.match(tg.sent[0].text, /^✗ Storefront@taken: .*already there/);
+    assert.match(tg.sent[1].text, /^✗ Notes@main: .*not in a git repository/);
+    assert.match(tg.sent[2].text, /rm is not one of CORE_AGENT_KINDS/);
+    // The kind is checked before the checkout, and the other two made none.
+    assert.equal(existsSync(join(home, ".herdr", "worktrees", "storefront", "reserved")), false);
+    assert.equal(git(repo, "worktree", "list", "--porcelain").split("\n\n").length, 1);
+    assert.equal(hc.argv().filter((a) => a[0] === "run").length, 0);
   } finally {
     tg.close();
   }

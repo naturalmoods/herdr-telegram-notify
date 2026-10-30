@@ -9,7 +9,7 @@ import { mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSy
 import { basename, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { randomInt } from "node:crypto";
-import { coreAgent, freshTabId, hcRun, isCore } from "./core.mjs";
+import { coreAgent, createWorktree, freshSpaceId, freshTabId, hcRun, isCore } from "./core.mjs";
 
 import {
   ATTACHMENT_MAX_BYTES,
@@ -435,27 +435,45 @@ async function startAgent(args, reply, originalText) {
   if (sent?.ok && live?.session) rememberMessage(stateDir, sent.result?.message_id, paneId, live.agentSession);
 }
 
-// /new under herdr-core: a terminal labelled with the space and a tab id the
-// app has not seen, which the app adopts as a new tab there. The program is
-// started bare and told the prompt once it says it is ready: a send to an agent
-// still booting can be dropped.
+// /new under herdr-core: a terminal labelled with a space and a tab id the app
+// has not seen, which the app adopts as a new tab there. With a branch the
+// terminal is in a checkout under ~/.herdr/worktrees, in a fresh space the app
+// nests under its repo, as the app's New worktree does. The program is started
+// bare and told the prompt once it says it is ready: a send to an agent still
+// booting can be dropped.
 async function startCoreAgent({ workspace, branch, kind, name, prompt, label, destination }, reply) {
-  if (branch !== undefined) {
-    return say(maskSecrets(`✗ ${destination}: worktrees are not started from the chat with herdr-core yet; use /new ${label} ${kind} without @branch.`), reply);
-  }
   const kinds = String(cfg("CORE_AGENT_KINDS")).split(",").map((k) => k.trim()).filter(Boolean);
   if (!kinds.includes(kind)) {
     return say(`✗ ${kind} is not one of CORE_AGENT_KINDS (${kinds.join(", ") || "none"}).`, reply);
   }
+  // The checkout is made before the terminal, so a branch that cannot be one
+  // starts nothing. It is also the one thing a failed start leaves behind.
+  let cwd = workspace.folder;
+  let checkout;
+  if (branch !== undefined) {
+    if (!cwd) return say(maskSecrets(`✗ ${destination}: the space has no folder to find its repo in.`), reply);
+    checkout = createWorktree(cwd, branch);
+    if (!checkout.ok) return say(maskSecrets(`✗ ${destination}: ${checkout.why}`), reply);
+    cwd = checkout.path;
+  }
+  const spaceId = branch === undefined ? workspace.workspace_id : freshSpaceId();
   const args = ["run", "--bg", "--keep", "--no-parent", "--name", name,
-    "--label", `herdr.space=${workspace.workspace_id}`, "--label", `herdr.tab=${freshTabId()}`];
-  if (workspace.folder) args.push("--cwd", workspace.folder);
+    "--label", `herdr.space=${spaceId}`, "--label", `herdr.tab=${freshTabId()}`];
+  if (cwd) args.push("--cwd", cwd);
   const started = herdrRun([...args, "--json", kind], 30_000);
   let paneId;
   try {
     paneId = JSON.parse(started.out ?? "")?.address;
   } catch {}
-  if (!started.ok || !paneId) return say(maskSecrets(`✗ ${label}: ${started.why ?? "hc did not say which terminal it started"}`), reply);
+  if (!started.ok || !paneId) {
+    const why = started.why ?? "hc did not say which terminal it started";
+    // A checkout is not an empty tab: leave it for the user, as the TUI path
+    // leaves a worktree workspace.
+    if (checkout) {
+      return say(maskSecrets(`✗ ${destination}: ${why}\nLeft the checkout at ${checkout.path}.\nRemove it with: git worktree remove ${checkout.path}`), reply);
+    }
+    return say(maskSecrets(`✗ ${label}: ${why}`), reply);
+  }
 
   let prompted;
   if (prompt.trim()) {
