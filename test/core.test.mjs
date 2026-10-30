@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 import { applyEvent, coreSession, guessTranscript, hookEvent, toSnapshot, transitions } from "../core.mjs";
-import { questionOnScreen } from "../lib.mjs";
+import { questionOnScreen, transcriptPath } from "../lib.mjs";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 const DAEMON = join(HERE, "..", "daemon.mjs");
@@ -78,6 +78,54 @@ test("the session is the program in the terminal, and two of a kind in one folde
   assert.equal(coreSession({ ...a, foreground: { pid: 9, cwd: a.cwd } }).value, "t1:9");
 });
 
+test("a Claude label from this process is the session, one from an earlier process is not", () => {
+  const id = "aaaaaaaa-1111-2222-3333-444444444444";
+  const t = agent("t1", "done", { pid: 100, labels: { "claude.session": `100:${id}` } });
+  assert.deepEqual(coreSession(t, [t]), { kind: "id", value: id, agent: "claude", cwd: "/work/storefront", since: 1000 });
+  // The label is read against the program in the pane now, so a leftover from
+  // the one before it falls back to the proc session.
+  const stale = { ...t, labels: { "claude.session": `999:${id}` } };
+  assert.deepEqual(coreSession(stale, [stale]), {
+    kind: "proc",
+    value: "t1:100",
+    agent: "claude",
+    cwd: "/work/storefront",
+    since: 1000,
+    shared: false,
+  });
+  // Only Claude Code sets it; another agent's terminal keeps its proc session.
+  const codex = { ...agent("t2", "done"), status: { state: "done", app: "codex" }, labels: { "claude.session": "100:" + id } };
+  assert.equal(coreSession(codex, [codex]).kind, "proc");
+  // An id that is not a session id is not a transcript file name either.
+  const odd = { ...t, labels: { "claude.session": "100:../../etc/passwd" } };
+  assert.equal(coreSession(odd, [odd]).kind, "proc");
+});
+
+test("two Claude agents in one folder keep their own transcript when each is labelled", () => {
+  const root = mkdtempSync(join(tmpdir(), "core-labelled-"));
+  const dir = join(root, "projects", "-work-storefront");
+  mkdirSync(dir, { recursive: true });
+  const first = join(dir, "aaaaaaaa-1111-2222-3333-444444444444.jsonl");
+  const second = join(dir, "bbbbbbbb-5555-6666-7777-888888888888.jsonl");
+  writeFileSync(first, "{}\n");
+  writeFileSync(second, "{}\n");
+  const a = agent("t1", "done", { foreground: { pid: 70, cwd: "/work/storefront" }, labels: { "claude.session": "70:aaaaaaaa-1111-2222-3333-444444444444" } });
+  const b = agent("t2", "idle", { foreground: { pid: 80, cwd: "/work/storefront" }, labels: { "claude.session": "80:bbbbbbbb-5555-6666-7777-888888888888" } });
+  const saved = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CLAUDE_CONFIG_DIR = root;
+  try {
+    assert.equal(coreSession(a, [a, b]).shared, undefined, "a real id is not ambiguous");
+    assert.equal(transcriptPath(coreSession(a, [a, b])), first);
+    assert.equal(transcriptPath(coreSession(b, [a, b])), second);
+    // Unlabelled, the pair is ambiguous and gets no transcript rather than the wrong one.
+    const plain = [a, b].map((t) => ({ ...t, labels: {} }));
+    assert.equal(transcriptPath(coreSession(plain[0], plain)), undefined);
+  } finally {
+    if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = saved;
+  }
+});
+
 test("events become one hook per status change and one closure, whichever way the terminal goes", () => {
   const map = new Map();
   const hooks = [];
@@ -105,6 +153,12 @@ test("events become one hook per status change and one closure, whichever way th
   apply({ type: "created", terminal: "t2", data: agent("t2", "blocked") });
   apply({ type: "removed", terminal: "t2", data: {} });
   assert.deepEqual(hooks.slice(3), ["status:blocked", "closed"]);
+
+  // The Claude session hook labels the terminal; a label is not a status change.
+  apply({ type: "created", terminal: "t3", data: agent("t3", "working") });
+  apply({ type: "labels", terminal: "t3", data: { labels: { "claude.session": "9:aaaaaaaa-1111" } } });
+  assert.equal(map.get("t3").labels["claude.session"], "9:aaaaaaaa-1111");
+  assert.deepEqual(hooks.slice(5), ["status:working"]);
 });
 
 test("a hook gets the TUI's event shape, with the blocked kind as its label", () => {
@@ -165,6 +219,67 @@ test("guessTranscript finds a Codex rollout by the folder it names", () => {
     if (saved === undefined) delete process.env.CODEX_HOME;
     else process.env.CODEX_HOME = saved;
   }
+});
+
+test("the session hook labels this terminal, and stays quiet otherwise", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "core-hook-"));
+  const fake = join(dir, "hc");
+  writeFileSync(
+    fake,
+    `#!${process.execPath}
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(join(dir, "hc-argv.jsonl"))}, JSON.stringify(args) + "\\n");
+if (args[0] === "get") console.log(JSON.stringify({ address: args[1], foreground: { pid: Number(process.env.FAKE_FOREGROUND_PID) } }));
+else console.log("{}");
+`
+  );
+  chmodSync(fake, 0o755);
+  const hook = join(HERE, "..", "contrib", "claude-session-hook.sh");
+  const id = "aaaaaaaa-1111-2222-3333-444444444444";
+  const base = {
+    ...process.env,
+    PATH: `${dir}:${process.env.PATH}`,
+    HC_TERMINAL_ID: "t3",
+    // The test process started the hook, so it is the program in the pane.
+    FAKE_FOREGROUND_PID: String(process.pid),
+  };
+  const runHook = (env) =>
+    new Promise((resolve) => {
+      const child = spawn(hook, [], { env });
+      let out = "";
+      child.stdout.on("data", (d) => (out += d));
+      child.on("close", (code) => resolve({ code, out }));
+      child.stdin.end(JSON.stringify({ session_id: id, transcript_path: "/work/storefront/x.jsonl", source: "clear" }));
+    });
+  const argv = () =>
+    existsSync(join(dir, "hc-argv.jsonl"))
+      ? readFileSync(join(dir, "hc-argv.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l))
+      : [];
+
+  const labelled = await runHook(base);
+  assert.equal(labelled.code, 0);
+  assert.equal(labelled.out, "", "the hook prints nothing on stdout");
+  assert.deepEqual(argv(), [
+    ["get", "t3", "--json"],
+    ["label", "t3", `claude.session=${process.pid}:${id}`],
+  ]);
+
+  // The foreground pid is not this hook's ancestor: another program's session.
+  const before = argv().length;
+  const stale = await runHook({ ...base, FAKE_FOREGROUND_PID: "1" });
+  assert.equal(stale.code, 0);
+  assert.equal(stale.out, "");
+  assert.deepEqual(argv().slice(before), [["get", "t3", "--json"]]);
+
+  // Outside an hc terminal there is nothing to label, and nothing to say.
+  const outside = { ...base };
+  delete outside.HC_TERMINAL_ID;
+  const beforeOutside = argv().length;
+  const quiet = await runHook(outside);
+  assert.equal(quiet.code, 0);
+  assert.equal(quiet.out, "");
+  assert.equal(argv().length, beforeOutside, "no hc call without HC_TERMINAL_ID");
 });
 
 // --------------------------------------------------------------- fakes

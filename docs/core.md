@@ -55,6 +55,33 @@ To keep it running after you log out: `loginctl enable-linger $USER`.
 Edit the unit if `node` or `hc` is not on the service's PATH, or set
 `HC_BIN_PATH` there.
 
+### Claude Code sessions
+
+herdr-core reports no agent session, so the daemon can only take the program in
+the terminal for the session. Claude Code can tell it the real one: add
+`contrib/claude-session-hook.sh` to `SessionStart` in `~/.claude/settings.json`,
+merging it into what is already there.
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          { "type": "command", "command": "~/.local/share/herdr-telegram-notify/contrib/claude-session-hook.sh" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The hook labels the terminal `claude.session=<pid>:<session id>` and does
+nothing without `HC_TERMINAL_ID` or `hc`, so it is harmless under Herdr TUI.
+With the label, replies stay with the conversation across `/clear`, and two
+Claude agents in one folder keep their own transcript.
+
 ## Directories
 
 | What | Default | Override |
@@ -71,15 +98,20 @@ Edit the unit if `node` or `hc` is not on the service's PATH, or set
   to hear about it. A blocked agent that says why shows it:
   `blocked (permission)`.
 - **Where to find it.** The 🖥 line says `hc attach t3`.
-- **Sessions.** herdr-core reports no agent session. The program running in
-  the terminal is the session: a reply goes to the agent the notification was
-  about, and is refused once that program has quit and another started. A
+- **Sessions.** herdr-core reports no agent session. With the
+  [Claude Code hook](#claude-code-sessions), Claude Code's own session id is
+  the session: a `/clear` starts a new one, and a label left by an earlier
+  program in the pane is ignored. Without the hook, the program running in the
+  terminal is the session: a reply goes to the agent the notification was
+  about, and is refused once that program has quit and another started, but a
   `/clear` inside the same agent is not noticed.
 - **Transcripts.** Found where the agent keeps them: Claude Code by the
-  folder, Codex by the folder its rollout names. Only files written since the
-  terminal started count. When two agents of one kind share a folder, neither
-  gets a transcript (no last message, duration or cost), rather than the
-  wrong one. pi transcripts are not found yet.
+  folder or by the id the [hook](#claude-code-sessions) labels it with, Codex
+  by the folder its rollout names. Only files written since the terminal
+  started count. Two Claude agents in one folder share one transcript folder:
+  without the hook neither gets a transcript (no last message, duration or
+  cost), rather than the wrong one; with it, each has its own id and its own
+  transcript. pi transcripts are not found yet.
 - **/new** starts the program in a new tab of the space, from the space's
   folder. Only names in `CORE_AGENT_KINDS` are started. `@branch` worktrees
   are not supported yet.

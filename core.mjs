@@ -163,15 +163,31 @@ export function isAgent(t) {
 const cwdOf = (t) => t.foreground?.cwd || t.cwd;
 const appOf = (t) => t.status?.app || t.foreground?.name || basename(String(t.argv?.[0] ?? "")) || "agent";
 
-// Which agent session is in the terminal now. hc reports no session id, so the
-// program is the session: the foreground process, in this terminal. A pane
-// that outlives its agent (quit, started again) gets a new pid and so a new
-// session, which is what keeps a reply out of a conversation it was not about.
+// The Claude Code session contrib/claude-session-hook.sh announced, if it is
+// this process's: the label carries the foreground pid it was set for, so one
+// left behind by a previous program in the pane cannot claim the next one.
+function labelledSession(t, pid) {
+  const [labelPid, id] = String(t.labels?.["claude.session"] ?? "").split(":");
+  if (!id || Number(labelPid) !== Number(pid)) return undefined;
+  return /^[A-Za-z0-9-]+$/.test(id) ? id : undefined;
+}
+
+// Which agent session is in the terminal now. Claude Code labels its terminal
+// with its own session id (see contrib/claude-session-hook.sh), so the session is
+// the real one: a /clear brings a new id, and it is not guessed from the folder.
+// hc reports no session id for anything else, so the program is the session: the
+// foreground process, in this terminal. A pane that outlives its agent (quit,
+// started again) gets a new pid and so a new session, which is what keeps a reply
+// out of a conversation it was not about.
 export function coreSession(t, terminals = []) {
   const pid = t.foreground?.pid ?? t.pid;
   if (!pid) return undefined;
   const app = appOf(t);
   const cwd = cwdOf(t);
+  const id = app.toLowerCase().includes("claude") ? labelledSession(t, pid) : undefined;
+  // A real id names one conversation, so another agent in the folder cannot be
+  // behind the transcript it finds; the shared check is only about guessing.
+  if (id) return { kind: "id", value: id, agent: app, cwd, since: t.created_ms };
   // Two agents of one kind in one folder write to one transcript folder, and
   // the newest file there could be either's; no transcript beats the wrong one.
   const shared = terminals.some((o) => o.address !== t.address && isAgent(o) && appOf(o) === app && cwdOf(o) === cwd);
