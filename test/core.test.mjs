@@ -90,6 +90,10 @@ test("events become one hook per status change and one closure, whichever way th
   apply({ type: "title", terminal: "t1", data: { title: "x" } });
   apply({ type: "status", terminal: "t1", data: { status: { state: "working", app: "claude", msg: "still" }, records: {}, reported: true } });
   apply({ type: "status", terminal: "t1", data: { status: { state: "done", app: "claude" }, records: {}, reported: true } });
+  // The turn's `state` is the word it ended on; the terminal stays live.
+  apply({ type: "turn", terminal: "t1", data: { turn: 1, state: "done" } });
+  assert.equal(map.get("t1").state, "live");
+  assert.equal(map.get("t1").turn, 1);
   // hc clears the status just before it says the program finished.
   apply({ type: "status", terminal: "t1", data: { status: null, records: {}, reported: true } });
   apply({ type: "finished", terminal: "t1", data: { reason: "exited", exit_code: 0, signal: null, finished_ms: 5 } });

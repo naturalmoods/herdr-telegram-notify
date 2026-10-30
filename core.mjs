@@ -351,8 +351,12 @@ export function applyEvent(terminals, ev) {
     case "foreground":
       if (after) after.foreground = data ?? null;
       break;
+    case "turn":
+      // Its `state` is the word the turn ended on, not the terminal's state.
+      if (after) after.turn = data.turn;
+      break;
     default:
-      // turn, title, keep, size: the field of the same name.
+      // title, keep, size: the field of the same name.
       if (after) Object.assign(after, data);
   }
   if (after) terminals.set(id, after);
