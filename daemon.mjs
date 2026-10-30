@@ -43,10 +43,14 @@ function runHook(args, env = {}) {
   child.on("error", (err) => console.error(`herdr-telegram-notify: could not start notify.mjs: ${err.message}`));
 }
 
+// The space names a hook reads, once a fresh connection has read them: until
+// then the copy can be missing or stale, and the first messages would say so.
+let names = Promise.resolve();
+
 function fire(change) {
   const { name, json } = hookEvent(change);
   if (debug) log(`${change.terminal.address}: ${name} ${json.data.agent_status ?? ""}`.trim());
-  runHook([], { HERDR_PLUGIN_EVENT: name, HERDR_PLUGIN_EVENT_JSON: JSON.stringify(json) });
+  void names.then(() => runHook([], { HERDR_PLUGIN_EVENT: name, HERDR_PLUGIN_EVENT_JSON: JSON.stringify(json) }));
 }
 
 // Space and tab names live in the app's document of each watched machine. The
@@ -98,6 +102,15 @@ function adopt(list, announce) {
   for (const change of changes) fire(change);
 }
 
+// A fresh list, and the space names read after it (`*` finds its machines in
+// the list): the hooks its changes start wait for those names.
+function adoptNamed(list, announce) {
+  let read;
+  names = new Promise((resolve) => (read = resolve));
+  adopt(list, announce);
+  void refreshSpaces().then(read);
+}
+
 // Before any hook starts, so the one it starts reads the change that started it.
 function save() {
   try {
@@ -127,16 +140,14 @@ function follow() {
       if (first) {
         // The subscribe answer: {seq, terminals}.
         first = false;
-        adopt(msg.terminals, known);
+        adoptNamed(msg.terminals, known);
         known = true;
         log(`following hc events (${terminals.size} terminal${terminals.size === 1 ? "" : "s"})`);
-        void refreshSpaces();
         return;
       }
       const p = msg.params ?? {};
       if (msg.method === "missed") {
-        adopt(p.terminals, true);
-        void refreshSpaces();
+        adoptNamed(p.terminals, true);
       } else if (msg.method === "event" && p.type === "doc") {
         if (p.data?.name === "herdr-app") {
           if (!p.machine) void refreshSpaces();
