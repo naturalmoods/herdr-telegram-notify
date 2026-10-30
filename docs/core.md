@@ -143,8 +143,23 @@ cp -r ~/.local/share/herdr-telegram-notify/contrib/herdr-app/telegram ~/.config/
 herdr-app check ~/.config/herdr-app/mods/telegram
 ```
 
-The app docks a new mod where its `mod.json` says: bottom, 28 px. A click on
-an agent's entry focuses its terminal.
+The shipped layouts are read-only, so the app does not dock the band into
+them. `herdr-app do mod.open --name telegram` shows it once; to keep it, clone
+the layout and add a 28 px block for the mod above the status bar, in the
+`work` column of `main`:
+
+```sh
+herdr-app do layout.clone --name main --as main-telegram
+```
+
+```json
+{ "id": "telegram", "type": "block", "size": { "px": 28 }, "content": { "mod": "telegram" } }
+```
+
+Put that object into `~/.config/herdr-app/layouts/main-telegram.json`, in the
+`children` of the block with `"id": "work"`, before the one with
+`"id": "status"`. Layouts reload when saved. A click on an agent's entry focuses
+its terminal.
 
 The labels are `telegram` and `telegram.expires` (epoch ms) on a pane, and
 `telegram.mute` and `telegram.mute.expires` on every agent while muted;
