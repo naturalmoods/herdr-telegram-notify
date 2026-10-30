@@ -13,6 +13,9 @@
   `SessionStart` in `~/.claude/settings.json`, and a `/clear` no longer breaks
   replies and two Claude agents in one folder keep their own transcript. See
   [docs/core.md](docs/core.md#claude-code-sessions).
+- The Herdr app shows the same 📨, 📱 and 🔕 badges in a band at the bottom of
+  the window: `contrib/herdr-app/telegram` reads the labels the daemon sets on
+  its terminals. See [docs/core.md](docs/core.md#sidebar).
 
 ## 0.13.0
 

@@ -121,9 +121,12 @@ also carry them as buttons.
 
 ## Sidebar
 
-Herdr TUI only. Run `herdr plugin action invoke sidebar --plugin naturalmoods.herdr-telegram-notify`.
+Herdr TUI: run `herdr plugin action invoke sidebar --plugin naturalmoods.herdr-telegram-notify`.
 Then reload config from the Herdr menu (or your `reload_config` key).
 Over SSH, run it where the Herdr window runs: the layout belongs to the **client machine's config**, not the server's. [Details](docs/guide.md#sidebar-tokens).
+
+In the Herdr app, a mod draws the same badges in a band at the bottom of the
+window instead: [install it](docs/core.md#sidebar).
 
 ## Upgrading
 

@@ -24,7 +24,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { execFile, spawn, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
 import { performance } from "node:perf_hooks";
-import { coreAgent, guessTranscript, hcJson, isCore, loadCoreSnapshot } from "./core.mjs";
+import { coreAgent, guessTranscript, hcJson, hcRun, isCore, loadCoreSnapshot } from "./core.mjs";
 
 export { isCore };
 
@@ -502,9 +502,34 @@ export function sidebarSequence() {
 // Values are display-only. Never await this on a delivery path: a missing or
 // older Herdr must not hold up a notification, a reply or a mute confirmation.
 export async function reportSidebarToken(scope, id, value, { ttlMs, expiresAt, seq, cfg = loadConfig() } = {}) {
-  // herdr-core has no sidebar; the app draws its own from mods.
-  if (isCore()) return;
   if (!isOn(cfg("SIDEBAR_TOKENS")) || isOn(cfg("DRY_RUN")) || (scope === "pane" && !id)) return;
+  // herdr-core has no sidebar tokens: the app draws its own from terminal
+  // labels, so a pane is one terminal and the mute (a workspace's) goes on every
+  // agent under its own label, which leaves a pane's badge where it is.
+  if (isCore()) {
+    const key = scope === "pane" ? "telegram" : "telegram.mute";
+    const remaining = expiresAt === undefined ? ttlMs : expiresAt - Date.now();
+    const clear = value === undefined || (expiresAt !== undefined && remaining <= 0);
+    const labels = clear
+      ? [`${key}=`, `${key}.expires=`]
+      : [`${key}=${value}`, ...(remaining === undefined ? [] : [`${key}.expires=${Date.now() + remaining}`])];
+    const targets = scope === "pane" ? [id] : (loadCoreSnapshot()?.agents ?? []).map((agent) => agent.pane_id);
+    let failure;
+    try {
+      // hc runs synchronously; one tick later keeps a delivery already on its way.
+      await new Promise((resolve) => setImmediate(resolve));
+      for (const target of targets) {
+        const res = hcRun(["label", target, ...labels], 1000);
+        // One terminal that closed between the snapshot and the label must not
+        // keep the rest of the mute from landing.
+        if (!res.ok) failure ??= res.why;
+      }
+      if (failure) throw new Error(failure);
+    } catch (err) {
+      if (isOn(cfg("DEBUG"))) console.error(`herdr-telegram-notify: sidebar token report failed: ${redact(err.message, cfg("TELEGRAM_BOT_TOKEN"))}`);
+    }
+    return;
+  }
   // Capture the sequence before the snapshot or RPC can be delayed.
   const sequence = seq ?? sidebarSequence();
   const run = (args) => sidebarExec(herdrBin(), args, {

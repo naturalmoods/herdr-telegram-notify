@@ -13,7 +13,8 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 import { applyEvent, coreSession, guessTranscript, hookEvent, toSnapshot, transitions } from "../core.mjs";
-import { questionOnScreen, transcriptPath } from "../lib.mjs";
+import { DEFAULTS, questionOnScreen, reportSidebarToken, transcriptPath } from "../lib.mjs";
+import { telegramEntries } from "../contrib/herdr-app/telegram/entries.js";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 const DAEMON = join(HERE, "..", "daemon.mjs");
@@ -282,6 +283,38 @@ else console.log("{}");
   assert.equal(argv().length, beforeOutside, "no hc call without HC_TERMINAL_ID");
 });
 
+// ------------------------------------------------------------ the app mod
+
+test("the app's band shows an agent's token and the mute once, and drops what expired or is no agent's", () => {
+  const now = 1_800_000_000_000;
+  const entries = telegramEntries(
+    [
+      { address: "t1", status: "done", where: "api / 1", labels: { telegram: "📨 07:12", "telegram.expires": String(now + 60_000) } },
+      { address: "t2", status: "blocked", where: "api / 2", labels: { telegram: "📱 07:13" } },
+      { address: "t3", status: "working", where: "api / 3", labels: { telegram: "📨 07:14", "telegram.expires": String(now - 1) } },
+      { address: "t4", status: "done", parent: "t1", where: "api / 1", labels: { telegram: "📨 07:15" } },
+      { address: "t5", where: "api / 1", labels: { telegram: "📨 07:16" } },
+      { address: "t6", status: "idle", where: "api / 2", labels: { telegram: "📨 07:17", "telegram.mute": "🔕 until 15:00", "telegram.mute.expires": String(now + 60_000) } },
+      { address: "t7", status: "idle", where: "api / 3", labels: { "telegram.mute": "🔕 until 15:00" } },
+    ],
+    now
+  );
+  assert.deepEqual(entries, [
+    { text: "🔕 until 15:00" },
+    { address: "t1", text: "📨 07:12", where: "api / 1" },
+    { address: "t2", text: "📱 07:13", where: "api / 2" },
+    { address: "t6", text: "📨 07:17", where: "api / 2" },
+  ]);
+  // Without a where, the address is what a click goes to.
+  assert.deepEqual(telegramEntries([{ address: "t8", status: "done", labels: { telegram: "📨 07:18" } }], now), [
+    { address: "t8", text: "📨 07:18", where: "t8" },
+  ]);
+  // A full core record keeps the place in its labels; only hc ls's summary is top-level.
+  assert.deepEqual(telegramEntries([{ address: "t9", status: "done", labels: { telegram: "📨 07:19", where: "notes / 2" } }], now), [
+    { address: "t9", text: "📨 07:19", where: "notes / 2" },
+  ]);
+});
+
 // --------------------------------------------------------------- fakes
 
 // `hc events` hands out its snapshot, waits a moment (as a real core would
@@ -326,10 +359,20 @@ if (args[0] === "events") {
   chmodSync(path, 0o755);
   return {
     path,
-    argv: () =>
-      existsSync(join(dir, "hc-argv.jsonl"))
-        ? readFileSync(join(dir, "hc-argv.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l))
-        : [],
+    argv: () => {
+      if (!existsSync(join(dir, "hc-argv.jsonl"))) return [];
+      // A call being appended right now can be read half-written; it is not one yet.
+      return readFileSync(join(dir, "hc-argv.jsonl"), "utf8")
+        .split("\n")
+        .map((line) => {
+          try {
+            return JSON.parse(line);
+          } catch {
+            return undefined;
+          }
+        })
+        .filter(Boolean);
+    },
     set: (next) => writeFileSync(records, JSON.stringify(next)),
   };
 }
@@ -400,6 +443,75 @@ function run(script, args, env, { until, timeoutMs = 20_000 }) {
     const bomb = setTimeout(() => done(new Error(`timed out; output:\n${out}`)), timeoutMs);
   });
 }
+
+// ---------------------------------------------------------- sidebar labels
+
+const cfg = (key) => DEFAULTS[key];
+
+// The daemon's copy is what a workspace report reads, so it is written here.
+function coreTerminals(fx, terminals) {
+  writeFileSync(join(fx.stateDir, "core-terminals.json"), JSON.stringify({ terminals }));
+}
+
+async function withCore(hc, fx, fn) {
+  const saved = { ...process.env };
+  Object.assign(process.env, { HERDR_BACKEND: "core", HC_BIN_PATH: hc.path, HERDR_PLUGIN_STATE_DIR: fx.stateDir });
+  try {
+    return await fn();
+  } finally {
+    for (const key of ["HERDR_BACKEND", "HC_BIN_PATH", "HERDR_PLUGIN_STATE_DIR"]) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+  }
+}
+
+test("the core reports sidebar tokens as terminal labels, and clears both", async () => {
+  const fx = dirs();
+  const hc = fakeHc(fx.root);
+  coreTerminals(fx, [agent("t1", "done"), agent("t2", "blocked"), agent("t3", "working", { parent: "t1" }), terminal("t5"), agent("box/t6", "done")]);
+  await withCore(hc, fx, async () => {
+    const labels = () => hc.argv().filter((a) => a[0] === "label");
+
+    await reportSidebarToken("pane", "t1", "📨 07:12", { ttlMs: 60_000, cfg });
+    const set = labels().at(-1);
+    assert.deepEqual(set.slice(0, 3), ["label", "t1", "telegram=📨 07:12"]);
+    const expires = Number(set[3].split("=")[1]);
+    assert.ok(expires >= Date.now() && expires <= Date.now() + 60_000, set[3]);
+
+    await reportSidebarToken("pane", "t1", undefined, { cfg });
+    assert.deepEqual(labels().at(-1), ["label", "t1", "telegram=", "telegram.expires="]);
+
+    // The mute is a workspace's: every agent of the daemon's copy, nothing else.
+    const until = Date.now() + 3_600_000;
+    await reportSidebarToken("workspace", undefined, "🔕 until 15:00", { expiresAt: until, cfg });
+    const mutes = labels().slice(-2);
+    assert.deepEqual(mutes.map((a) => a[1]), ["t1", "t2"]);
+    for (const mute of mutes) {
+      assert.deepEqual(mute.slice(2), ["telegram.mute=🔕 until 15:00", `telegram.mute.expires=${until}`]);
+    }
+
+    await reportSidebarToken("workspace", undefined, undefined, { cfg });
+    assert.deepEqual(labels().slice(-2).map((a) => a.slice(1)), [
+      ["t1", "telegram.mute=", "telegram.mute.expires="],
+      ["t2", "telegram.mute=", "telegram.mute.expires="],
+    ]);
+  });
+});
+
+test("SIDEBAR_TOKENS=0 and DRY_RUN=1 leave the core's terminal labels alone", async () => {
+  const fx = dirs();
+  const hc = fakeHc(fx.root);
+  coreTerminals(fx, [agent("t1", "done")]);
+  await withCore(hc, fx, async () => {
+    for (const [key, value] of [["SIDEBAR_TOKENS", "0"], ["DRY_RUN", "1"]]) {
+      const off = (name) => (name === key ? value : DEFAULTS[name]);
+      await reportSidebarToken("pane", "t1", "📨 07:12", { ttlMs: 60_000, cfg: off });
+      await reportSidebarToken("workspace", undefined, "🔕 until 15:00", { expiresAt: Date.now() + 60_000, cfg: off });
+    }
+    assert.deepEqual(hc.argv(), []);
+  });
+});
 
 // ------------------------------------------------------------- end to end
 

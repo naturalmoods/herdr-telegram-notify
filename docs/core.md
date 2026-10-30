@@ -116,9 +116,29 @@ Claude agents in one folder keep their own transcript.
   folder. Only names in `CORE_AGENT_KINDS` are started. `@branch` worktrees
   are not supported yet.
 - **/stop** uses `hc interrupt` (Esc for agents that report status).
-- **Sidebar.** The app has none of its own to report to; `SIDEBAR_TOKENS` does
-  nothing here.
 - **Mute.** `node daemon.mjs mute`, or `/mute` from the chat.
+
+## Sidebar
+
+The app has no sidebar tokens of its own, so the daemon publishes the same
+state as terminal labels and a mod draws them: a one-line band at the bottom of
+the window with the latest 📨 notification, 📱 input from the phone, and 🔕 mute.
+
+Install it on the computer where the app window runs, from the clone:
+
+```sh
+mkdir -p ~/.config/herdr-app/mods
+cp -r ~/.local/share/herdr-telegram-notify/contrib/herdr-app/telegram ~/.config/herdr-app/mods/telegram
+herdr-app check ~/.config/herdr-app/mods/telegram
+```
+
+The app docks a new mod where its `mod.json` says: bottom, 28 px. A click on
+an agent's entry focuses its terminal.
+
+The labels are `telegram` and `telegram.expires` (epoch ms) on a pane, and
+`telegram.mute` and `telegram.mute.expires` on every agent while muted;
+clearing removes them. `SIDEBAR_TOKENS=0` turns the reporting off here too, and
+the band drops an entry whose expiry has passed even if its label is still set.
 
 ## Telegram bots
 
