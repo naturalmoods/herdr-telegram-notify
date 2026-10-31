@@ -19,7 +19,17 @@ is closed or that computer is off, because herdr-core keeps running.
 
 It follows only this machine's terminals. Terminals on machines this core
 added (`box/t7`) belong to the daemon running there. Helpers an agent started
-with `hc run` (terminals with a parent) are left out.
+with `hc run` (terminals with a parent) are left out; instead they get one line
+in their parent's notification, naming the live ones and what they are doing:
+`🧩 2 helpers: sub-auth done, sub-docs working`.
+
+`CORE_MACHINES` in `.env` changes that: empty (the default) follows this
+machine only; a comma list of names as `hc machine ls` shows them (`box,vps`)
+adds those machines; `*` includes every added machine. Their agents get the same
+notifications, replies and `/diff`, with space and tab names read from that
+machine's document, and `/new` on one of their spaces is refused for now. Do
+not include a machine that runs its own daemon on the same bot — every message
+would come twice.
 
 ## Setup
 
@@ -55,6 +65,33 @@ To keep it running after you log out: `loginctl enable-linger $USER`.
 Edit the unit if `node` or `hc` is not on the service's PATH, or set
 `HC_BIN_PATH` there.
 
+### Claude Code sessions
+
+herdr-core reports no agent session, so the daemon can only take the program in
+the terminal for the session. Claude Code can tell it the real one: add
+`contrib/claude-session-hook.sh` to `SessionStart` in `~/.claude/settings.json`,
+merging it into what is already there.
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          { "type": "command", "command": "~/.local/share/herdr-telegram-notify/contrib/claude-session-hook.sh" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The hook labels the terminal `claude.session=<pid>:<session id>` and does
+nothing without `HC_TERMINAL_ID` or `hc`, so it is harmless under Herdr TUI.
+With the label, replies stay with the conversation across `/clear`, and two
+Claude agents in one folder keep their own transcript.
+
 ## Directories
 
 | What | Default | Override |
@@ -67,26 +104,72 @@ Edit the unit if `node` or `hc` is not on the service's PATH, or set
 
 - **Names.** Spaces and tabs come from the app's document on this core. A
   space nobody named is called after its repo, as in the app.
-- **Status.** herdr-core reports `error` as well. Add it to `NOTIFY_STATUSES`
-  to hear about it. A blocked agent that says why shows it:
-  `blocked (permission)`.
-- **Where to find it.** The 🖥 line says `hc attach t3`.
-- **Sessions.** herdr-core reports no agent session. The program running in
-  the terminal is the session: a reply goes to the agent the notification was
-  about, and is refused once that program has quit and another started. A
+- **Status.** herdr-core reports `error` as well, and it is heard by default:
+  without a `NOTIFY_STATUSES` of your own, `done,blocked,error` notify. A list
+  you write is used exactly as it stands. A blocked agent that says why shows
+  it: `blocked (permission)`.
+- **Where to find it.** The 🖥 line says `hc attach t3`, or `hc attach box/t7`
+  for an agent on an added machine.
+- **Sessions.** herdr-core reports no agent session. With the
+  [Claude Code hook](#claude-code-sessions), Claude Code's own session id is
+  the session: a `/clear` starts a new one, and a label left by an earlier
+  program in the pane is ignored. Without the hook, the program running in the
+  terminal is the session: a reply goes to the agent the notification was
+  about, and is refused once that program has quit and another started, but a
   `/clear` inside the same agent is not noticed.
 - **Transcripts.** Found where the agent keeps them: Claude Code by the
-  folder, Codex by the folder its rollout names. Only files written since the
-  terminal started count. When two agents of one kind share a folder, neither
-  gets a transcript (no last message, duration or cost), rather than the
-  wrong one. pi transcripts are not found yet.
+  folder or by the id the [hook](#claude-code-sessions) labels it with, Codex
+  by the folder its rollout names, pi by the folder it slugs its cwd into
+  (`--home-x-api--` under `~/.pi/agent/sessions`, or `PI_CODING_AGENT_DIR`).
+  Only files written since the terminal started count. Two Claude agents in
+  one folder share one transcript folder:
+  without the hook neither gets a transcript (no last message, duration or
+  cost), rather than the wrong one; with it, each has its own id and its own
+  transcript.
 - **/new** starts the program in a new tab of the space, from the space's
-  folder. Only names in `CORE_AGENT_KINDS` are started. `@branch` worktrees
-  are not supported yet.
+  folder. Only names in `CORE_AGENT_KINDS` are started. `@branch` makes a
+  checkout under `~/.herdr/worktrees/<repo>/<branch>` and starts the agent
+  there in a new space of its own, as the app's New worktree does: a branch
+  that exists is checked out, a new one starts from HEAD.
 - **/stop** uses `hc interrupt` (Esc for agents that report status).
-- **Sidebar.** The app has none of its own to report to; `SIDEBAR_TOKENS` does
-  nothing here.
 - **Mute.** `node daemon.mjs mute`, or `/mute` from the chat.
+
+## Sidebar
+
+The app has no sidebar tokens of its own, so the daemon publishes the same
+state as terminal labels and a mod draws them: a one-line band at the bottom of
+the window with the latest 📨 notification, 📱 input from the phone, and 🔕 mute.
+
+Install it on the computer where the app window runs, from the clone:
+
+```sh
+mkdir -p ~/.config/herdr-app/mods
+cp -r ~/.local/share/herdr-telegram-notify/contrib/herdr-app/telegram ~/.config/herdr-app/mods/telegram
+herdr-app check ~/.config/herdr-app/mods/telegram
+```
+
+The shipped layouts are read-only, so the app does not dock the band into
+them. `herdr-app do mod.open --name telegram` shows it once; to keep it, clone
+the layout and add a 28 px block for the mod above the status bar, in the
+`work` column of `main`:
+
+```sh
+herdr-app do layout.clone --name main --as main-telegram
+```
+
+```json
+{ "id": "telegram", "type": "block", "size": { "px": 28 }, "content": { "mod": "telegram" } }
+```
+
+Put that object into `~/.config/herdr-app/layouts/main-telegram.json`, in the
+`children` of the block with `"id": "work"`, before the one with
+`"id": "status"`. Layouts reload when saved. A click on an agent's entry focuses
+its terminal.
+
+The labels are `telegram` and `telegram.expires` (epoch ms) on a pane, and
+`telegram.mute` and `telegram.mute.expires` on every agent while muted;
+clearing removes them. `SIDEBAR_TOKENS=0` turns the reporting off here too, and
+the band drops an entry whose expiry has passed even if its label is still set.
 
 ## Telegram bots
 

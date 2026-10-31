@@ -24,7 +24,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { execFile, spawn, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
 import { performance } from "node:perf_hooks";
-import { coreAgent, guessTranscript, hcJson, isCore, loadCoreSnapshot } from "./core.mjs";
+import { coreAgent, coreMachines, guessTranscript, hcJson, hcRun, isCore, loadCoreSnapshot, remoteTranscript } from "./core.mjs";
 
 export { isCore };
 
@@ -68,8 +68,10 @@ export const DEFAULTS = {
   WHISPER_MODEL: "small",
   WHISPER_LANGUAGE: "",
   BOARD: "0",
-  // herdr-core only: the programs /new may start (it runs them by name).
+  // herdr-core only: the programs /new may start (it runs them by name), and
+  // the added machines this daemon also notifies for (see docs/core.md).
   CORE_AGENT_KINDS: "claude,codex,pi,opencode,gemini",
+  CORE_MACHINES: "",
   DEBUG: "0",
   DRY_RUN: "0",
 };
@@ -152,12 +154,27 @@ export function warnUnknownKeys(fileEnv) {
 export function loadConfig() {
   const fileEnv = loadEnvFile(process.env.HERDR_PLUGIN_CONFIG_DIR);
   warnUnknownKeys(fileEnv);
-  return (key) => firstDefined(process.env[key], fileEnv[key], DEFAULTS[key]);
+  const cfg = (key) => firstDefined(process.env[key], fileEnv[key], DEFAULTS[key]);
+  // A key the user set, as opposed to one that fell back to DEFAULTS.
+  cfg.userSet = (key) => firstDefined(process.env[key], fileEnv[key]) !== undefined;
+  return cfg;
 }
 
 // The statuses herdr reports, and so the only ones NOTIFY_STATUSES can name.
 // `error` comes from herdr-core only.
 export const STATUSES = ["done", "blocked", "working", "idle", "error"];
+
+// The statuses a run notifies on. herdr-core reports `error`, which the TUI
+// never does, so it is heard by default there too — unless the user wrote
+// NOTIFY_STATUSES, whose list is then taken exactly as it stands.
+export function notifyStatuses(cfg) {
+  const list = String(cfg("NOTIFY_STATUSES") ?? "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  if (isCore() && !cfg.userSet?.("NOTIFY_STATUSES") && !list.includes("error")) list.push("error");
+  return list;
+}
 
 // A value the runtime cannot parse falls back to the default, silently — the
 // failure mode of `SWEEP_MINUTES=5min` is a sweeper that never runs and a config
@@ -365,8 +382,17 @@ export function gitBin() {
   return "git";
 }
 
-function git(cwd, args) {
+function git(cwd, args, machine) {
   if (typeof cwd !== "string" || !cwd || cwd.includes("\0")) return undefined;
+  // The folder of a remote agent is not on this disk, so hc runs git on that
+  // machine. The output arrives whole; locally it is streamed below.
+  if (machine) {
+    const res = hcRun(
+      ["exec", "--on", machine, "--cwd", cwd, "--env", "GIT_OPTIONAL_LOCKS=0", "--env", "LC_ALL=C", "git", ...args],
+      10_000
+    );
+    return res.ok ? res.out : undefined;
+  }
   // ponytail: filename inventories are bounded at 1 MB; stream them if huge
   // untracked trees matter.
   const res = spawnSync(gitBin(), ["-C", cwd, ...args], {
@@ -382,10 +408,10 @@ function git(cwd, args) {
 // Not every change need be this turn's doing, but this is the difference between
 // an agent that thought about the problem and one that changed things. Share the
 // counts with /diff so its caption and the notification's line use the same rules.
-export function workingTreeChanges(cwd, showNames = false) {
-  const stat = git(cwd, ["diff", "--shortstat", "HEAD", "--no-color", "--no-ext-diff", "--no-textconv", "--"]);
+export function workingTreeChanges(cwd, showNames = false, machine) {
+  const stat = git(cwd, ["diff", "--shortstat", "HEAD", "--no-color", "--no-ext-diff", "--no-textconv", "--"], machine);
   if (stat === undefined) return undefined;
-  const untracked = git(cwd, ["ls-files", "--others", "--exclude-standard", "-z"]);
+  const untracked = git(cwd, ["ls-files", "--others", "--exclude-standard", "-z"], machine);
   if (untracked === undefined) return undefined;
 
   const bits = [];
@@ -404,12 +430,21 @@ export function workingTreeChanges(cwd, showNames = false) {
 
 export const DIFF_MAX_BYTES = 5 * 1024 * 1024;
 
-export async function workingTreeDiff(cwd) {
-  if (git(cwd, ["rev-parse", "--verify", "HEAD^{commit}"]) === undefined) {
+export async function workingTreeDiff(cwd, machine) {
+  if (git(cwd, ["rev-parse", "--verify", "HEAD^{commit}"], machine) === undefined) {
     return { error: "The directory is not a git repo, or it has no commits yet." };
   }
-  const summary = workingTreeChanges(cwd, true);
+  const summary = workingTreeChanges(cwd, true, machine);
   if (summary === undefined) return { error: "I could not read the working tree changes." };
+
+  // A remote diff comes back through hc in one piece, so it is only kept under
+  // the same limit; the local one is streamed and never held whole.
+  if (machine) {
+    const text = git(cwd, ["diff", "HEAD", "--no-color", "--no-ext-diff", "--no-textconv", "--"], machine);
+    if (text === undefined) return { error: "I could not read the diff (git failed or timed out)." };
+    const bytes = Buffer.byteLength(text);
+    return { summary, bytes, text: bytes <= DIFF_MAX_BYTES ? text : undefined };
+  }
 
   return new Promise((resolve) => {
     const child = spawn(gitBin(), ["-C", cwd, "diff", "HEAD", "--no-color", "--no-ext-diff", "--no-textconv", "--"], {
@@ -437,7 +472,7 @@ export async function workingTreeDiff(cwd) {
 // One agent as it stands now, in `herdr agent get`'s shape, from whichever
 // runtime this runs under.
 export function liveAgentRecord(paneId) {
-  if (isCore()) return coreAgent(paneId);
+  if (isCore()) return coreAgent(paneId, coreMachines(loadConfig()("CORE_MACHINES")));
   try {
     return JSON.parse(herdr(["agent", "get", paneId]))?.result?.agent;
   } catch {
@@ -474,7 +509,7 @@ export function herdr(args, timeout = 4000) {
 // Every workspace, pane and agent herdr knows about. The notifier and the
 // poller's /status both need it, so it lives here rather than in either.
 export function loadSnapshot() {
-  if (isCore()) return loadCoreSnapshot();
+  if (isCore()) return loadCoreSnapshot(process.env.HERDR_PLUGIN_STATE_DIR, coreMachines(loadConfig()("CORE_MACHINES")));
   const out = herdr(["api", "snapshot"]);
   if (!out) return undefined;
   try {
@@ -502,9 +537,34 @@ export function sidebarSequence() {
 // Values are display-only. Never await this on a delivery path: a missing or
 // older Herdr must not hold up a notification, a reply or a mute confirmation.
 export async function reportSidebarToken(scope, id, value, { ttlMs, expiresAt, seq, cfg = loadConfig() } = {}) {
-  // herdr-core has no sidebar; the app draws its own from mods.
-  if (isCore()) return;
   if (!isOn(cfg("SIDEBAR_TOKENS")) || isOn(cfg("DRY_RUN")) || (scope === "pane" && !id)) return;
+  // herdr-core has no sidebar tokens: the app draws its own from terminal
+  // labels, so a pane is one terminal and the mute (a workspace's) goes on every
+  // agent under its own label, which leaves a pane's badge where it is.
+  if (isCore()) {
+    const key = scope === "pane" ? "telegram" : "telegram.mute";
+    const expires = expiresAt ?? (ttlMs === undefined ? undefined : Date.now() + ttlMs);
+    const clear = value === undefined || (expires !== undefined && expires <= Date.now());
+    const labels = clear
+      ? [`${key}=`, `${key}.expires=`]
+      : [`${key}=${value}`, ...(expires === undefined ? [] : [`${key}.expires=${expires}`])];
+    const targets = scope === "pane" ? [id] : (loadSnapshot()?.agents ?? []).map((agent) => agent.pane_id);
+    let failure;
+    try {
+      // hc runs synchronously; one tick later keeps a delivery already on its way.
+      await new Promise((resolve) => setImmediate(resolve));
+      for (const target of targets) {
+        const res = hcRun(["label", target, ...labels], 1000);
+        // One terminal that closed between the snapshot and the label must not
+        // keep the rest of the mute from landing.
+        if (!res.ok) failure ??= res.why;
+      }
+      if (failure) throw new Error(failure);
+    } catch (err) {
+      if (isOn(cfg("DEBUG"))) console.error(`herdr-telegram-notify: sidebar token report failed: ${redact(err.message, cfg("TELEGRAM_BOT_TOKEN"))}`);
+    }
+    return;
+  }
   // Capture the sequence before the snapshot or RPC can be delayed.
   const sequence = seq ?? sidebarSequence();
   const run = (args) => sidebarExec(herdrBin(), args, {
@@ -707,7 +767,7 @@ export function buildMessage(parts) {
   // Mask source fields before clipping or escaping, including messages queued
   // before masking was enabled and titles shared by notifications and reminders.
   parts = Object.fromEntries(Object.entries(parts).map(([key, value]) => [key, typeof value === "string" ? maskSecrets(value) : value]));
-  const { emoji, agent, statusLabel, title, prompt, project, changes, tools, meta, agentTokens, pane, herd, bodyIsScreen, late } = parts;
+  const { emoji, agent, statusLabel, title, prompt, project, changes, tools, meta, agentTokens, pane, helpers, herd, bodyIsScreen, late } = parts;
 
   const render = (body) => {
     const plain = [];
@@ -724,7 +784,7 @@ export function buildMessage(parts) {
       plain.push(shown);
       html.push(`<i>${escapeHtml(shown)}</i>`);
     }
-    for (const line of [prompt, project, changes, tools, meta, agentTokens, pane, herd ? `🐑 ${herd}` : undefined].filter(Boolean)) {
+    for (const line of [prompt, project, changes, tools, meta, agentTokens, pane, helpers, herd ? `🐑 ${herd}` : undefined].filter(Boolean)) {
       const shown = clip(line, HEAD_LINE_CHARS);
       plain.push(shown);
       html.push(escapeHtml(shown));
@@ -1571,6 +1631,12 @@ export function herdStatusText(snap, stateDir) {
 // Codex stores dated rollouts, so recent days are searched before old history.
 export function transcriptPath(session) {
   if (!session?.value) return undefined;
+  // A remote transcript is not a local path: hc brings the text over, and
+  // readTurn() takes it as it is.
+  if (session.machine) {
+    const text = remoteTranscript(session);
+    return text === undefined ? undefined : { text };
+  }
   if (session.kind === "proc") return guessTranscript(session);
   if (session.kind === "path") return existsSync(session.value) ? session.value : undefined;
   if (session.kind !== "id") return undefined;
@@ -1671,8 +1737,8 @@ export function isHumanPrompt(record, message) {
 // fails silently and expensively: no prompt, no duration, and a token count that
 // only covers the part of the turn it managed to see. A turn of forty tool calls
 // was already past two hundred records.
-export function readTurn(path, maxRecords = 1500) {
-  const tail = readTail(path);
+export function readTurn(source, maxRecords = 1500) {
+  const tail = typeof source === "string" ? readTail(source) : source?.text;
   if (!tail) return {};
   const lines = tail.split("\n").filter((l) => l.trim());
 

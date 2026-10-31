@@ -8,6 +8,31 @@
   `/new` starts a labelled terminal the app adopts as a new tab. Run it as a
   service on the machine where the agents run. See [docs/core.md](docs/core.md).
   Herdr TUI is unchanged.
+- Under herdr-core, `/new <workspace>@<branch>` makes the app's checkout under
+  `~/.herdr/worktrees/<repo>/<branch>` and starts the agent there in a new space.
+- Claude Code can report its real session under herdr-core: add
+  [`contrib/claude-session-hook.sh`](contrib/claude-session-hook.sh) to
+  `SessionStart` in `~/.claude/settings.json`, and a `/clear` no longer breaks
+  replies and two Claude agents in one folder keep their own transcript. See
+  [docs/core.md](docs/core.md#claude-code-sessions).
+- The Herdr app shows the same 📨, 📱 and 🔕 badges in a band at the bottom of
+  the window: `contrib/herdr-app/telegram` reads the labels the daemon sets on
+  its terminals. See [docs/core.md](docs/core.md#sidebar).
+- `CORE_MACHINES` lets the daemon notify for agents on machines this core
+  added (`box/t7`) too: notifications, replies, `/stop`, `/screen`, `/diff` and
+  transcripts work as they do locally, and `/new` on one of their spaces is
+  refused for now. Empty by default, as before. Do not include a machine that
+  runs its own daemon on the same bot, or every message comes twice. See
+  [docs/core.md](docs/core.md#where-it-runs).
+- Under herdr-core, pi transcripts are found by the folder pi slugs the cwd
+  into (`~/.pi/agent/sessions`, or `PI_CODING_AGENT_DIR`), so a pi turn has a
+  last message, duration and token count like Claude's and Codex's.
+- herdr-core's `error` status is heard by default: with no `NOTIFY_STATUSES`
+  of your own, `done,blocked,error` notify. A list you write is used exactly
+  as it stands, and the doctor shows the effective one.
+- A parent's notification lists the helpers it started with `hc run` on one
+  line (`🧩 2 helpers: sub-auth done, sub-docs working`) instead of leaving
+  them out entirely.
 
 ## 0.13.0
 

@@ -6,14 +6,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, chmodSync, existsSync, utimesSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
-import { applyEvent, coreSession, guessTranscript, hookEvent, toSnapshot, transitions } from "../core.mjs";
-import { questionOnScreen } from "../lib.mjs";
+import { applyEvent, coreMachines, coreSession, guessTranscript, hookEvent, loadCoreSnapshot, remoteTranscript, toSnapshot, transitions } from "../core.mjs";
+import { DEFAULTS, questionOnScreen, readTurn, reportSidebarToken, toolSummary, transcriptPath, workingTreeChanges, workingTreeDiff } from "../lib.mjs";
+import { telegramEntries } from "../contrib/herdr-app/telegram/entries.js";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 const DAEMON = join(HERE, "..", "daemon.mjs");
@@ -69,6 +70,100 @@ test("a space the document does not know yet still has a name", () => {
   assert.deepEqual(snap.workspaces, [{ workspace_id: "s9", label: "storefront", folder: "/work/storefront" }]);
 });
 
+test("CORE_MACHINES adds a machine's agents, with its own spaces and tabs and box/-prefixed ids", () => {
+  const doc = {
+    spaces: [{ id: "s1", name: "Storefront", folder: "/work/storefront", tabs: [{ id: "a", name: "login" }] }],
+    machines: { box: { spaces: [{ id: "s1", name: "Boxes", folder: "/srv/boxes", tabs: [{ id: "a", name: "deploy" }] }] } },
+  };
+  const list = [
+    agent("t1", "done", { labels: { "herdr.space": "s1", "herdr.tab": "a" } }),
+    agent("box/t7", "working", { cwd: "/srv/boxes", labels: { "herdr.space": "s1", "herdr.tab": "a" } }),
+    agent("vps/t8", "done", { cwd: "/srv/notes" }),
+    agent("vps/t9", "idle", { parent: "vps/t8" }),
+  ];
+  // Empty: this machine only, as before.
+  assert.deepEqual(toSnapshot(list, doc).agents.map((a) => a.pane_id), ["t1"]);
+  const scoped = toSnapshot(list, doc, coreMachines("box"));
+  assert.deepEqual(scoped.agents.map((a) => a.pane_id), ["t1", "box/t7"]);
+  assert.equal(scoped.agents[1].workspace_id, "box/s1");
+  assert.equal(scoped.agents[1].tab_id, "box/a");
+  assert.equal(scoped.workspaces.find((w) => w.workspace_id === "box/s1").label, "Boxes");
+  assert.equal(scoped.tabs.find((t) => t.tab_id === "box/a").label, "deploy");
+  // A helper stays out wherever it runs, and `*` adds every added machine.
+  assert.deepEqual(toSnapshot(list, doc, coreMachines("box")).agents.map((a) => a.pane_id), ["t1", "box/t7"]);
+  assert.deepEqual(toSnapshot(list, doc, coreMachines("*")).agents.map((a) => a.pane_id), ["t1", "box/t7", "vps/t8"]);
+  // transitions follows the same rule.
+  const before = agent("box/t7", "working");
+  const after = agent("box/t7", "done");
+  assert.deepEqual(transitions(before, after), []);
+  assert.deepEqual(transitions(before, after, coreMachines("box")).map((c) => c.type), ["status"]);
+  assert.deepEqual(transitions(before, after, coreMachines("*")).map((c) => c.type), ["status"]);
+});
+
+test("a state file written before CORE_MACHINES still loads", () => {
+  const fx = dirs();
+  writeFileSync(join(fx.stateDir, "core-terminals.json"), JSON.stringify({ terminals: [agent("t1", "done")] }));
+  writeFileSync(
+    join(fx.stateDir, "core-spaces.json"),
+    JSON.stringify({ spaces: [{ id: "s1", name: "Storefront", folder: "/work/storefront", tabs: [] }] })
+  );
+  const snap = loadCoreSnapshot(fx.stateDir);
+  assert.deepEqual(snap.agents.map((a) => a.pane_id), ["t1"]);
+  assert.equal(snap.workspaces[0].label, "Storefront");
+});
+
+test("a remote transcript is tailed through hc, and only an id session has one", async () => {
+  const fx = dirs();
+  const id = "aaaaaaaa-1111-2222-3333-444444444444";
+  const body = [
+    JSON.stringify({ type: "user", timestamp: "2026-09-22T10:00:00Z", message: { role: "user", content: "make the boxes roll" } }),
+    JSON.stringify({ type: "assistant", timestamp: "2026-09-22T10:01:00Z", message: { role: "assistant", content: [{ type: "text", text: "Boxes roll." }] } }),
+  ].join("\n") + "\n";
+  const hc = fakeHc(fx.root, { exec: [["ls -t", body]] });
+  await withCore(hc, fx, async () => {
+    const session = { kind: "id", value: id, agent: "claude", cwd: "/srv/boxes", since: 0, machine: "box" };
+    const transcript = transcriptPath(session);
+    assert.deepEqual(transcript, { text: body });
+    assert.deepEqual(hc.argv(), [
+      [
+        "exec", "--on", "box", "sh", "-c",
+        `f=$(ls -t ~/.claude/projects/*/${id}.jsonl 2>/dev/null | head -1) && [ -n "$f" ] && tail -c 4194304 "$f"`,
+      ],
+    ]);
+    const turn = readTurn(transcript);
+    assert.equal(turn.prompt, "make the boxes roll");
+    assert.equal(turn.text, "Boxes roll.");
+    assert.equal(turn.duration, 60_000);
+    // The program is not a session on another machine, and its folder is no help.
+    const proc = { kind: "proc", value: "box/t7:4242", agent: "claude", cwd: "/srv/boxes", since: 0, machine: "box" };
+    assert.equal(transcriptPath(proc), undefined);
+    assert.equal(remoteTranscript(proc), undefined);
+    assert.equal(hc.argv().length, 1, "no transcript, no hc call");
+  });
+});
+
+test("a remote agent's changes summary and diff run git on its machine through hc", async () => {
+  const fx = dirs();
+  const hc = fakeHc(fx.root, {
+    exec: [
+      ["--shortstat", " 2 files changed, 3 insertions(+)\n"],
+      ["ls-files", "new.txt\0"],
+      ["diff HEAD", "--- a\n+++ b\n"],
+      ["rev-parse", "abc123\n"],
+    ],
+  });
+  await withCore(hc, fx, async () => {
+    assert.equal(workingTreeChanges("/srv/boxes", false, "box"), "2 files · +3 −0 · 1 new");
+    const diff = await workingTreeDiff("/srv/boxes", "box");
+    assert.equal(diff.summary, "2 files · +3 −0 · 1 new: new.txt");
+    assert.equal(diff.text, "--- a\n+++ b\n");
+    const execs = hc.argv().filter((a) => a[0] === "exec");
+    assert.deepEqual(execs[0].slice(0, 5), ["exec", "--on", "box", "--cwd", "/srv/boxes"]);
+    assert.ok(execs.every((a) => a.includes("git")));
+    assert.ok(execs.some((a) => a.includes("diff") && a.includes("HEAD")));
+  });
+});
+
 test("the session is the program in the terminal, and two of a kind in one folder share no transcript", () => {
   const a = agent("t1", "done", { pid: 7 });
   const b = agent("t2", "idle", { pid: 8 });
@@ -76,6 +171,54 @@ test("the session is the program in the terminal, and two of a kind in one folde
   assert.equal(coreSession(a, [a, b]).shared, true);
   assert.equal(coreSession(a, [a, { ...b, cwd: "/elsewhere" }]).shared, false);
   assert.equal(coreSession({ ...a, foreground: { pid: 9, cwd: a.cwd } }).value, "t1:9");
+});
+
+test("a Claude label from this process is the session, one from an earlier process is not", () => {
+  const id = "aaaaaaaa-1111-2222-3333-444444444444";
+  const t = agent("t1", "done", { pid: 100, labels: { "claude.session": `100:${id}` } });
+  assert.deepEqual(coreSession(t, [t]), { kind: "id", value: id, agent: "claude", cwd: "/work/storefront", since: 1000 });
+  // The label is read against the program in the pane now, so a leftover from
+  // the one before it falls back to the proc session.
+  const stale = { ...t, labels: { "claude.session": `999:${id}` } };
+  assert.deepEqual(coreSession(stale, [stale]), {
+    kind: "proc",
+    value: "t1:100",
+    agent: "claude",
+    cwd: "/work/storefront",
+    since: 1000,
+    shared: false,
+  });
+  // Only Claude Code sets it; another agent's terminal keeps its proc session.
+  const codex = { ...agent("t2", "done"), status: { state: "done", app: "codex" }, labels: { "claude.session": "100:" + id } };
+  assert.equal(coreSession(codex, [codex]).kind, "proc");
+  // An id that is not a session id is not a transcript file name either.
+  const odd = { ...t, labels: { "claude.session": "100:../../etc/passwd" } };
+  assert.equal(coreSession(odd, [odd]).kind, "proc");
+});
+
+test("two Claude agents in one folder keep their own transcript when each is labelled", () => {
+  const root = mkdtempSync(join(tmpdir(), "core-labelled-"));
+  const dir = join(root, "projects", "-work-storefront");
+  mkdirSync(dir, { recursive: true });
+  const first = join(dir, "aaaaaaaa-1111-2222-3333-444444444444.jsonl");
+  const second = join(dir, "bbbbbbbb-5555-6666-7777-888888888888.jsonl");
+  writeFileSync(first, "{}\n");
+  writeFileSync(second, "{}\n");
+  const a = agent("t1", "done", { foreground: { pid: 70, cwd: "/work/storefront" }, labels: { "claude.session": "70:aaaaaaaa-1111-2222-3333-444444444444" } });
+  const b = agent("t2", "idle", { foreground: { pid: 80, cwd: "/work/storefront" }, labels: { "claude.session": "80:bbbbbbbb-5555-6666-7777-888888888888" } });
+  const saved = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CLAUDE_CONFIG_DIR = root;
+  try {
+    assert.equal(coreSession(a, [a, b]).shared, undefined, "a real id is not ambiguous");
+    assert.equal(transcriptPath(coreSession(a, [a, b])), first);
+    assert.equal(transcriptPath(coreSession(b, [a, b])), second);
+    // Unlabelled, the pair is ambiguous and gets no transcript rather than the wrong one.
+    const plain = [a, b].map((t) => ({ ...t, labels: {} }));
+    assert.equal(transcriptPath(coreSession(plain[0], plain)), undefined);
+  } finally {
+    if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = saved;
+  }
 });
 
 test("events become one hook per status change and one closure, whichever way the terminal goes", () => {
@@ -105,6 +248,12 @@ test("events become one hook per status change and one closure, whichever way th
   apply({ type: "created", terminal: "t2", data: agent("t2", "blocked") });
   apply({ type: "removed", terminal: "t2", data: {} });
   assert.deepEqual(hooks.slice(3), ["status:blocked", "closed"]);
+
+  // The Claude session hook labels the terminal; a label is not a status change.
+  apply({ type: "created", terminal: "t3", data: agent("t3", "working") });
+  apply({ type: "labels", terminal: "t3", data: { labels: { "claude.session": "9:aaaaaaaa-1111" } } });
+  assert.equal(map.get("t3").labels["claude.session"], "9:aaaaaaaa-1111");
+  assert.deepEqual(hooks.slice(5), ["status:working"]);
 });
 
 test("a hook gets the TUI's event shape, with the blocked kind as its label", () => {
@@ -142,10 +291,55 @@ test("guessTranscript takes Claude's newest file for that folder written since t
     assert.equal(guessTranscript(session), fresh);
     assert.equal(guessTranscript({ ...session, since: 4000 }), undefined, "nothing written since it started");
     assert.equal(guessTranscript({ ...session, shared: true }), undefined);
-    assert.equal(guessTranscript({ ...session, agent: "pi" }), undefined);
   } finally {
     if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR;
     else process.env.CLAUDE_CONFIG_DIR = saved;
+  }
+});
+
+test("guessTranscript finds pi's newest session for the folder, and readTurn reads its format", () => {
+  const root = mkdtempSync(join(tmpdir(), "core-pi-"));
+  const dir = join(root, "sessions", "--work-storefront--");
+  mkdirSync(dir, { recursive: true });
+  const old = join(dir, "20260101T120000_aaaaaaaa.jsonl");
+  const fresh = join(dir, "20260101T130000_bbbbbbbb.jsonl");
+  writeFileSync(old, "{}\n");
+  const piMessage = (role, content, s, usage) => ({
+    type: "message",
+    timestamp: new Date(Date.UTC(2026, 0, 1, 12, 0, s)).toISOString(),
+    message: { role, content, ...(usage ? { usage } : {}) },
+  });
+  writeFileSync(
+    fresh,
+    [
+      JSON.stringify({ type: "session", version: 3, id: "bbbbbbbb", timestamp: "2026-01-01T13:00:00Z" }),
+      JSON.stringify(piMessage("user", [{ type: "text", text: "fix the login" }], 0)),
+      JSON.stringify(piMessage("assistant", [{ type: "toolCall", name: "bash", id: "c1", arguments: {} }], 30)),
+      JSON.stringify(piMessage("assistant", [{ type: "text", text: "Login fixed." }], 60, {
+        input: 10, output: 20, cacheRead: 5, cost: { total: 0.01 },
+      })),
+    ].join("\n") + "\n"
+  );
+  utimesSync(old, 1, 1);
+  utimesSync(fresh, 3, 3);
+  const saved = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = root;
+  try {
+    const session = { agent: "pi", cwd: "/work/storefront", since: 2000 };
+    assert.equal(guessTranscript(session), fresh);
+    assert.equal(guessTranscript({ ...session, since: 4000 }), undefined, "nothing written since it started");
+    assert.equal(guessTranscript({ ...session, shared: true }), undefined);
+    // A program whose name only contains "pi" is not pi.
+    assert.equal(guessTranscript({ ...session, agent: "copilot" }), undefined);
+    const turn = readTurn(fresh);
+    assert.equal(turn.prompt, "fix the login");
+    assert.equal(turn.text, "Login fixed.");
+    assert.equal(turn.duration, 60_000);
+    assert.equal(turn.out, 20);
+    assert.equal(toolSummary(turn.tools), "1 bash");
+  } finally {
+    if (saved === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = saved;
   }
 });
 
@@ -167,13 +361,108 @@ test("guessTranscript finds a Codex rollout by the folder it names", () => {
   }
 });
 
+test("the session hook labels this terminal, and stays quiet otherwise", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "core-hook-"));
+  const fake = join(dir, "hc");
+  writeFileSync(
+    fake,
+    `#!${process.execPath}
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(join(dir, "hc-argv.jsonl"))}, JSON.stringify(args) + "\\n");
+if (args[0] === "get") console.log(JSON.stringify({ address: args[1], foreground: { pid: Number(process.env.FAKE_FOREGROUND_PID) } }));
+else console.log("{}");
+`
+  );
+  chmodSync(fake, 0o755);
+  const hook = join(HERE, "..", "contrib", "claude-session-hook.sh");
+  const id = "aaaaaaaa-1111-2222-3333-444444444444";
+  const base = {
+    ...process.env,
+    PATH: `${dir}:${process.env.PATH}`,
+    HC_TERMINAL_ID: "t3",
+    // The test process started the hook, so it is the program in the pane.
+    FAKE_FOREGROUND_PID: String(process.pid),
+  };
+  const runHook = (env) =>
+    new Promise((resolve) => {
+      const child = spawn(hook, [], { env });
+      let out = "";
+      child.stdout.on("data", (d) => (out += d));
+      child.on("close", (code) => resolve({ code, out }));
+      // A hook that has nothing to do exits before reading what Claude Code sends.
+      child.stdin.on("error", () => {});
+      child.stdin.end(JSON.stringify({ session_id: id, transcript_path: "/work/storefront/x.jsonl", source: "clear" }));
+    });
+  const argv = () =>
+    existsSync(join(dir, "hc-argv.jsonl"))
+      ? readFileSync(join(dir, "hc-argv.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l))
+      : [];
+
+  const labelled = await runHook(base);
+  assert.equal(labelled.code, 0);
+  assert.equal(labelled.out, "", "the hook prints nothing on stdout");
+  assert.deepEqual(argv(), [
+    ["get", "t3", "--json"],
+    ["label", "t3", `claude.session=${process.pid}:${id}`],
+  ]);
+
+  // The foreground pid is not this hook's ancestor: another program's session.
+  const before = argv().length;
+  const stale = await runHook({ ...base, FAKE_FOREGROUND_PID: "1" });
+  assert.equal(stale.code, 0);
+  assert.equal(stale.out, "");
+  assert.deepEqual(argv().slice(before), [["get", "t3", "--json"]]);
+
+  // Outside an hc terminal there is nothing to label, and nothing to say.
+  const outside = { ...base };
+  delete outside.HC_TERMINAL_ID;
+  const beforeOutside = argv().length;
+  const quiet = await runHook(outside);
+  assert.equal(quiet.code, 0);
+  assert.equal(quiet.out, "");
+  assert.equal(argv().length, beforeOutside, "no hc call without HC_TERMINAL_ID");
+});
+
+// ------------------------------------------------------------ the app mod
+
+test("the app's band shows an agent's token and the mute once, and drops what expired or is no agent's", () => {
+  const now = 1_800_000_000_000;
+  const entries = telegramEntries(
+    [
+      { address: "t1", status: "done", where: "api / 1", labels: { telegram: "📨 07:12", "telegram.expires": String(now + 60_000) } },
+      { address: "t2", status: "blocked", where: "api / 2", labels: { telegram: "📱 07:13" } },
+      { address: "t3", status: "working", where: "api / 3", labels: { telegram: "📨 07:14", "telegram.expires": String(now - 1) } },
+      { address: "t4", status: "done", parent: "t1", where: "api / 1", labels: { telegram: "📨 07:15" } },
+      { address: "t5", where: "api / 1", labels: { telegram: "📨 07:16" } },
+      { address: "t6", status: "idle", where: "api / 2", labels: { telegram: "📨 07:17", "telegram.mute": "🔕 until 15:00", "telegram.mute.expires": String(now + 60_000) } },
+      { address: "t7", status: "idle", where: "api / 3", labels: { "telegram.mute": "🔕 until 15:00" } },
+    ],
+    now
+  );
+  assert.deepEqual(entries, [
+    { text: "🔕 until 15:00" },
+    { address: "t1", text: "📨 07:12", where: "api / 1" },
+    { address: "t2", text: "📱 07:13", where: "api / 2" },
+    { address: "t6", text: "📨 07:17", where: "api / 2" },
+  ]);
+  // Without a where, the address is what a click goes to.
+  assert.deepEqual(telegramEntries([{ address: "t8", status: "done", labels: { telegram: "📨 07:18" } }], now), [
+    { address: "t8", text: "📨 07:18", where: "t8" },
+  ]);
+  // A full core record keeps the place in its labels; only hc ls's summary is top-level.
+  assert.deepEqual(telegramEntries([{ address: "t9", status: "done", labels: { telegram: "📨 07:19", where: "notes / 2" } }], now), [
+    { address: "t9", text: "📨 07:19", where: "notes / 2" },
+  ]);
+});
+
 // --------------------------------------------------------------- fakes
 
 // `hc events` hands out its snapshot, waits a moment (as a real core would
 // before anything changes), then the events it was given, and stays open.
 // `hc connect` answers doc.get. Every other call is logged as JSON argv and
 // answered from the records file, which a test can rewrite as things change.
-function fakeHc(dir, { terminals = [], events = [], doc = {}, screens = {} } = {}) {
+function fakeHc(dir, { terminals = [], events = [], doc = {}, docs = {}, screens = {}, exec = [] } = {}) {
   const records = join(dir, "records.json");
   writeFileSync(records, JSON.stringify(terminals));
   const path = join(dir, "hc");
@@ -183,8 +472,10 @@ const args = process.argv.slice(2);
 fs.appendFileSync(${JSON.stringify(join(dir, "hc-argv.jsonl"))}, JSON.stringify(args) + "\\n");
 const records = JSON.parse(fs.readFileSync(${JSON.stringify(records)}, "utf8"));
 const screens = ${JSON.stringify(screens)};
+const docs = ${JSON.stringify(docs)};
+const exec = ${JSON.stringify(exec)};
 const out = (v) => console.log(JSON.stringify(v));
-const target = args.filter((a) => /^t\\d+$/.test(a)).pop();
+const target = args.filter((a) => /(^|\\/)t\\d+$/.test(a)).pop();
 if (args[0] === "events") {
   out({ seq: 0, terminals: records });
   setTimeout(() => {
@@ -194,8 +485,13 @@ if (args[0] === "events") {
 } else if (args[0] === "connect") {
   process.stdin.once("data", (d) => {
     const req = JSON.parse(String(d).split("\\n")[0]);
-    out({ jsonrpc: "2.0", id: req.id, result: { value: ${JSON.stringify(doc)}, version: 1 } });
+    const value = req.params?.on ? (docs[req.params.on] ?? null) : ${JSON.stringify(doc)};
+    out({ jsonrpc: "2.0", id: req.id, result: { value, version: 1 } });
   });
+} else if (args[0] === "exec") {
+  const joined = args.join(" ");
+  const hit = exec.find(([needle]) => joined.includes(needle));
+  process.stdout.write(hit ? hit[1] : "");
 } else if (args[0] === "get") {
   const t = records.find((r) => r.address === target);
   if (!t) { console.error(JSON.stringify({ error: { kind: "not_found", message: "no terminal " + target } })); process.exit(3); }
@@ -211,12 +507,39 @@ if (args[0] === "events") {
   chmodSync(path, 0o755);
   return {
     path,
-    argv: () =>
-      existsSync(join(dir, "hc-argv.jsonl"))
-        ? readFileSync(join(dir, "hc-argv.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l))
-        : [],
+    argv: () => {
+      if (!existsSync(join(dir, "hc-argv.jsonl"))) return [];
+      // A call being appended right now can be read half-written; it is not one yet.
+      return readFileSync(join(dir, "hc-argv.jsonl"), "utf8")
+        .split("\n")
+        .map((line) => {
+          try {
+            return JSON.parse(line);
+          } catch {
+            return undefined;
+          }
+        })
+        .filter(Boolean);
+    },
     set: (next) => writeFileSync(records, JSON.stringify(next)),
   };
+}
+
+// A real repo in a temp dir, for the branch path: `/new` runs actual git.
+function git(cwd, ...args) {
+  const res = spawnSync("git", args, { cwd, encoding: "utf8" });
+  assert.equal(res.status, 0, `git ${args.join(" ")} in ${cwd}: ${res.stderr}`);
+  return res.stdout.trim();
+}
+
+function initRepo(dir) {
+  mkdirSync(dir, { recursive: true });
+  git(dir, "init", "-q");
+  git(dir, "config", "user.email", "test@example.com");
+  git(dir, "config", "user.name", "Test");
+  writeFileSync(join(dir, "README.md"), "storefront\n");
+  git(dir, "add", "README.md");
+  git(dir, "commit", "-q", "-m", "init");
 }
 
 function dirs(env = []) {
@@ -286,6 +609,75 @@ function run(script, args, env, { until, timeoutMs = 20_000 }) {
   });
 }
 
+// ---------------------------------------------------------- sidebar labels
+
+const cfg = (key) => DEFAULTS[key];
+
+// The daemon's copy is what a workspace report reads, so it is written here.
+function coreTerminals(fx, terminals) {
+  writeFileSync(join(fx.stateDir, "core-terminals.json"), JSON.stringify({ terminals }));
+}
+
+async function withCore(hc, fx, fn) {
+  const saved = { ...process.env };
+  Object.assign(process.env, { HERDR_BACKEND: "core", HC_BIN_PATH: hc.path, HERDR_PLUGIN_STATE_DIR: fx.stateDir });
+  try {
+    return await fn();
+  } finally {
+    for (const key of ["HERDR_BACKEND", "HC_BIN_PATH", "HERDR_PLUGIN_STATE_DIR"]) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+  }
+}
+
+test("the core reports sidebar tokens as terminal labels, and clears both", async () => {
+  const fx = dirs();
+  const hc = fakeHc(fx.root);
+  coreTerminals(fx, [agent("t1", "done"), agent("t2", "blocked"), agent("t3", "working", { parent: "t1" }), terminal("t5"), agent("box/t6", "done")]);
+  await withCore(hc, fx, async () => {
+    const labels = () => hc.argv().filter((a) => a[0] === "label");
+
+    await reportSidebarToken("pane", "t1", "📨 07:12", { ttlMs: 60_000, cfg });
+    const set = labels().at(-1);
+    assert.deepEqual(set.slice(0, 3), ["label", "t1", "telegram=📨 07:12"]);
+    const expires = Number(set[3].split("=")[1]);
+    assert.ok(expires >= Date.now() && expires <= Date.now() + 60_000, set[3]);
+
+    await reportSidebarToken("pane", "t1", undefined, { cfg });
+    assert.deepEqual(labels().at(-1), ["label", "t1", "telegram=", "telegram.expires="]);
+
+    // The mute is a workspace's: every agent of the daemon's copy, nothing else.
+    const until = Date.now() + 3_600_000;
+    await reportSidebarToken("workspace", undefined, "🔕 until 15:00", { expiresAt: until, cfg });
+    const mutes = labels().slice(-2);
+    assert.deepEqual(mutes.map((a) => a[1]), ["t1", "t2"]);
+    for (const mute of mutes) {
+      assert.deepEqual(mute.slice(2), ["telegram.mute=🔕 until 15:00", `telegram.mute.expires=${until}`]);
+    }
+
+    await reportSidebarToken("workspace", undefined, undefined, { cfg });
+    assert.deepEqual(labels().slice(-2).map((a) => a.slice(1)), [
+      ["t1", "telegram.mute=", "telegram.mute.expires="],
+      ["t2", "telegram.mute=", "telegram.mute.expires="],
+    ]);
+  });
+});
+
+test("SIDEBAR_TOKENS=0 and DRY_RUN=1 leave the core's terminal labels alone", async () => {
+  const fx = dirs();
+  const hc = fakeHc(fx.root);
+  coreTerminals(fx, [agent("t1", "done")]);
+  await withCore(hc, fx, async () => {
+    for (const [key, value] of [["SIDEBAR_TOKENS", "0"], ["DRY_RUN", "1"]]) {
+      const off = (name) => (name === key ? value : DEFAULTS[name]);
+      await reportSidebarToken("pane", "t1", "📨 07:12", { ttlMs: 60_000, cfg: off });
+      await reportSidebarToken("workspace", undefined, "🔕 until 15:00", { expiresAt: Date.now() + 60_000, cfg: off });
+    }
+    assert.deepEqual(hc.argv(), []);
+  });
+});
+
 // ------------------------------------------------------------- end to end
 
 test("the daemon turns an hc status event into the TUI plugin's message, with the space's name and the transcript", async () => {
@@ -325,6 +717,45 @@ test("the daemon turns an hc status event into the TUI plugin's message, with th
   assert.match(out, /fix the login/);
   const terminals = JSON.parse(readFileSync(join(fx.stateDir, "core-terminals.json"), "utf8")).terminals;
   assert.equal(terminals[0].status.state, "done");
+});
+
+test("a parent's notification lists its live helpers on one line, and only when it has some", async () => {
+  const helper = (address, extra = {}) => terminal(address, { parent: "t3", ...extra });
+  const cases = [
+    {
+      helpers: [
+        helper("h1", { name: "sub-auth", status: { state: "done", app: "bash" } }),
+        helper("h2", { name: "sub-docs" }),
+        helper("h3", { name: "sub-gone", state: "finished" }),
+      ],
+      line: "🧩 2 helpers: sub-auth done, sub-docs running",
+    },
+    { helpers: [], line: undefined },
+    {
+      helpers: [1, 2, 3, 4, 5, 6, 7].map((n) => helper(`h${n}`, { name: `sub-${n}` })),
+      line: "🧩 7 helpers: sub-1 running, sub-2 running, sub-3 running, sub-4 running, sub-5 running +2",
+    },
+  ];
+  for (const { helpers, line } of cases) {
+    const fx = dirs();
+    const hc = fakeHc(fx.root, {
+      terminals: [agent("t3", "working", { labels: { "herdr.space": "s1" } }), ...helpers],
+      events: [
+        { type: "status", terminal: "t3", data: { status: { state: "done", app: "claude" }, records: {}, reported: true } },
+      ],
+    });
+    const out = await run(DAEMON, [], {
+      HC_BIN_PATH: hc.path,
+      HERDR_PLUGIN_STATE_DIR: fx.stateDir,
+      HERDR_PLUGIN_CONFIG_DIR: fx.configDir,
+      CLAUDE_CONFIG_DIR: join(fx.root, "claude"),
+      DRY_RUN: "1",
+      SHOW_CHANGES: "0",
+    }, { until: (o) => o.includes("--- plain-text fallback ---") });
+    assert.match(out, /claude · done/);
+    if (line) assert.ok(out.includes(line), out);
+    else assert.equal(out.includes("🧩"), false, out);
+  }
 });
 
 test("the daemon does not report what was already done before it started, and refuses a second copy", async () => {
@@ -411,6 +842,91 @@ test("/new starts the agent in a new tab of that space, from its folder, and tel
   }
 });
 
+test("/new with a branch makes the app's checkout under ~/.herdr/worktrees and starts the agent there in a new space", async () => {
+  const fx = dirs(["REPLIES=1"]);
+  const home = join(fx.root, "home");
+  mkdirSync(home);
+  const repo = join(fx.root, "storefront");
+  initRepo(repo);
+  git(repo, "branch", "release"); // a branch that already exists
+  writeFileSync(join(fx.stateDir, "core-spaces.json"), JSON.stringify({ spaces: [{ id: "s1", name: "Storefront", folder: repo, tabs: [] }] }));
+  writeFileSync(join(fx.stateDir, "core-terminals.json"), JSON.stringify({ terminals: [] }));
+  const hc = fakeHc(fx.root, { terminals: [agent("t9", "idle", { foreground: { pid: 9, cwd: repo, name: "claude", argv: ["claude"] } })] });
+  const update = (id, text) => ({ update_id: id, message: { message_id: id * 10, chat: { id: CHAT }, from: { id: 7 }, text } });
+  const tg = await fakeTelegram([[update(1, "/new storefront@feature/login claude Review notes.md"), update(2, "/new storefront@release claude")]]);
+  try {
+    await run(REPLIES, [], {
+      HOME: home,
+      HERDR_BACKEND: "core",
+      HC_BIN_PATH: hc.path,
+      HERDR_PLUGIN_STATE_DIR: fx.stateDir,
+      HERDR_PLUGIN_CONFIG_DIR: fx.configDir,
+      TELEGRAM_API_BASE: tg.base,
+    }, { until: () => tg.sent.length >= 2 });
+    const root = join(home, ".herdr", "worktrees", basename(repo));
+    const fresh = join(root, "feature-login");
+    const reused = join(root, "release");
+    // A new branch starts from HEAD; an existing one is checked out as it is.
+    assert.equal(git(fresh, "rev-parse", "--abbrev-ref", "HEAD"), "feature/login");
+    assert.equal(git(fresh, "rev-parse", "HEAD"), git(repo, "rev-parse", "HEAD"));
+    assert.equal(git(reused, "rev-parse", "--abbrev-ref", "HEAD"), "release");
+    const runs = hc.argv().filter((a) => a[0] === "run");
+    assert.equal(runs.length, 2);
+    assert.deepEqual(runs[0].slice(-4), ["--cwd", fresh, "--json", "claude"]);
+    assert.deepEqual(runs[1].slice(-4), ["--cwd", reused, "--json", "claude"]);
+    const spaces = runs.map((a) => a.find((v) => v.startsWith("herdr.space=")));
+    for (const run of runs) {
+      assert.match(run.find((v) => v.startsWith("herdr.space=")), /^herdr\.space=sp[0-9a-f]{32}$/);
+      assert.match(run.find((v) => v.startsWith("herdr.tab=")), /^herdr\.tab=t[0-9a-f]{32}$/);
+      assert.ok(!run.includes("herdr.space=s1"), "the checkout did not get a space of its own");
+    }
+    assert.notEqual(spaces[0], spaces[1], "both checkouts went into one space");
+    assert.deepEqual(hc.argv().find((a) => a[0] === "send"), ["send", "--", "t9", "Review notes.md"]);
+    assert.equal(tg.sent[0].text, "▶ started claude in Storefront@feature/login · t9");
+    assert.equal(tg.sent[1].text, "▶ started claude in Storefront@release · t9");
+  } finally {
+    tg.close();
+  }
+});
+
+test("/new with a branch starts nothing when the checkout cannot be made", async () => {
+  const fx = dirs(["REPLIES=1"]);
+  const home = join(fx.root, "home");
+  // Where that branch's checkout already is, empty or not.
+  mkdirSync(join(home, ".herdr", "worktrees", "storefront", "taken"), { recursive: true });
+  const repo = join(fx.root, "storefront");
+  initRepo(repo);
+  const notes = join(fx.root, "notes");
+  mkdirSync(notes);
+  writeFileSync(join(fx.stateDir, "core-spaces.json"), JSON.stringify({ spaces: [
+    { id: "s1", name: "Storefront", folder: repo, tabs: [] },
+    { id: "s2", name: "Notes", folder: notes, tabs: [] },
+  ] }));
+  writeFileSync(join(fx.stateDir, "core-terminals.json"), JSON.stringify({ terminals: [] }));
+  const hc = fakeHc(fx.root, { terminals: [] });
+  const update = (id, text) => ({ update_id: id, message: { message_id: id * 10, chat: { id: CHAT }, from: { id: 7 }, text } });
+  const tg = await fakeTelegram([[update(1, "/new storefront@taken claude"), update(2, "/new notes@main claude"), update(3, "/new storefront@reserved rm")]]);
+  try {
+    await run(REPLIES, [], {
+      HOME: home,
+      HERDR_BACKEND: "core",
+      HC_BIN_PATH: hc.path,
+      HERDR_PLUGIN_STATE_DIR: fx.stateDir,
+      HERDR_PLUGIN_CONFIG_DIR: fx.configDir,
+      TELEGRAM_API_BASE: tg.base,
+    }, { until: () => tg.sent.length >= 3 });
+    assert.match(tg.sent[0].text, /^✗ Storefront@taken: .*already there/);
+    assert.match(tg.sent[1].text, /^✗ Notes@main: .*not in a git repository/);
+    assert.match(tg.sent[2].text, /rm is not one of CORE_AGENT_KINDS/);
+    // The kind is checked before the checkout, and the other two made none.
+    assert.equal(existsSync(join(home, ".herdr", "worktrees", "storefront", "reserved")), false);
+    assert.equal(git(repo, "worktree", "list", "--porcelain").split("\n\n").length, 1);
+    assert.equal(hc.argv().filter((a) => a[0] === "run").length, 0);
+  } finally {
+    tg.close();
+  }
+});
+
 test("an answer to a blocked agent's question is typed into it with a forced send", async () => {
   const fx = dirs(["REPLIES=1"]);
   const t3 = agent("t3", "blocked", { foreground: { pid: 4242, cwd: "/work/storefront", name: "claude", argv: ["claude"] } });
@@ -440,6 +956,99 @@ test("an answer to a blocked agent's question is typed into it with a forced sen
       TELEGRAM_API_BASE: tg.base,
     }, { until: () => hc.argv().some((a) => a[0] === "send") });
     assert.deepEqual(hc.argv().find((a) => a[0] === "send"), ["send", "--force", "--", "t3", "2"]);
+  } finally {
+    tg.close();
+  }
+});
+
+test("the daemon follows a box agent only when CORE_MACHINES names that machine", async () => {
+  const setup = () => {
+    const fx = dirs();
+    const hc = fakeHc(fx.root, {
+      terminals: [agent("box/t7", "working", { cwd: "/srv/boxes", created_ms: 0, labels: { "herdr.space": "s1", "herdr.tab": "a" } })],
+      docs: { box: { spaces: [{ id: "s1", name: "Boxes", folder: "/srv/boxes", tabs: [{ id: "a", name: "deploy" }] }] } },
+      events: [
+        { type: "status", terminal: "box/t7", data: { status: { state: "done", app: "claude", title: "Fix the login" }, records: {}, reported: true } },
+      ],
+    });
+    const env = { HC_BIN_PATH: hc.path, HERDR_PLUGIN_STATE_DIR: fx.stateDir, HERDR_PLUGIN_CONFIG_DIR: fx.configDir, DRY_RUN: "1" };
+    return { fx, hc, env };
+  };
+
+  // Empty: this machine only, so the remote change is not news.
+  {
+    const { hc, env } = setup();
+    const child = spawn(process.execPath, [DAEMON], { env: { ...process.env, ...env } });
+    let out = "";
+    child.stdout.on("data", (d) => (out += d));
+    try {
+      await new Promise((r) => {
+        const poll = setInterval(() => out.includes("following hc events") && (clearInterval(poll), r()), 50);
+      });
+      await new Promise((r) => setTimeout(r, 1500));
+      assert.doesNotMatch(out, /--- plain-text fallback ---/);
+      assert.equal(hc.argv().filter((a) => a[0] === "label").length, 0);
+    } finally {
+      child.kill("SIGKILL");
+    }
+  }
+
+  // Named: its agent gets the message a local one gets, with box's own names.
+  {
+    const { fx, env } = setup();
+    const out = await run(DAEMON, [], { ...env, CORE_MACHINES: "box" }, { until: (o) => o.includes("--- plain-text fallback ---") });
+    assert.match(out, /claude · done/);
+    assert.match(out, /Boxes/);
+    assert.match(out, /tab deploy/);
+    assert.match(out, /hc attach box\/t7/);
+    const spaces = JSON.parse(readFileSync(join(fx.stateDir, "core-spaces.json"), "utf8"));
+    assert.equal(spaces.machines.box.spaces[0].name, "Boxes");
+  }
+});
+
+test("a reply to a remote agent goes to its box/t7 address through hc", async () => {
+  const fx = dirs(["REPLIES=1", "CORE_MACHINES=box"]);
+  const t7 = agent("box/t7", "working", { foreground: { pid: 4242, cwd: "/srv/boxes", name: "claude", argv: ["claude"] } });
+  const hc = fakeHc(fx.root, { terminals: [t7] });
+  writeFileSync(
+    join(fx.stateDir, "messages.jsonl"),
+    JSON.stringify({ id: 500, paneId: "box/t7", session: "proc:box/t7:4242", at: Date.now() }) + "\n"
+  );
+  const tg = await fakeTelegram([[{ update_id: 1, message: { message_id: 10, chat: { id: CHAT }, from: { id: 7 }, text: "carry on", reply_to_message: { message_id: 500 } } }]]);
+  try {
+    await run(REPLIES, [], {
+      HERDR_BACKEND: "core",
+      HC_BIN_PATH: hc.path,
+      HERDR_PLUGIN_STATE_DIR: fx.stateDir,
+      HERDR_PLUGIN_CONFIG_DIR: fx.configDir,
+      TELEGRAM_API_BASE: tg.base,
+    }, { until: () => hc.argv().some((a) => a[0] === "send") });
+    assert.deepEqual(hc.argv().find((a) => a[0] === "send"), ["send", "--", "box/t7", "carry on"]);
+  } finally {
+    tg.close();
+  }
+});
+
+test("/new on a space on another machine is refused, and starts nothing", async () => {
+  const fx = dirs(["REPLIES=1", "CORE_MACHINES=box"]);
+  writeFileSync(
+    join(fx.stateDir, "core-spaces.json"),
+    JSON.stringify({ spaces: [], machines: { box: { spaces: [{ id: "s1", name: "Boxes", folder: "/srv/boxes", tabs: [] }] } } })
+  );
+  writeFileSync(join(fx.stateDir, "core-terminals.json"), JSON.stringify({ terminals: [] }));
+  const hc = fakeHc(fx.root, { terminals: [] });
+  const update = { update_id: 1, message: { message_id: 10, chat: { id: CHAT }, from: { id: 7 }, text: "/new Boxes claude Review notes.md" } };
+  const tg = await fakeTelegram([[update]]);
+  try {
+    await run(REPLIES, [], {
+      HERDR_BACKEND: "core",
+      HC_BIN_PATH: hc.path,
+      HERDR_PLUGIN_STATE_DIR: fx.stateDir,
+      HERDR_PLUGIN_CONFIG_DIR: fx.configDir,
+      TELEGRAM_API_BASE: tg.base,
+    }, { until: () => tg.sent.length >= 1 });
+    assert.match(tg.sent[0].text, /^✗ Boxes: \/new on another machine is not supported yet/);
+    assert.equal(hc.argv().filter((a) => a[0] === "run").length, 0);
   } finally {
     tg.close();
   }

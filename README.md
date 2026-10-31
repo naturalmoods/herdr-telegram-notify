@@ -115,15 +115,18 @@ also carry them as buttons.
 | `/stop` | Send Esc to a working or blocked agent, without quitting it. |
 | `/screen` | Read up to 40 cropped lines of the agent's current screen. |
 | `/diff` | Download staged and unstaged changes; list untracked names only. |
-| `/new <workspace>[@<branch>] <kind> [prompt]` | Start an agent in a background tab, or its own Git worktree (Herdr TUI only). |
+| `/new <workspace>[@<branch>] <kind> [prompt]` | Start an agent in a background tab, or its own Git worktree. |
 
 [Command details, safety checks and limits](docs/guide.md#commands).
 
 ## Sidebar
 
-Herdr TUI only. Run `herdr plugin action invoke sidebar --plugin naturalmoods.herdr-telegram-notify`.
+Herdr TUI: run `herdr plugin action invoke sidebar --plugin naturalmoods.herdr-telegram-notify`.
 Then reload config from the Herdr menu (or your `reload_config` key).
 Over SSH, run it where the Herdr window runs: the layout belongs to the **client machine's config**, not the server's. [Details](docs/guide.md#sidebar-tokens).
+
+In the Herdr app, a mod draws the same badges in a band at the bottom of the
+window instead: [install it](docs/core.md#sidebar).
 
 ## Upgrading
 
