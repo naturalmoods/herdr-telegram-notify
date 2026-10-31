@@ -390,6 +390,8 @@ else console.log("{}");
       let out = "";
       child.stdout.on("data", (d) => (out += d));
       child.on("close", (code) => resolve({ code, out }));
+      // A hook that has nothing to do exits before reading what Claude Code sends.
+      child.stdin.on("error", () => {});
       child.stdin.end(JSON.stringify({ session_id: id, transcript_path: "/work/storefront/x.jsonl", source: "clear" }));
     });
   const argv = () =>
